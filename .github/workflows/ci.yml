@@ -53,6 +53,9 @@ jobs:
       - name: Tests (unit + protocol torture/fuzz)
         run: cargo test --quiet
 
+      - name: Release script source-integrity regression
+        run: bash scripts/release-local-smoke.sh
+
       - name: Release build (NFR-7.1)
         run: cargo build --release
 

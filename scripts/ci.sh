@@ -25,6 +25,9 @@ cargo clippy --all-targets 2>&1 | tail -1
 step "cargo test (unit + protocol torture/fuzz)"
 cargo test --quiet
 
+step "release-local source-integrity regression"
+bash scripts/release-local-smoke.sh
+
 if [ "$FAST" = "1" ]; then
   step "cargo-deny check"
   if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; else echo "cargo-deny not installed; skipping"; fi

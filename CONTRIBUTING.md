@@ -85,11 +85,12 @@ Releases are built locally on the maintainer system to conserve GitHub Actions r
 
 ```bash
 # Build multi-arch Linux packages (x86_64 and aarch64) locally
-scripts/release-local.sh v0.1.x
+scripts/release-local.sh v0.1.0
 
 # Build and publish directly to GitHub Releases via gh CLI
-scripts/release-local.sh v0.1.x --publish
+scripts/release-local.sh v0.1.0 --publish
 ```
 
-The script builds both `x86_64-unknown-linux-gnu` (native) and `aarch64-unknown-linux-gnu` (via `cross`), packages `.tar.gz` archives and individual `.sha256` files, computes the canonical `SHA256SUMS`, and pushes the release assets to GitHub.
+The release tag must exactly match the package version in `Cargo.toml`. Existing tags are rebuilt from the tagged commit in a detached worktree. For a new tag, the script requires a clean working tree, builds the current commit in a detached worktree, and creates the tag only after all artifacts and checksums have been produced successfully.
 
+The script installs dashboard dependencies with `npm ci`, builds Rust with the committed lockfile, builds both `x86_64-unknown-linux-gnu` (native) and `aarch64-unknown-linux-gnu` (via `cross`), packages `.tar.gz` archives and individual `.sha256` files, computes the canonical `SHA256SUMS`, and pushes the release assets to GitHub.

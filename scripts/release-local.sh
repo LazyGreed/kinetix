@@ -6,7 +6,7 @@
 # Usage:
 #   scripts/release-local.sh <tag> [--publish] [--draft]
 # Example:
-#   scripts/release-local.sh v0.1.1 --publish
+#   scripts/release-local.sh v0.1.0 --publish
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ err() { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; exit 1; }
 
 if [ $# -lt 1 ]; then
   echo "Usage: $0 <tag> [--publish] [--draft]"
-  echo "  <tag>        Release tag, e.g. v0.1.1"
+  echo "  <tag>        Release tag, e.g. v0.1.0"
   echo "  --publish    Upload artifacts directly to GitHub Release using gh CLI"
   echo "  --draft      Create release as draft when publishing"
   exit 1
@@ -38,93 +38,147 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+'; then
-  err "Tag must match vX.Y.Z format (got '$TAG')"
+if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  err "Tag must match vX.Y.Z exactly (got '$TAG')"
 fi
 
 cd "$ROOT_DIR"
 
+command -v git >/dev/null 2>&1 || err "git is required"
 command -v cargo >/dev/null 2>&1 || err "cargo is required"
+command -v rustup >/dev/null 2>&1 || err "rustup is required"
 command -v npm >/dev/null 2>&1 || err "npm is required"
 command -v tar >/dev/null 2>&1 || err "tar is required"
 command -v sha256sum >/dev/null 2>&1 || err "sha256sum is required"
 
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || err "must be run from a git checkout"
+
 if [ "$PUBLISH" -eq 1 ]; then
   command -v gh >/dev/null 2>&1 || err "gh CLI is required to publish"
   gh auth status >/dev/null 2>&1 || err "gh CLI is not authenticated"
+
+  log "Refreshing remote tags before resolving $TAG..."
+  git fetch --tags origin
 fi
+
+TAG_REF="refs/tags/$TAG"
+TAG_EXISTS=0
+if git rev-parse --verify --quiet "$TAG_REF^{commit}" >/dev/null; then
+  TAG_EXISTS=1
+  SOURCE_SHA="$(git rev-parse "$TAG_REF^{commit}")"
+  log "Building existing tag $TAG at $SOURCE_SHA"
+else
+  if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+    err "working tree is not clean; commit or stash changes before building a new release tag"
+  fi
+  SOURCE_SHA="$(git rev-parse HEAD)"
+  log "Tag $TAG does not exist yet; building clean HEAD at $SOURCE_SHA"
+fi
+
+PACKAGE_VERSION="$(
+  git show "$SOURCE_SHA:Cargo.toml" |
+    awk -F'"' '/^version[[:space:]]*=/{print $2; exit}'
+)"
+[ -n "$PACKAGE_VERSION" ] || err "could not read package version from Cargo.toml at $SOURCE_SHA"
+if [ "$TAG" != "v$PACKAGE_VERSION" ]; then
+  err "release tag $TAG does not match Cargo package version $PACKAGE_VERSION"
+fi
+
+WORK_PARENT="$(mktemp -d)"
+BUILD_ROOT="$WORK_PARENT/source"
+WORKTREE_ADDED=0
+
+cleanup() {
+  if [ "$WORKTREE_ADDED" -eq 1 ]; then
+    git -C "$ROOT_DIR" worktree remove --force "$BUILD_ROOT" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORK_PARENT"
+}
+trap cleanup EXIT
+
+git worktree add --detach "$BUILD_ROOT" "$SOURCE_SHA" >/dev/null
+WORKTREE_ADDED=1
 
 TARGETS=("x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu")
 
-# 1. Build dashboard frontend once (rust-embed requires assets before compilation)
-log "Building embedded dashboard frontend..."
+# 1. Build dashboard frontend from the exact source commit that will be released.
+log "Installing and building embedded dashboard frontend..."
 (
-  cd "$ROOT_DIR/dashboard"
+  cd "$BUILD_ROOT/dashboard"
+  npm ci
   npm run build
 )
 
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-# 2. Build for each target
+# 2. Build each target from the same detached source worktree.
 for TARGET in "${TARGETS[@]}"; do
   log "Building binary for target: $TARGET"
 
   if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
     rustup target add "$TARGET" >/dev/null 2>&1 || true
-    cargo build --release --target "$TARGET"
-    BIN_SRC="$ROOT_DIR/target/$TARGET/release/kinetix"
+    (
+      cd "$BUILD_ROOT"
+      cargo build --release --locked --target "$TARGET"
+    )
   else
     if command -v cross >/dev/null 2>&1; then
       log "Cross-compiling $TARGET via cross..."
-      cross build --release --target "$TARGET"
-      BIN_SRC="$ROOT_DIR/target/$TARGET/release/kinetix"
+      (
+        cd "$BUILD_ROOT"
+        cross build --release --locked --target "$TARGET"
+      )
     else
       err "cross command not found. Install cross to build aarch64."
     fi
   fi
 
+  BIN_SRC="$BUILD_ROOT/target/$TARGET/release/kinetix"
   [ -f "$BIN_SRC" ] || err "Built binary not found at $BIN_SRC"
 
   ARCHIVE_NAME="kinetix-$TAG-$TARGET.tar.gz"
   ARCHIVE_PATH="$DIST_DIR/$ARCHIVE_NAME"
 
   log "Creating archive: $ARCHIVE_NAME"
-  TMP_STAGE="$(mktemp -d)"
+  TMP_STAGE="$WORK_PARENT/stage-$TARGET"
+  mkdir -p "$TMP_STAGE"
   cp "$BIN_SRC" "$TMP_STAGE/kinetix"
   chmod 0755 "$TMP_STAGE/kinetix"
   tar -czf "$ARCHIVE_PATH" -C "$TMP_STAGE" kinetix
-  rm -rf "$TMP_STAGE"
 
-  # Single asset sha256 file
   (
     cd "$DIST_DIR"
     sha256sum "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256"
   )
 done
 
-# 3. Create consolidated SHA256SUMS file
+# 3. Create consolidated SHA256SUMS file.
 log "Generating canonical SHA256SUMS..."
 (
   cd "$DIST_DIR"
   sha256sum kinetix-"$TAG"-*.tar.gz > SHA256SUMS
 )
 
-log "Release artifacts prepared in $DIST_DIR:"
+log "Release artifacts prepared in $DIST_DIR from source $SOURCE_SHA:"
 ls -lh "$DIST_DIR"
 
-# 4. Optional publish via gh
+# 4. Optional publish via gh. Create a new tag only after every artifact succeeds.
 if [ "$PUBLISH" -eq 1 ]; then
   log "Publishing release $TAG to GitHub..."
 
-  # Create or update git tag locally if it doesn't match HEAD
-  if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-    log "Creating git tag $TAG..."
-    git tag -a "$TAG" -m "Release $TAG"
+  if [ "$TAG_EXISTS" -eq 0 ]; then
+    log "Creating git tag $TAG at $SOURCE_SHA..."
+    git tag -a "$TAG" "$SOURCE_SHA" -m "Release $TAG"
+  fi
+
+  TAG_SHA="$(git rev-parse "$TAG_REF^{commit}")"
+  if [ "$TAG_SHA" != "$SOURCE_SHA" ]; then
+    err "tag $TAG resolves to $TAG_SHA, but artifacts were built from $SOURCE_SHA"
   fi
 
   log "Pushing tag $TAG to origin..."
-  git push origin "$TAG"
+  git push origin "refs/tags/$TAG"
 
   log "Ensuring GitHub Release exists..."
   if ! gh release view "$TAG" >/dev/null 2>&1; then
@@ -132,7 +186,11 @@ if [ "$PUBLISH" -eq 1 ]; then
   fi
 
   log "Uploading artifacts to release $TAG..."
-  gh release upload "$TAG" "$DIST_DIR"/kinetix-"$TAG"-*.tar.gz "$DIST_DIR"/kinetix-"$TAG"-*.sha256 "$DIST_DIR"/SHA256SUMS --clobber
+  gh release upload "$TAG" \
+    "$DIST_DIR"/kinetix-"$TAG"-*.tar.gz \
+    "$DIST_DIR"/kinetix-"$TAG"-*.sha256 \
+    "$DIST_DIR"/SHA256SUMS \
+    --clobber
 
   log "Release $TAG published successfully!"
   gh release view "$TAG"
