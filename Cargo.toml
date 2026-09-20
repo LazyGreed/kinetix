@@ -4,9 +4,9 @@ version = "0.3.0"
 edition = "2021"
 description = "Multi-protocol LLM proxy: OpenAI/Anthropic in, configurable upstreams out, with virtual keys, account pools, Routes, and cost tracking"
 license = "MIT"
-repository = "https://github.com/LazyGreed/kinetix"
-authors = ["LazyGreed"]
-homepage = "https://github.com/LazyGreed/kinetix"
+repository = "https://github.com/PrightCord/kinetix"
+authors = ["PrightCord"]
+homepage = "https://github.com/PrightCord/kinetix"
 default-run = "kinetix"
 
 [[bin]]

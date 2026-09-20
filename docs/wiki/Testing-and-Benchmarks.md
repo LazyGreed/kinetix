@@ -49,8 +49,8 @@ Run this before pushing — it mirrors `.github/workflows/ci.yml`.
 
 Pi (a coding agent) is run against Kinetix end-to-end: plain streaming, a
 tool-calling turn, multi-turn sessions, and the Anthropic-format client. See
-[`docs/pi-compatibility.md`](https://github.com/LazyGreed/kinetix/blob/main/docs/pi-compatibility.md)
-and [`docs/compatibility.md`](https://github.com/LazyGreed/kinetix/blob/main/docs/compatibility.md).
+[`docs/pi-compatibility.md`](https://github.com/PrightCord/kinetix/blob/main/docs/pi-compatibility.md)
+and [`docs/compatibility.md`](https://github.com/PrightCord/kinetix/blob/main/docs/compatibility.md).
 
 ## Benchmarks
 
@@ -67,7 +67,7 @@ Cancellation latency: `scripts/cancel_bench.py` measures how long the upstream
 keeps being written after a client disconnect (NFR-1.10).
 
 Measured results, methodology, and caveats are documented in
-[`docs/benchmarks.md`](https://github.com/LazyGreed/kinetix/blob/main/docs/benchmarks.md).
+[`docs/benchmarks.md`](https://github.com/PrightCord/kinetix/blob/main/docs/benchmarks.md).
 Headline numbers: added TTFT/total overhead of **~0.1–2 ms**, throughput far above
 the 50 req/s target with zero errors, idle RSS ~13 MB, cold start ~75 ms.
 

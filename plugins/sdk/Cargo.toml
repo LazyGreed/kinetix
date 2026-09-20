@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust SDK for Kinetix plugins (WIT bindings, host helpers, and export macro)."
 license = "MIT"
-repository = "https://github.com/LazyGreed/kinetix"
+repository = "https://github.com/PrightCord/kinetix"
 
 [dependencies]
 wit-bindgen = "0.62"

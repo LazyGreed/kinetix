@@ -8,7 +8,7 @@ admin dashboard. It is built for developers and small technical teams running AI
 coding agents such as [Pi](https://pi.dev).
 
 This wiki is the detailed, task-oriented companion to the repo
-[`README.md`](https://github.com/LazyGreed/kinetix/blob/main/README.md).
+[`README.md`](https://github.com/PrightCord/kinetix/blob/main/README.md).
 
 ## Start here
 
@@ -39,12 +39,12 @@ This wiki is the detailed, task-oriented companion to the repo
   wire protocol and routing decisions matters more than breadth.
 - **Isn't**: a general-purpose AI platform, a multi-tenant SaaS, or a bundled
   provider-preset library. See the non-goals in
-  [docs/DESIGN.md](https://github.com/LazyGreed/kinetix/blob/main/docs/DESIGN.md).
+  [docs/DESIGN.md](https://github.com/PrightCord/kinetix/blob/main/docs/DESIGN.md).
 
 ## Editing this wiki
 
 The wiki pages are generated from the markdown files in
-[`docs/wiki/`](https://github.com/LazyGreed/kinetix/tree/main/docs/wiki). Edit
+[`docs/wiki/`](https://github.com/PrightCord/kinetix/tree/main/docs/wiki). Edit
 them there (so changes are reviewed and versioned with the code) and mirror them
 to the GitHub wiki with:
 

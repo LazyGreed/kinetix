@@ -52,7 +52,7 @@ after the first run.
 | `KINETIX_ALERT_P95_LATENCY_MS` | `100` | p95 added-proxy-latency alert threshold (sustained 10 min). |
 
 A documented template is in
-[`.env.example`](https://github.com/LazyGreed/kinetix/blob/main/.env.example).
+[`.env.example`](https://github.com/PrightCord/kinetix/blob/main/.env.example).
 
 ## Bootstrap file (optional)
 
@@ -60,7 +60,7 @@ For a reproducible, file-driven first start you can seed an empty database from 
 TOML file (`KINETIX_BOOTSTRAP_FILE=config.toml`). It is used **only when the
 database has no providers**; afterwards the database is authoritative. A
 documented example is
-[`config.toml.example`](https://github.com/LazyGreed/kinetix/blob/main/config.toml.example).
+[`config.toml.example`](https://github.com/PrightCord/kinetix/blob/main/config.toml.example).
 
 ```toml
 [[virtual_keys]]

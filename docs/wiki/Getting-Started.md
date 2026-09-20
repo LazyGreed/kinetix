@@ -24,7 +24,7 @@ Other platforms may work from source but are not currently targeted by the relea
 The recommended installation needs no `.env` file and no hand-written configuration file.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
 ```
 
 By default, the installer:
@@ -52,7 +52,7 @@ Kinetix stores its default state under:
 Set `KINETIX_VERSION` to a release tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh \
   | KINETIX_VERSION=v0.1.0 bash
 ```
 
@@ -61,7 +61,7 @@ curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh \
 To explicitly build the current development branch:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh \
   | KINETIX_VERSION=main bash
 ```
 
@@ -78,7 +78,7 @@ The default install prefix is:
 Override it with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh \
   | KINETIX_PREFIX=/custom/prefix bash
 ```
 
@@ -254,9 +254,9 @@ Modern coding agents that use the Responses API can use:
 POST /v1/responses
 ```
 
-See [Compatibility](https://github.com/LazyGreed/kinetix/blob/main/docs/compatibility.md) for protocol behavior and documented deviations.
+See [Compatibility](https://github.com/PrightCord/kinetix/blob/main/docs/compatibility.md) for protocol behavior and documented deviations.
 
-See [Pi Compatibility](https://github.com/LazyGreed/kinetix/blob/main/docs/pi-compatibility.md) for Pi-specific setup and acceptance notes.
+See [Pi Compatibility](https://github.com/PrightCord/kinetix/blob/main/docs/pi-compatibility.md) for Pi-specific setup and acceptance notes.
 
 ## Useful commands
 
@@ -321,7 +321,7 @@ The repository includes:
 * backup/restore procedures
 * upgrade procedures
 
-See [Deployment](Deployment) and [`deploy/README.md`](https://github.com/LazyGreed/kinetix/blob/main/deploy/README.md).
+See [Deployment](Deployment) and [`deploy/README.md`](https://github.com/PrightCord/kinetix/blob/main/deploy/README.md).
 
 ## Uninstall
 
@@ -340,7 +340,7 @@ kinetix uninstall [--yes] [--remove-binary] [--keep-data] [--dry-run]
 Or use the standalone uninstall script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/uninstall.sh | bash
 ```
 
 ## Next steps

@@ -64,7 +64,7 @@ custom provider wire adapters (`wire_plugin`), dynamic credential strategies
 (`credential_plugin`), routing facts (`plugin.<id>.<name>`), health probes, and
 model discovery. Native providers remain zero-overhead and completely unaffected
 by installed plugins. See [Plugins](Plugins) and
-[docs/KINETIX-PLUGIN-ARCHITECTURE.md](https://github.com/LazyGreed/kinetix/blob/main/docs/KINETIX-PLUGIN-ARCHITECTURE.md).
+[docs/KINETIX-PLUGIN-ARCHITECTURE.md](https://github.com/PrightCord/kinetix/blob/main/docs/KINETIX-PLUGIN-ARCHITECTURE.md).
 
 **Is it multi-tenant / highly available?**
 No. It's a single-machine, small-team gateway. Multi-tenant SaaS and HA are

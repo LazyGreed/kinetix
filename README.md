@@ -4,10 +4,10 @@
 
 Use virtual keys, account pools, executable Routes, automatic fallback, usage and cost controls, and an embedded admin dashboard — all from a single Rust binary.
 
-[![CI](https://github.com/LazyGreed/kinetix/actions/workflows/ci.yml/badge.svg)](https://github.com/LazyGreed/kinetix/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/LazyGreed/kinetix)](https://github.com/LazyGreed/kinetix/releases/latest)
+[![CI](https://github.com/PrightCord/kinetix/actions/workflows/ci.yml/badge.svg)](https://github.com/PrightCord/kinetix/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/PrightCord/kinetix)](https://github.com/PrightCord/kinetix/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Wiki](https://img.shields.io/badge/docs-wiki-blueviolet)](https://github.com/LazyGreed/kinetix/wiki)
+[![Wiki](https://img.shields.io/badge/docs-wiki-blueviolet)](https://github.com/PrightCord/kinetix/wiki)
 
 ## Why Kinetix?
 
@@ -63,7 +63,7 @@ Clients see a stable OpenAI- or Anthropic-compatible endpoint. Kinetix resolves 
 The recommended Linux installer resolves the latest release and downloads the matching prebuilt binary for `x86_64` or `aarch64`. If a prebuilt binary cannot be used, it falls back to building from source.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
 ```
 
 The installer places `kinetix` in `~/.local/bin`, initializes the XDG directories, and prints the generated dashboard admin password **once**.
@@ -200,7 +200,7 @@ Where fallback is permitted, another eligible target can be selected before the 
 
 Routes can also use explicit session identity for sticky/cache-aware routing. Kinetix does not guess conversation identity when no supported session identifier is provided.
 
-See the [Routing and Fallback](https://github.com/LazyGreed/kinetix/wiki/Routing-and-Fallback) documentation for the full model.
+See the [Routing and Fallback](https://github.com/PrightCord/kinetix/wiki/Routing-and-Fallback) documentation for the full model.
 
 ## Virtual keys
 
@@ -312,7 +312,7 @@ kinetix plugin --help
 
 Administrative commands operate directly on the SQLite control plane, so most configuration changes work even when the proxy server is stopped and do not require the dashboard or admin password.
 
-The complete command surface is documented in the [CLI Reference](https://github.com/LazyGreed/kinetix/wiki/CLI-Reference).
+The complete command surface is documented in the [CLI Reference](https://github.com/PrightCord/kinetix/wiki/CLI-Reference).
 
 Configuration precedence is:
 
@@ -341,7 +341,7 @@ Highlights include:
 
 Dashboard sessions are intentionally process-local, so restarting the server invalidates existing sessions.
 
-See [SECURITY.md](SECURITY.md) and the [Security](https://github.com/LazyGreed/kinetix/wiki/Security) documentation for the security model and vulnerability-reporting process.
+See [SECURITY.md](SECURITY.md) and the [Security](https://github.com/PrightCord/kinetix/wiki/Security) documentation for the security model and vulnerability-reporting process.
 
 ## Deployment
 
@@ -379,20 +379,20 @@ The Compose configuration binds Kinetix to localhost by default and includes an 
 Install the latest release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
 ```
 
 Pin a release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh \
   | KINETIX_VERSION=v0.1.0 bash
 ```
 
 Build the current `main` branch instead:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh \
   | KINETIX_VERSION=main bash
 ```
 
@@ -407,7 +407,7 @@ kinetix uninstall
 Or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LazyGreed/kinetix/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/uninstall.sh | bash
 ```
 
 Additional options:
@@ -418,7 +418,7 @@ kinetix uninstall [--yes] [--remove-binary] [--keep-data] [--dry-run]
 
 ## Documentation
 
-The [Kinetix Wiki](https://github.com/LazyGreed/kinetix/wiki) contains task-oriented documentation covering:
+The [Kinetix Wiki](https://github.com/PrightCord/kinetix/wiki) contains task-oriented documentation covering:
 
 * Getting Started
 * CLI Reference
