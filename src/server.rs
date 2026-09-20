@@ -120,12 +120,70 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
 
     tracing::info!(addr = %config.bind, "Kinetix is listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(config.shutdown_grace_secs))
-        .await
-        .context("server error")?;
+    serve_with_shutdown(
+        listener,
+        app,
+        Duration::from_secs(config.shutdown_grace_secs),
+        shutdown_signal(),
+    )
+    .await?;
 
-    tracing::info!("Kinetix shut down cleanly");
+    tracing::info!("Kinetix server stopped");
+    Ok(())
+}
+
+async fn serve_with_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    grace: Duration,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    // Keep serving normally until either the server exits unexpectedly or an
+    // OS shutdown signal arrives.
+    tokio::select! {
+        result = &mut server_task => {
+            result.context("server task failed")?.context("server error")?;
+            return Ok(());
+        }
+        _ = shutdown => {}
+    }
+
+    tracing::info!(
+        grace_secs = grace.as_secs(),
+        "shutdown signal received; draining in-flight requests"
+    );
+    let _ = shutdown_tx.send(());
+
+    match tokio::time::timeout(grace, &mut server_task).await {
+        Ok(result) => {
+            result.context("server task failed")?.context("server error")?;
+            tracing::info!("all in-flight requests drained");
+        }
+        Err(_) => {
+            // run() is the top-level server future. Stop polling the Axum
+            // server now; returning from run() then tears down the process
+            // runtime and any connection tasks still draining.
+            server_task.abort();
+            let _ = server_task.await;
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "graceful shutdown deadline exceeded; forcing shutdown"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -235,7 +293,7 @@ fn warn_on_unroutable_routes(registry: &Registry) {
     }
 }
 
-async fn shutdown_signal(grace_secs: u64) {
+async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -257,8 +315,105 @@ async fn shutdown_signal(grace_secs: u64) {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tracing::info!(
-        grace_secs,
-        "shutdown signal received; draining in-flight requests (bounded)"
-    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::get, Router};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn shutdown_deadline_bounds_stuck_in_flight_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (request_started_tx, request_started_rx) = oneshot::channel::<()>();
+        let request_started_tx = Arc::new(Mutex::new(Some(request_started_tx)));
+
+        let app = Router::new().route(
+            "/stuck",
+            get({
+                let request_started_tx = request_started_tx.clone();
+                move || {
+                    let request_started_tx = request_started_tx.clone();
+                    async move {
+                        if let Some(tx) = request_started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        std::future::pending::<()>().await;
+                        "unreachable"
+                    }
+                }
+            }),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let grace = Duration::from_millis(50);
+        let server_task = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            grace,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let request_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .get(format!("http://{addr}/stuck"))
+                .send()
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), request_started_rx)
+            .await
+            .expect("request never reached the handler")
+            .expect("request-start signal sender dropped");
+
+        let started = tokio::time::Instant::now();
+        shutdown_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(500), server_task)
+            .await
+            .expect("server exceeded the shutdown deadline tolerance")
+            .expect("server task panicked")
+            .expect("server returned an error");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown should return shortly after the grace deadline"
+        );
+
+        request_task.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_cleanly_when_nothing_is_in_flight() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let app = Router::new();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            Duration::from_secs(1),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        shutdown_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(500), server_task)
+            .await
+            .expect("idle server did not drain promptly")
+            .expect("server task panicked")
+            .expect("server returned an error");
+    }
 }
