@@ -280,7 +280,7 @@ description = "Optional email address used as an OAuth login hint."
 
 ## Developing Plugins
 
-The separate `plugins/` workspace contains the official Rust SDK and example plugins.
+The official Rust SDK, first-party plugins, catalog source, and packaging tooling live in the separate [`PrightCord/kinetix-plugins`](https://github.com/PrightCord/kinetix-plugins) repository.
 
 ### 1. Project Setup
 
@@ -296,7 +296,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-kinetix-plugin-sdk = { path = "../sdk" }
+kinetix-plugin-sdk = { path = "../../sdk" }
 wit-bindgen = "0.62"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -318,15 +318,15 @@ impl Guest for MyPlugin {
 export!(MyPlugin);
 ```
 
-### 3. Build with `scripts/build-plugin.sh`
+### 3. Build from `kinetix-plugins`
 
-The build script compiles the crate to `wasm32-wasip1` (or `wasm32-unknown-unknown`), converts it to a component using `wasm-tools`, validates WIT compliance, and packages the `.kxp` archive:
+From a checkout of `PrightCord/kinetix-plugins`, the build script compiles the crate for `wasm32-unknown-unknown`, converts it to a component using `wasm-tools`, validates WIT compliance, and packages the deterministic `.kxp` archive:
 
 ```bash
 ./scripts/build-plugin.sh plugins/antigravity-oauth
 ```
 
-The output package is produced at `plugins/antigravity-oauth/target/antigravity-oauth-0.1.0.kxp`.
+The output package is written beside the plugin source, for example `plugins/antigravity-oauth/dev.kinetix.antigravity-oauth-0.1.0.kxp`.
 
 ### Installed package retention
 
@@ -347,10 +347,10 @@ operation. Plugins never receive filesystem access to this cache.
 
 ## Plugin Catalog
 
-Kinetix ships an embedded official catalog metadata file at
-`plugins/catalog.json`, exposed through `GET /admin/api/plugins/catalog`.
-The catalog powers dashboard discovery, but it is deliberately **not** a trust
-root for package installation.
+The authoritative official catalog metadata lives in `PrightCord/kinetix-plugins/catalog.json`.
+Kinetix vendors a default offline snapshot at `src/plugins/catalog.snapshot.json`, exposed through
+`GET /admin/api/plugins/catalog`. The catalog powers dashboard discovery, but it is deliberately
+**not** a trust root for package installation.
 
 Catalog metadata may describe publisher, capabilities, version, and expected
 artifact naming. Package installation still requires the normal Kinetix package
@@ -363,8 +363,8 @@ following are present:
 - the catalog entry is marked `installable = true`;
 - it contains an HTTPS distribution URL, exact SHA-256, publisher key id, and
   explicit redirect-host allow-list;
-- the publisher key id resolves in the separate compiled
-  `plugins/trusted-publishers.json` trust store;
+- the publisher key id resolves in the separately compiled
+  `src/plugins/trusted-publishers.snapshot.json` trust-store snapshot;
 - the downloaded package's SHA, manifest id/version, and Ed25519 signature all
   verify before installation.
 
@@ -375,21 +375,18 @@ download URL or signing key.
 
 Generate the signing key offline and keep the private key out of the repository:
 
+Run publisher-key and package tooling from the `PrightCord/kinetix-plugins` checkout:
+
 ```sh
 openssl genpkey -algorithm ED25519 -out kinetix-plugin-signing.pem
 bash scripts/plugin-publisher-key.sh kinetix-plugin-signing.pem
+KINETIX_PLUGIN_SIGNING_KEY_FILE=kinetix-plugin-signing.pem \
+  scripts/build-plugin.sh plugins/antigravity-oauth
 ```
 
-Commit only the printed raw public key (base64) to
-`plugins/trusted-publishers.json`, with a stable key id such as
-`kinetix-official-v1`. Set `KINETIX_PLUGIN_SIGNING_KEY_FILE` when using
-`scripts/release-local.sh`, or configure the
-`KINETIX_PLUGIN_SIGNING_KEY_PEM` GitHub Actions secret for the manual release
-workflow.
-
-`scripts/build-plugin.sh` then embeds `signature.ed25519` in the deterministic
-`.kxp`. Release checksums include both Kinetix binaries and signed plugin
-packages.
+Commit only the printed raw public key (base64) to `trusted-publishers.json`, with a stable key id
+such as `kinetix-official-v1`. The plugin build embeds `signature.ed25519` in the deterministic
+`.kxp`; plugin release assets and checksums are owned by the plugin repository, not Kinetix core.
 
 Do not set an entry `installable = true` until the signed release asset exists
 and its exact SHA-256 and redirect hosts have been committed to the catalog.
@@ -448,7 +445,7 @@ rolled-back manifest before it can be enabled again.
 
 ```bash
 # 1. Install package (installed-disabled by default)
-kinetix plugin install plugins/antigravity-oauth/target/antigravity-oauth-0.1.0.kxp \
+kinetix plugin install /path/to/dev.kinetix.antigravity-oauth-0.1.0.kxp \
   --allow-untrusted-signature
 
 # 2. View manifest and requested permissions

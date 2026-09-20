@@ -51,13 +51,6 @@ command -v npm >/dev/null 2>&1 || err "npm is required"
 command -v tar >/dev/null 2>&1 || err "tar is required"
 command -v sha256sum >/dev/null 2>&1 || err "sha256sum is required"
 
-PLUGIN_SIGNING_KEY_FILE="${KINETIX_PLUGIN_SIGNING_KEY_FILE:-}"
-if [ -n "$PLUGIN_SIGNING_KEY_FILE" ]; then
-  command -v wasm-tools >/dev/null 2>&1 || err "wasm-tools is required when signing plugin release assets"
-  command -v openssl >/dev/null 2>&1 || err "openssl is required when signing plugin release assets"
-  [ -f "$PLUGIN_SIGNING_KEY_FILE" ] || err "plugin signing key not found: $PLUGIN_SIGNING_KEY_FILE"
-fi
-
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || err "must be run from a git checkout"
 
 if [ "$PUBLISH" -eq 1 ]; then
@@ -160,24 +153,12 @@ for TARGET in "${TARGETS[@]}"; do
   )
 done
 
-# 3. Optionally build signed first-party plugin release assets.
-if [ -n "$PLUGIN_SIGNING_KEY_FILE" ]; then
-  log "Building signed first-party plugin packages..."
-  rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
-  (
-    cd "$BUILD_ROOT"
-    KINETIX_PLUGIN_SIGNING_KEY_FILE="$PLUGIN_SIGNING_KEY_FILE" \
-      scripts/build-plugin.sh plugins/antigravity-oauth
-  )
-  cp "$BUILD_ROOT"/plugins/antigravity-oauth/*.kxp "$DIST_DIR"/
-fi
-
-# 4. Create consolidated SHA256SUMS file.
+# 3. Create consolidated SHA256SUMS file.
 log "Generating canonical SHA256SUMS..."
 (
   cd "$DIST_DIR"
   shopt -s nullglob
-  ASSETS=(kinetix-"$TAG"-*.tar.gz *.kxp)
+  ASSETS=(kinetix-"$TAG"-*.tar.gz)
   [ "${#ASSETS[@]}" -gt 0 ] || err "no release assets were produced"
   sha256sum "${ASSETS[@]}" > SHA256SUMS
 )
@@ -185,7 +166,7 @@ log "Generating canonical SHA256SUMS..."
 log "Release artifacts prepared in $DIST_DIR from source $SOURCE_SHA:"
 ls -lh "$DIST_DIR"
 
-# 5. Optional publish via gh. Create a new tag only after every artifact succeeds.
+# 4. Optional publish via gh. Create a new tag only after every artifact succeeds.
 if [ "$PUBLISH" -eq 1 ]; then
   log "Publishing release $TAG to GitHub..."
 
@@ -212,7 +193,6 @@ if [ "$PUBLISH" -eq 1 ]; then
   RELEASE_ASSETS=(
     "$DIST_DIR"/kinetix-"$TAG"-*.tar.gz
     "$DIST_DIR"/kinetix-"$TAG"-*.sha256
-    "$DIST_DIR"/*.kxp
     "$DIST_DIR"/SHA256SUMS
   )
   gh release upload "$TAG" "${RELEASE_ASSETS[@]}" --clobber

@@ -1,13 +1,14 @@
 //! End-to-end test: install and run a real compiled plugin component.
 //!
 //! This exercises the full path that unit tests cannot: a genuine `.kxp`
-//! package containing a WebAssembly component built from `plugins/`, installed
-//! through the manager, enabled (which instantiates it), and invoked through a
-//! capability. It proves the WIT host boundary works against a real guest.
+//! package containing a WebAssembly component built by the external
+//! `PrightCord/kinetix-plugins` repository, installed through the manager,
+//! enabled (which instantiates it), and invoked through a capability. It proves
+//! the WIT host boundary works against a real guest.
 //!
-//! The test is skipped (not failed) when the plugin package or the toolchain
-//! that produces it is unavailable, so it does not break environments without
-//! `wasm32-unknown-unknown` / `wasm-tools`.
+//! Set `KINETIX_PLUGIN_E2E_PACKAGE` to a built `.kxp`. The test is skipped when
+//! that package is unavailable so normal core CI stays hermetic and independent
+//! from the plugin repository/toolchain.
 
 use std::sync::Arc;
 
@@ -15,16 +16,11 @@ use kinetix::crypto::Crypto;
 use kinetix::db::{self, Pool};
 use kinetix::plugins::{Capability, HostPolicy, PluginManager};
 
-/// Path to the built `.kxp`, produced by `scripts/build-plugin.sh`.
+/// Path to an externally built `.kxp` used for host/guest conformance.
 fn package_path() -> Option<std::path::PathBuf> {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dir = manifest_dir.join("plugins/antigravity-oauth");
-    let entry = std::fs::read_dir(&dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().map(|x| x == "kxp").unwrap_or(false))?;
-    Some(entry)
+    let path = std::env::var_os("KINETIX_PLUGIN_E2E_PACKAGE")
+        .map(std::path::PathBuf::from)?;
+    path.is_file().then_some(path)
 }
 
 async fn manager() -> (PluginManager, Pool) {
@@ -48,7 +44,7 @@ async fn manager() -> (PluginManager, Pool) {
 async fn installs_enables_and_instantiates_a_real_component() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: build the plugin first (scripts/build-plugin.sh plugins/antigravity-oauth)"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
         );
         return;
     };

@@ -30,11 +30,11 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 - **Embedded Admin Dashboard (`dashboard/`, `src/assets.rs`)**:
   - React 19 + TypeScript + Vite + Tailwind CSS v4 single-page application.
   - Embedded directly into the Rust binary at compile time via `rust-embed`.
-- **Plugin System & Guest SDK (`src/plugins/`, `wit/`, `plugins/`)**:
+- **Plugin Host (`src/plugins/`, `wit/`)**:
   - WebAssembly Component Model runtime powered by `wasmtime` 48.
   - WIT contract defined in `wit/kinetix-plugin.wit` with host capabilities (HTTP egress, logging, key-value storage, credential refreshing).
-  - Guest SDK in `plugins/sdk` and first-party plugins (e.g., `plugins/antigravity-oauth`).
-  - Packaged as `.kxp` deterministic tar archives (`plugin.toml`, `plugin.wasm`, metadata).
+  - The guest SDK, first-party plugins, catalog source, and packaging tooling live in `PrightCord/kinetix-plugins`.
+  - Kinetix vendors only the default catalog/trust snapshots under `src/plugins/` for offline discovery.
 - **CLI & Daemon Runner (`src/main.rs`, `src/cli.rs`, `src/server.rs`)**:
   - Unified binary providing both the proxy daemon (`kinetix serve`) and administrative CLI commands (`kinetix provider`, `model`, `key`, `route`, `user`, etc.).
 
@@ -53,7 +53,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - HTTP routing: `src/server.rs` mounts `src/frontends/`, `src/admin.rs`, and embedded `src/assets.rs`.
   - Request execution: `src/pipeline.rs` orchestrates `src/router.rs`, `src/registry.rs`, `src/pool.rs`, `src/adapters/`, `src/db.rs`, and `src/plugins/`.
   - Leaf modules: `src/types.rs`, `src/crypto.rs`, `src/paths.rs`, `src/sse.rs`, `src/cost.rs`, `src/limits.rs` provide pure types and utilities with zero inward dependencies on pipeline or server.
-  - Plugin workspace: `plugins/` is an independent Cargo workspace decoupled from the main crate build; `src/plugins/` depends only on Wasmtime and WIT definitions.
+  - Plugin host: `src/plugins/` depends on Wasmtime and the host WIT definition. Guest SDK/plugins are maintained independently in `PrightCord/kinetix-plugins`.
 
 ---
 
@@ -82,7 +82,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   cargo build --release
   ```
 - **Plugin build**:
-  To build a `.kxp` package from a guest plugin (requires `wasm32-unknown-unknown` and `wasm-tools`):
+  Guest plugins are built in the separate `PrightCord/kinetix-plugins` repository. From that checkout:
   ```bash
   scripts/build-plugin.sh plugins/antigravity-oauth
   ```
@@ -109,9 +109,9 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   cargo test --test decode_fixtures
   cargo test --test wire_fixtures
 
-  # Plugin subsystem tests
+  # Plugin host subsystem tests
   cargo test --test plugins
-  cargo test --test plugin_e2e
+  KINETIX_PLUGIN_E2E_PACKAGE=/path/to/plugin.kxp cargo test --test plugin_e2e
 
   # End-to-end smoke test against synthetic upstream
   scripts/smoke.sh 127.0.0.1:8180
@@ -215,7 +215,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - `scripts/compat-matrix.sh`: Tests coding-agent client profiles (Pi, Codex Responses, Anthropic) across multi-turn sessions, tool calling, and thinking blocks.
 - **WASM plugin runtime**:
   - `tests/plugins.rs`: Tests plugin store, capabilities, lifecycle, and host policy.
-  - `tests/plugin_e2e.rs`: Tests end-to-end installation, instantiation, and invocation of a compiled `.kxp` package.
+  - `tests/plugin_e2e.rs`: Tests end-to-end installation, instantiation, and invocation of an external compiled `.kxp` supplied with `KINETIX_PLUGIN_E2E_PACKAGE`.
 
 ## fixtures
 
@@ -250,10 +250,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   ```bash
   cd dashboard && npm ci && npm run build
   ```
-- If plugin code or WIT contracts are touched, plugin packaging succeeds:
-  ```bash
-  scripts/build-plugin.sh plugins/antigravity-oauth
-  ```
+- If plugin code is touched, validate/package it in `PrightCord/kinetix-plugins`. If the host WIT changes, coordinate the matching SDK/WIT update in that repository.
 
 ## tests pass
 - All unit and fixture tests pass:

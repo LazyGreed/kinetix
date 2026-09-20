@@ -1471,17 +1471,18 @@ aspiration. It is a living list: update it as later phases land.
   host capability and the buffered `host-http` import is refused to adapter
   stores. A provider bound with `wire_plugin` resolves to its plugin adapter at
   enable time (registered under both `plugin:<id>/<cap>` and the bare id).
-- **Guest SDK and real plugin.** `plugins/sdk` (`kinetix-plugin-sdk`, wit-bindgen
-  0.62) exposes both worlds and small helpers; `plugins/antigravity-oauth` is a
+- **Guest SDK and real plugin.** `PrightCord/kinetix-plugins/sdk` (`kinetix-plugin-sdk`, wit-bindgen
+  0.62) exposes both worlds and small helpers; `PrightCord/kinetix-plugins/plugins/antigravity-oauth` is a
   real component providing a CredentialStrategy (Google OAuth refresh-token
   exchange) **and** the `antigravity` (`v1internal`) wire format, built by
-  `scripts/build-plugin.sh` into a `.kxp`. The component is a valid wasm32
+  `PrightCord/kinetix-plugins/scripts/build-plugin.sh` into a `.kxp`. The component is a valid wasm32
   component (two worlds from one binary).
 - **Live guest-invocation tests.** `tests/plugin_e2e.rs` installs, enables, and
-  invokes the real compiled component: credential-strategy resolution across the
-  host boundary, and the adapter world's `wire_format`/`build_url`/`apply_auth`/
-  `build_body`/`parse_stream_chunk`/`classify_error` (including Antigravity 429
-  quota-reset parsing).
+  invokes a real compiled component supplied through `KINETIX_PLUGIN_E2E_PACKAGE`.
+  The package is built by `PrightCord/kinetix-plugins`, keeping core CI independent
+  from the guest toolchain while preserving host/guest conformance coverage:
+  credential-strategy resolution plus adapter `wire_format`/`build_url`/
+  `apply_auth`/`build_body`/`parse_stream_chunk`/`classify_error`.
 - **Surface.** CLI `kinetix plugin {install,list,show,enable,disable,validate,
   remove,permissions,approve,revoke}`; admin endpoints under `/admin/api/plugins`
   (§20); dashboard-independent JSON summaries.
@@ -1501,6 +1502,6 @@ aspiration. It is a living list: update it as later phases land.
   local `.kxp` upload, permission review/approval, validation, enable/disable,
   and removal. A remote catalog/discovery experience and declarative
   plugin-provided integration UI remain follow-up work.
-- **SDK polish (§22).** `plugins/sdk` exists and works, but it is not published
-  and does not yet auto-generate stub impls for the interfaces a plugin does not
-  provide (a plugin still hand-writes them, as `antigravity-oauth` does).
+- **SDK polish (§22).** The SDK now lives in `PrightCord/kinetix-plugins/sdk` and works, but it is not
+  published and does not yet auto-generate stub impls for interfaces a plugin does
+  not provide.

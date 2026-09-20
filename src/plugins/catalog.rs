@@ -1,8 +1,9 @@
 //! Official plugin catalog and publisher trust metadata.
 //!
-//! The embedded catalog is discovery metadata. Publisher keys live in a
-//! separate embedded trust store so changing a catalog entry cannot introduce a
-//! new trusted signing key.
+//! Kinetix keeps a vendored snapshot for offline/default discovery. The source
+//! catalog and publisher metadata live in `PrightCord/kinetix-plugins`; these
+//! snapshots are host assets, not plugin source. Publisher keys remain separate
+//! so changing a catalog entry cannot introduce a new trusted signing key.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
@@ -67,7 +68,7 @@ fn default_enabled() -> bool {
 }
 
 pub fn embedded_catalog() -> Result<Catalog> {
-    let catalog: Catalog = serde_json::from_str(include_str!("../../plugins/catalog.json"))
+    let catalog: Catalog = serde_json::from_str(include_str!("catalog.snapshot.json"))
         .context("parsing embedded plugin catalog")?;
     if catalog.schema_version != 1 {
         bail!(
@@ -80,7 +81,7 @@ pub fn embedded_catalog() -> Result<Catalog> {
 
 pub fn embedded_trust_store() -> Result<PublisherTrustStore> {
     let store: PublisherTrustStore =
-        serde_json::from_str(include_str!("../../plugins/trusted-publishers.json"))
+        serde_json::from_str(include_str!("trusted-publishers.snapshot.json"))
             .context("parsing embedded plugin publisher trust store")?;
     if store.schema_version != 1 {
         bail!(
