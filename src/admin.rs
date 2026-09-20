@@ -4252,10 +4252,28 @@ pub async fn start_plugin_auth(
         )));
     }
 
-    let redirect_uri = format!(
-        "{}/admin/api/plugins/auth/callback",
-        state.config.public_base_url.trim_end_matches('/')
-    );
+    let redirect_uri = if body.plugin_id == "dev.kinetix.claude-code-oauth" {
+        let base = url::Url::parse(&state.config.public_base_url)
+            .map_err(|_| ApiError::bad("public_base_url is not a valid URL"))?;
+        let host = base
+            .host_str()
+            .ok_or_else(|| ApiError::bad("public_base_url has no host"))?;
+        if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+            return Err(ApiError::bad(
+                "Claude Code OAuth requires a loopback public_base_url",
+            ));
+        }
+        let port = base
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        format!("http://localhost{port}/callback")
+    } else {
+        format!(
+            "{}/admin/api/plugins/auth/callback",
+            state.config.public_base_url.trim_end_matches('/')
+        )
+    };
     let pending = state.plugin_auth_sessions.create(
         &body.plugin_id,
         &body.flow_name,
@@ -4398,11 +4416,12 @@ pub async fn plugin_auth_callback(
         .ok_or_else(|| ApiError::bad("authorization callback is missing code"))?;
 
     let manager = plugin_manager(&state)?;
+    let exchange_code = format!("{code}#{}", query.state);
     let result = match manager
         .auth_exchange(
             &session.plugin_id,
             &session.flow_name,
-            code,
+            &exchange_code,
             &session.redirect_uri,
             Some(&session.pkce_verifier),
         )
