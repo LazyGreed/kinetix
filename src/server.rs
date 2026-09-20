@@ -168,7 +168,9 @@ where
 
     match tokio::time::timeout(grace, &mut server_task).await {
         Ok(result) => {
-            result.context("server task failed")?.context("server error")?;
+            result
+                .context("server task failed")?
+                .context("server error")?;
             tracing::info!("all in-flight requests drained");
         }
         Err(_) => {
@@ -326,9 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_deadline_bounds_stuck_in_flight_request() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let (request_started_tx, request_started_rx) = oneshot::channel::<()>();
@@ -353,14 +353,9 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let grace = Duration::from_millis(50);
-        let server_task = tokio::spawn(serve_with_shutdown(
-            listener,
-            app,
-            grace,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        let server_task = tokio::spawn(serve_with_shutdown(listener, app, grace, async move {
+            let _ = shutdown_rx.await;
+        }));
 
         let request_task = tokio::spawn(async move {
             reqwest::Client::new()
@@ -393,9 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_returns_cleanly_when_nothing_is_in_flight() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app = Router::new();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
