@@ -18,8 +18,7 @@ use kinetix::plugins::{Capability, HostPolicy, PluginManager};
 
 /// Path to an externally built `.kxp` used for host/guest conformance.
 fn package_path() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("KINETIX_PLUGIN_E2E_PACKAGE")
-        .map(std::path::PathBuf::from)?;
+    let path = std::env::var_os("KINETIX_PLUGIN_E2E_PACKAGE").map(std::path::PathBuf::from)?;
     path.is_file().then_some(path)
 }
 
@@ -104,7 +103,9 @@ async fn installs_enables_and_instantiates_a_real_component() {
 #[tokio::test]
 async fn invokes_a_real_guest_capability_through_the_host_boundary() {
     let Some(path) = package_path() else {
-        eprintln!("skipping: plugin package not built");
+        eprintln!(
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+        );
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
@@ -140,7 +141,9 @@ async fn invokes_a_real_guest_capability_through_the_host_boundary() {
 #[tokio::test]
 async fn a_real_guest_reports_usable_after_enable() {
     let Some(path) = package_path() else {
-        eprintln!("skipping: plugin package not built");
+        eprintln!(
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+        );
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
@@ -164,7 +167,9 @@ async fn a_real_guest_reports_usable_after_enable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adapter_world_translates_the_antigravity_wire_format() {
     let Some(path) = package_path() else {
-        eprintln!("skipping: plugin package not built");
+        eprintln!(
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+        );
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
@@ -240,7 +245,9 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adapter_classifies_quota_exhaustion() {
     let Some(path) = package_path() else {
-        eprintln!("skipping: plugin package not built");
+        eprintln!(
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+        );
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
