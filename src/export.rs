@@ -179,27 +179,43 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
     Ok((jsonl_path, csv_path))
 }
 
+fn export_file_day(name: &str) -> Option<chrono::NaiveDate> {
+    let date = if let Some(rest) = name.strip_prefix("usage-") {
+        rest.strip_suffix(".jsonl")
+            .or_else(|| rest.strip_suffix(".csv"))?
+    } else if let Some(rest) = name.strip_prefix("summary-") {
+        rest.strip_suffix(".csv")?
+    } else {
+        return None;
+    };
+
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
 /// Remove export files older than `retention_days` (by filename date).
 pub fn prune(dir: &Path, retention_days: i64) -> Result<u64> {
     if retention_days <= 0 {
         return Ok(0);
     }
     let cutoff = Utc::now().date_naive() - Duration::days(retention_days);
+    prune_before(dir, cutoff)
+}
+
+fn prune_before(dir: &Path, cutoff: chrono::NaiveDate) -> Result<u64> {
     let mut removed = 0u64;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(0);
     };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        // Files are named `<kind>-YYYY-MM-DD.<ext>`.
-        if let Some(date_part) = name.split('-').nth(1) {
-            if let Ok(day) = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-                if day < cutoff && std::fs::remove_file(e.path()).is_ok() {
-                    removed += 1;
-                }
-            }
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if export_file_day(&name).is_some_and(|day| day < cutoff)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
         }
     }
+
     Ok(removed)
 }
 
@@ -252,5 +268,66 @@ pub fn delete_file(dir: &Path, name: &str) -> Result<bool> {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("kinetix-export-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn parses_only_supported_export_file_names() {
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+        assert_eq!(export_file_day("usage-2026-08-31.jsonl"), Some(expected));
+        assert_eq!(export_file_day("usage-2026-08-31.csv"), Some(expected));
+        assert_eq!(export_file_day("summary-2026-08-31.csv"), Some(expected));
+
+        assert_eq!(export_file_day("usage-2026-08-31.txt"), None);
+        assert_eq!(export_file_day("summary-2026-08-31.jsonl"), None);
+        assert_eq!(export_file_day("other-2026-08-31.csv"), None);
+        assert_eq!(export_file_day("usage-not-a-date.csv"), None);
+    }
+
+    #[test]
+    fn prune_before_removes_only_old_supported_exports() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old = [
+            "usage-2026-08-31.jsonl",
+            "usage-2026-08-31.csv",
+            "summary-2026-08-31.csv",
+        ];
+        let keep = [
+            "usage-2026-09-01.jsonl",
+            "usage-2026-09-02.csv",
+            "usage-2026-08-31.txt",
+            "usage-not-a-date.csv",
+            "other-2026-08-31.csv",
+            "README",
+        ];
+
+        for name in old.iter().chain(keep.iter()) {
+            std::fs::write(dir.join(name), b"test").unwrap();
+        }
+
+        let cutoff = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let removed = prune_before(&dir, cutoff).unwrap();
+
+        assert_eq!(removed, old.len() as u64);
+        for name in old {
+            assert!(!dir.join(name).exists(), "{name} should have been pruned");
+        }
+        for name in keep {
+            assert!(dir.join(name).exists(), "{name} should have been retained");
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
