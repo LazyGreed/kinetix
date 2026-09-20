@@ -1114,40 +1114,15 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             Ok(())
         }
         PluginAction::Approve { id } => {
-            let row = manager
-                .get(&id)
-                .await?
-                .with_context(|| format!("plugin '{id}' is not installed"))?;
-            let manifest = row
-                .manifest()
-                .context("plugin has an unreadable manifest")?;
-            let grants = crate::plugins::manager::permission_grants(&manifest);
-            sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ?")
-                .bind(&id)
-                .execute(&pool)
-                .await?;
-            for g in &grants {
-                sqlx::query(
-                    "INSERT INTO plugin_permissions (plugin_id, permission, value_json, approved_at)
-                     VALUES (?,?,?,?)",
-                )
-                .bind(&id)
-                .bind(&g.permission)
-                .bind(&g.value_json)
-                .bind(db::now_iso())
-                .execute(&pool)
-                .await?;
-            }
+            let grants = manager.approve_permissions(&id).await?;
             println!("approved {} grant(s) for '{id}'", grants.len());
             Ok(())
         }
         PluginAction::Revoke { id, permission } => {
-            sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ? AND permission = ?")
-                .bind(&id)
-                .bind(&permission)
-                .execute(&pool)
-                .await?;
-            println!("revoked '{permission}' from '{id}' (KV state retained)");
+            manager.revoke_permission(&id, &permission).await?;
+            println!(
+                "revoked '{permission}' from '{id}'; plugin disabled (KV state retained)"
+            );
             Ok(())
         }
     }

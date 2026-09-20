@@ -71,15 +71,14 @@ impl RuntimeStateRow {
     }
 }
 
-/// Insert or replace an installed (disabled) plugin and its approved
-/// permissions in one transaction.
+/// Insert or replace an installed plugin in a disabled, unapproved state.
+/// Every install or upgrade requires explicit permission approval before enable.
 pub async fn upsert_plugin(
     pool: &Pool,
     validated: &ValidatedManifest,
     sha256: &str,
     component: &[u8],
     signature: &str,
-    approved_permissions: &[PermissionGrant],
 ) -> Result<()> {
     let manifest_json = serde_json::to_string(&validated.manifest)?;
     let api_major = validated.manifest.api_major().unwrap_or(0) as i64;
@@ -87,8 +86,8 @@ pub async fn upsert_plugin(
 
     let mut tx = pool.begin().await.context("begin plugin upsert")?;
 
-    // Preserve `enabled` across an upgrade only when the id already exists; a
-    // fresh install is always installed-disabled (§11).
+    // Install and upgrade are always installed-disabled. An upgrade must never
+    // inherit active authority from the previous component (§11, §20).
     sqlx::query(
         "INSERT INTO plugins
          (id, version, plugin_api_major, package_sha256, enabled, signature,
@@ -98,6 +97,7 @@ pub async fn upsert_plugin(
            version=excluded.version,
            plugin_api_major=excluded.plugin_api_major,
            package_sha256=excluded.package_sha256,
+           enabled=0,
            signature=excluded.signature,
            manifest_json=excluded.manifest_json,
            component=excluded.component,
@@ -115,23 +115,12 @@ pub async fn upsert_plugin(
     .execute(&mut *tx)
     .await?;
 
-    // Replace the approved permission set wholesale (all-or-nothing, §20).
+    // Installation and upgrade never approve permissions implicitly. Clear any
+    // previous grants so a new component cannot inherit authority.
     sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ?")
         .bind(&validated.manifest.id)
         .execute(&mut *tx)
         .await?;
-    for g in approved_permissions {
-        sqlx::query(
-            "INSERT INTO plugin_permissions (plugin_id, permission, value_json, approved_at)
-             VALUES (?,?,?,?)",
-        )
-        .bind(&validated.manifest.id)
-        .bind(&g.permission)
-        .bind(&g.value_json)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-    }
 
     // Ensure a runtime-state row exists.
     sqlx::query(
@@ -194,6 +183,44 @@ pub async fn permissions(pool: &Pool, id: &str) -> Result<Vec<PermissionRow>> {
     .bind(id)
     .fetch_all(pool)
     .await?)
+}
+
+/// Replace the approved permission set atomically.
+pub async fn replace_permissions(
+    pool: &Pool,
+    id: &str,
+    grants: &[PermissionGrant],
+) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin plugin permission update")?;
+    sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let now = crate::db::now_iso();
+    for grant in grants {
+        sqlx::query(
+            "INSERT INTO plugin_permissions (plugin_id, permission, value_json, approved_at)
+             VALUES (?,?,?,?)",
+        )
+        .bind(id)
+        .bind(&grant.permission)
+        .bind(&grant.value_json)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Revoke one approved permission grant.
+pub async fn revoke_permission(pool: &Pool, id: &str, permission: &str) -> Result<()> {
+    sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ? AND permission = ?")
+        .bind(id)
+        .bind(permission)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn runtime_state(pool: &Pool, id: &str) -> Result<Option<RuntimeStateRow>> {

@@ -79,12 +79,12 @@ async fn install_is_disabled_and_records_provenance() {
     assert_eq!(row.enabled, 0);
     assert_eq!(row.package_sha256.len(), 64);
 
-    // Permission grants are recorded all-or-nothing (§20).
+    // Installation records requested permissions in the manifest but grants
+    // no runtime authority until the operator explicitly approves them (§20).
     let perms = kinetix::plugins::store::permissions(&pool, "dev.example.foo")
         .await
         .unwrap();
-    assert!(perms.iter().any(|p| p.permission == "network_hosts"));
-    assert!(perms.iter().any(|p| p.permission == "credential_scopes"));
+    assert!(perms.is_empty());
 }
 
 #[tokio::test]
@@ -96,6 +96,63 @@ async fn hash_mismatch_is_rejected() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("hash mismatch"), "{err}");
+}
+
+#[tokio::test]
+async fn enable_requires_explicit_permission_approval() {
+    let (m, _pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+
+    let err = m.enable("dev.example.foo").await.unwrap_err();
+    assert!(err.to_string().contains("permissions are not approved"), "{err}");
+    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 0);
+}
+
+#[tokio::test]
+async fn upgrade_disables_plugin_and_clears_previous_approvals() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    kinetix::plugins::store::set_enabled(&pool, "dev.example.foo", true)
+        .await
+        .unwrap();
+
+    let upgraded = GOOD_MANIFEST.replace("version = \"1.2.0\"", "version = \"1.3.0\"");
+    let upgraded_kxp = build_kxp(&upgraded, EMPTY_COMPONENT);
+    m.install(&upgraded_kxp, None, &[], false).await.unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    assert_eq!(row.version, "1.3.0");
+    assert_eq!(row.enabled, 0);
+    assert!(
+        kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn revoking_a_permission_disables_the_plugin() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    kinetix::plugins::store::set_enabled(&pool, "dev.example.foo", true)
+        .await
+        .unwrap();
+
+    m.revoke_permission("dev.example.foo", "network_hosts")
+        .await
+        .unwrap();
+
+    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 0);
+    let perms = kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+        .await
+        .unwrap();
+    assert!(!perms.iter().any(|p| p.permission == "network_hosts"));
 }
 
 #[tokio::test]
@@ -126,6 +183,7 @@ async fn component_not_implementing_the_world_fails_to_enable() {
     let (m, _pool) = manager().await;
     let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
     // Enable instantiates the component; an empty component does not satisfy the
     // plugin world, so enablement fails closed (AC#4).
     let err = m.enable("dev.example.foo").await.unwrap_err();

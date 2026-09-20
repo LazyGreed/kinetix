@@ -60,12 +60,19 @@ impl HostBacking for Backing {
     async fn resolve_secret(
         &self,
         _plugin_id: &str,
-        _provider_id: &str,
+        provider_id: &str,
         account_id: &str,
     ) -> Result<String> {
         let account = crate::db::get_account(&self.pool, account_id)
             .await?
             .ok_or_else(|| anyhow!("account not found"))?;
+        if account.provider_id != provider_id {
+            bail!(
+                "account '{}' does not belong to provider '{}'",
+                account_id,
+                provider_id
+            );
+        }
         self.crypto.decrypt(&account.secret_enc)
     }
 }
@@ -171,14 +178,14 @@ impl PluginManager {
             .compile(&pkg.component)
             .map_err(|e| anyhow!("{e}"))?;
 
-        let grants = permission_grants(&validated.manifest);
+        // Installation and upgrade never grant authority. The operator must
+        // explicitly approve the declared permission set before enablement.
         store::upsert_plugin(
             &self.inner.pool,
             &validated,
             &pkg.package_sha256,
             &pkg.component,
             sig.as_str(),
-            &grants,
         )
         .await?;
 
@@ -214,9 +221,10 @@ impl PluginManager {
         if !manifest.compatible() {
             bail!("plugin '{id}' is not API-compatible with this host");
         }
+        let grants = self.ensure_permissions_approved(id, &manifest).await?;
         let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
         // Instantiate to prove the component links against our host API.
-        let mut store = self.new_store(&row, &limits, false);
+        let mut store = self.new_store(&row, &limits, &grants, false);
         let component = self.inner.runtime.compile(&row.component)?;
         let linker = self.inner.runtime.linker()?;
         let _ = self
@@ -245,6 +253,62 @@ impl PluginManager {
 
     pub async fn get(&self, id: &str) -> Result<Option<PluginRow>> {
         store::get_plugin(&self.inner.pool, id).await
+    }
+
+    /// Explicitly approve the plugin's currently declared permission set.
+    pub async fn approve_permissions(&self, id: &str) -> Result<Vec<PermissionGrant>> {
+        let row = self
+            .get(id)
+            .await?
+            .ok_or_else(|| anyhow!("plugin '{id}' is not installed"))?;
+        let manifest = row
+            .manifest()
+            .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
+        let grants = permission_grants(&manifest);
+        store::replace_permissions(&self.inner.pool, id, &grants).await?;
+        Ok(grants)
+    }
+
+    /// Revoke one permission and immediately disable the plugin.
+    pub async fn revoke_permission(&self, id: &str, permission: &str) -> Result<()> {
+        if self.get(id).await?.is_none() {
+            bail!("plugin '{id}' is not installed");
+        }
+        store::revoke_permission(&self.inner.pool, id, permission).await?;
+        self.disable(id).await
+    }
+
+    /// Return approved grants only when they exactly match the current manifest.
+    async fn ensure_permissions_approved(
+        &self,
+        id: &str,
+        manifest: &Manifest,
+    ) -> Result<Vec<PermissionGrant>> {
+        let requested = permission_grants(manifest);
+        let approved: Vec<PermissionGrant> = store::permissions(&self.inner.pool, id)
+            .await?
+            .into_iter()
+            .map(|row| PermissionGrant {
+                permission: row.permission,
+                value_json: row.value_json,
+            })
+            .collect();
+
+        let requested_set: std::collections::BTreeSet<_> = requested
+            .iter()
+            .map(|g| (g.permission.clone(), g.value_json.clone()))
+            .collect();
+        let approved_set: std::collections::BTreeSet<_> = approved
+            .iter()
+            .map(|g| (g.permission.clone(), g.value_json.clone()))
+            .collect();
+
+        if requested_set != approved_set {
+            bail!(
+                "plugin '{id}' permissions are not approved for the current manifest; run kinetix plugin approve {id}"
+            );
+        }
+        Ok(approved)
     }
 
     /// Read the plugin's host-stamped cached routing facts (§6.4) for the
@@ -284,17 +348,19 @@ impl PluginManager {
 
     /// Whether a plugin is installed, enabled, and its circuit is not open.
     pub async fn is_usable(&self, id: &str) -> bool {
-        match self.get(id).await {
-            Ok(Some(row)) if row.status().is_enabled() => {
-                match store::runtime_state(&self.inner.pool, id).await {
-                    Ok(Some(state)) => match state.circuit() {
-                        CircuitState::Open => false,
-                        _ => true,
-                    },
-                    _ => true,
-                }
-            }
-            _ => false,
+        let row = match self.get(id).await {
+            Ok(Some(row)) if row.status().is_enabled() => row,
+            _ => return false,
+        };
+        let Some(manifest) = row.manifest() else {
+            return false;
+        };
+        if self.ensure_permissions_approved(id, &manifest).await.is_err() {
+            return false;
+        }
+        match store::runtime_state(&self.inner.pool, id).await {
+            Ok(Some(state)) => !matches!(state.circuit(), CircuitState::Open),
+            _ => true,
         }
     }
 
@@ -343,6 +409,7 @@ impl PluginManager {
         &self,
         row: &PluginRow,
         limits: &manifest::EffectiveLimits,
+        grants: &[PermissionGrant],
         adapter: bool,
     ) -> wasmtime::Store<HostCtx> {
         let manifest = row.manifest().unwrap_or_else(|| Manifest {
@@ -356,12 +423,31 @@ impl PluginManager {
             limits: Limits::default(),
             routing_facts_mode: "pure".into(),
         });
+        // Runtime authority is derived only from approved grant rows.
+        let mut network_hosts = Vec::new();
+        let mut credential_scopes = Vec::new();
+        let mut credential_read = false;
+        for grant in grants {
+            match grant.permission.as_str() {
+                "network_hosts" => {
+                    network_hosts = serde_json::from_str(&grant.value_json).unwrap_or_default();
+                }
+                "credential_scopes" => {
+                    credential_scopes = serde_json::from_str(&grant.value_json).unwrap_or_default();
+                }
+                "credential_read" => {
+                    credential_read = serde_json::from_str(&grant.value_json).unwrap_or(false);
+                }
+                _ => {}
+            }
+        }
+
         let ctx = HostCtx {
             plugin_id: row.id.clone(),
-            network_hosts: manifest.permissions.network_hosts.clone(),
-            credential_read: manifest.permissions.credential_read,
-            credential_sign: !manifest.permissions.credential_scopes.is_empty(),
-            credential_scopes: manifest.permissions.credential_scopes.clone(),
+            network_hosts,
+            credential_read,
+            credential_sign: !credential_scopes.is_empty(),
+            credential_scopes,
             storage_quota: limits.storage,
             max_outbound_requests: limits.max_outbound_requests,
             max_http_body: limits.max_http_body,
@@ -388,10 +474,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
+        let grants = self.ensure_permissions_approved(id, &manifest).await?;
         let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
         let component = self.inner.runtime.compile(&row.component)?;
         let linker = self.inner.runtime.linker()?;
-        let mut store = self.new_store(&row, &limits, adapter);
+        let mut store = self.new_store(&row, &limits, &grants, adapter);
         let plugin = self
             .inner
             .runtime
@@ -425,10 +512,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
+        let grants = self.ensure_permissions_approved(id, &manifest).await?;
         let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
         let component = self.inner.runtime.compile(&row.component)?;
         let linker = self.inner.runtime.linker()?;
-        let mut store = self.new_store(&row, &limits, true);
+        let mut store = self.new_store(&row, &limits, &grants, true);
         let plugin = self
             .inner
             .runtime
@@ -855,7 +943,8 @@ impl PluginManager {
         let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
         let component = self.inner.runtime.compile(&row.component)?;
         let linker = self.inner.runtime.linker()?;
-        let mut store = self.new_store(&row, &limits, false);
+        // Validation proves linking with no runtime authority granted.
+        let mut store = self.new_store(&row, &limits, &[], false);
         let _ = self
             .inner
             .runtime
@@ -1051,6 +1140,62 @@ pub fn read_package(path: &std::path::Path) -> Result<Package> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn backing_rejects_cross_provider_account_lookup() {
+        let dir = std::env::temp_dir().join(format!(
+            "kinetix-plugin-credential-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("t.db").display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let crypto = Arc::new(Crypto::new(&[11u8; 32]));
+
+        let provider = |name: &str| crate::db::NewProvider {
+            name,
+            base_url: "https://example.com",
+            wire_format: crate::types::WireFormat::Openai,
+            auth_scheme: crate::types::AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: serde_json::json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+        };
+        let provider_a = crate::db::insert_provider(&pool, &provider("A")).await.unwrap();
+        let provider_b = crate::db::insert_provider(&pool, &provider("B")).await.unwrap();
+        let secret_enc = crypto.encrypt("provider-b-secret").unwrap();
+        let account_id = crate::db::insert_account(
+            &pool,
+            &provider_b,
+            "B account",
+            &secret_enc,
+            "****",
+            1,
+            1,
+            None,
+            "unknown",
+        )
+        .await
+        .unwrap();
+
+        let backing = Backing { pool, crypto };
+        let err = backing
+            .resolve_secret("dev.example.plugin", &provider_a, &account_id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not belong"), "{err}");
+    }
 
     #[test]
     fn permission_grants_are_all_or_nothing() {

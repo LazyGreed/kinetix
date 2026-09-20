@@ -3716,33 +3716,11 @@ pub async fn approve_plugin_permissions(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let row = crate::plugins::store::get_plugin(&state.pool, &id)
+    let manager = plugin_manager(&state)?;
+    let grants = manager
+        .approve_permissions(&id)
         .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("plugin not found"))?;
-    let manifest = row
-        .manifest()
-        .ok_or_else(|| ApiError::bad("plugin has an unreadable manifest"))?;
-    let grants = crate::plugins::manager::permission_grants(&manifest);
-    // Replace the approved set with the currently declared set.
-    sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ?")
-        .bind(&id)
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    for g in &grants {
-        sqlx::query(
-            "INSERT INTO plugin_permissions (plugin_id, permission, value_json, approved_at)
-             VALUES (?,?,?,?)",
-        )
-        .bind(&id)
-        .bind(&g.permission)
-        .bind(&g.value_json)
-        .bind(db::now_iso())
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    }
+        .map_err(plugin_bad)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -3769,12 +3747,11 @@ pub async fn revoke_plugin_permissions(
     if permission.is_empty() {
         return Err(ApiError::bad("provide a permission to revoke"));
     }
-    sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ? AND permission = ?")
-        .bind(&id)
-        .bind(permission)
-        .execute(&state.pool)
+    let manager = plugin_manager(&state)?;
+    manager
+        .revoke_permission(&id, permission)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(plugin_bad)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -3785,7 +3762,12 @@ pub async fn revoke_plugin_permissions(
         &format!("Revoked permission '{permission}'. Plugin KV state is retained."),
     )
     .await;
-    Ok(Json(json!({ "ok": true, "id": id, "revoked": permission })))
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "revoked": permission,
+        "enabled": false
+    })))
 }
 
 /// `GET /admin/api/plugins/{id}/audit` — audit entries mentioning this plugin.
