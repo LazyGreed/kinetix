@@ -50,6 +50,9 @@ jobs:
       - name: Release build (NFR-7.1)
         run: cargo build --release
 
+      - name: Installer source-build smoke
+        run: bash scripts/install-smoke.sh
+
       # End-to-end smoke test against the synthetic upstream (FR-9.2, FR-9.4).
       - name: End-to-end smoke
         run: scripts/smoke.sh 127.0.0.1:8180

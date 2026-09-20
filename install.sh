@@ -86,6 +86,8 @@ fi
 if [ "$installed" -eq 0 ]; then
   command -v cargo >/dev/null 2>&1 || err "cargo (Rust) is required to build Kinetix; install from https://rustup.rs (or install a released tag: KINETIX_VERSION=vX.Y.Z)"
   command -v git   >/dev/null 2>&1 || err "git is required to build Kinetix from source"
+  command -v node  >/dev/null 2>&1 || err "Node.js is required to build the embedded dashboard from source"
+  command -v npm   >/dev/null 2>&1 || err "npm is required to build the embedded dashboard from source"
 
   WORK="$(mktemp -d)"
   trap 'rm -rf "$WORK"' EXIT
@@ -95,6 +97,15 @@ if [ "$installed" -eq 0 ]; then
     || git clone --depth 1 "$REPO" "$WORK/kinetix"
 
   cd "$WORK/kinetix"
+
+  log "Building embedded dashboard"
+  (
+    cd dashboard
+    npm ci
+    npm run build
+  )
+  [ -f dashboard/dist/index.html ] || err "dashboard build did not produce dashboard/dist/index.html"
+
   log "Building release binary (this may take a few minutes)"
   cargo build --release --locked 2>/dev/null || cargo build --release
 
