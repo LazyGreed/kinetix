@@ -355,7 +355,11 @@ impl PluginManager {
         let Some(manifest) = row.manifest() else {
             return false;
         };
-        if self.ensure_permissions_approved(id, &manifest).await.is_err() {
+        if self
+            .ensure_permissions_approved(id, &manifest)
+            .await
+            .is_err()
+        {
             return false;
         }
         match store::runtime_state(&self.inner.pool, id).await {
@@ -1153,27 +1157,33 @@ mod tests {
         crate::db::migrate(&pool).await.unwrap();
         let crypto = Arc::new(Crypto::new(&[11u8; 32]));
 
-        let provider = |name: &str| crate::db::NewProvider {
-            name,
-            base_url: "https://example.com",
-            wire_format: crate::types::WireFormat::Openai,
-            auth_scheme: crate::types::AuthScheme::Bearer,
-            custom_header_name: None,
-            custom_param_name: None,
-            extra_headers: serde_json::json!({}),
-            timeout_ms: 30_000,
-            capability_mode: "permissive",
-            models_path: None,
-            rate_limit_rules: serde_json::json!({}),
-            follow_redirects: false,
-            credential_hosts: "",
-            allow_insecure_tls: false,
-            wire_plugin: "",
-            credential_plugin: "",
-            model_source_plugin: "",
-        };
-        let provider_a = crate::db::insert_provider(&pool, &provider("A")).await.unwrap();
-        let provider_b = crate::db::insert_provider(&pool, &provider("B")).await.unwrap();
+        fn new_provider(name: &str) -> crate::db::NewProvider<'_> {
+            crate::db::NewProvider {
+                name,
+                base_url: "https://example.com",
+                wire_format: crate::types::WireFormat::Openai,
+                auth_scheme: crate::types::AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: serde_json::json!({}),
+                timeout_ms: 30_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: serde_json::json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+            }
+        }
+        let provider_a = crate::db::insert_provider(&pool, &new_provider("A"))
+            .await
+            .unwrap();
+        let provider_b = crate::db::insert_provider(&pool, &new_provider("B"))
+            .await
+            .unwrap();
         let secret_enc = crypto.encrypt("provider-b-secret").unwrap();
         let account_id = crate::db::insert_account(
             &pool,
