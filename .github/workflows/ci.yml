@@ -9,10 +9,16 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least-privilege default; jobs that need more (none currently) opt in explicitly.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build / test / lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -73,6 +79,8 @@ jobs:
   dashboard:
     name: dashboard build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: dashboard
