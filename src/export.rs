@@ -271,7 +271,6 @@ pub fn delete_file(dir: &Path, name: &str) -> Result<bool> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
