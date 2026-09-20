@@ -31,6 +31,7 @@ pub fn build(state: AppState) -> Router {
         ]);
 
     let public = Router::new()
+        .route("/callback", get(admin::plugin_auth_callback))
         .route("/healthz", get(api::healthz))
         .route("/v1/chat/completions", post(api::chat_completions))
         .route("/v1/responses", post(api::responses))
