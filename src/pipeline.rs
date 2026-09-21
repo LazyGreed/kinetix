@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::response::Response;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -1692,8 +1693,83 @@ async fn stream_response(
     }
 }
 
-/// The async streaming driver: reads upstream SSE, encodes to the client
-/// format, emits keepalives, and logs usage when done.
+/// Emit normalized events to a streaming client. Returns false when the client
+/// disconnected while writing.
+#[allow(clippy::too_many_arguments)]
+async fn emit_translated_events(
+    events: Vec<StreamEvent>,
+    encoder: &mut Encoder,
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    state: &AppState,
+    meta: &RequestMeta,
+    started: Instant,
+    usage: &mut TokenUsage,
+    ttft_ms: &mut Option<i64>,
+    committed: &mut bool,
+    trace: &mut RouteTrace,
+    saw_reasoning: &mut bool,
+    saw_tool: &mut bool,
+) -> bool {
+    for ev in events {
+        if let StreamEvent::Usage(u) = &ev {
+            usage.merge(u);
+        }
+        match &ev {
+            StreamEvent::ThinkingDelta { .. } if !*saw_reasoning => {
+                *saw_reasoning = true;
+                state.flight.record(
+                    &meta.request_id,
+                    started.elapsed().as_millis() as u64,
+                    "reasoning_event",
+                    "first thinking delta",
+                );
+            }
+            StreamEvent::ToolCallStart { .. } if !*saw_tool => {
+                *saw_tool = true;
+                state.flight.record(
+                    &meta.request_id,
+                    started.elapsed().as_millis() as u64,
+                    "tool_call_event",
+                    "first tool call",
+                );
+            }
+            _ => {}
+        }
+        let frames = encoder.encode(ev);
+        if ttft_ms.is_none() && !frames.is_empty() {
+            *ttft_ms = Some(started.elapsed().as_millis() as i64);
+            state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
+            state.live.mark_streaming(&meta.request_id);
+            state.flight.record(
+                &meta.request_id,
+                started.elapsed().as_millis() as u64,
+                "upstream_first_frame",
+                "first upstream model event",
+            );
+        }
+        for frame in frames {
+            if !*committed {
+                *committed = true;
+                trace.commit();
+                state.live.mark_committed(&meta.request_id);
+                state.flight.record(
+                    &meta.request_id,
+                    started.elapsed().as_millis() as u64,
+                    "commit",
+                    "first client bytes",
+                );
+            }
+            if tx.send(Ok(frame)).await.is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The async streaming driver: reads validated upstream SSE (or a complete JSON
+/// response), encodes to the client format, and treats incomplete EOF as a
+/// post-commit upstream failure.
 #[allow(clippy::too_many_arguments)]
 async fn drive_stream(
     state: AppState,
@@ -1719,15 +1795,77 @@ async fn drive_stream(
     let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
-    let mut upstream = attempt.stream.take().expect("stream present");
     let adapter = attempt.adapter.clone();
+
+    // A normal JSON response is already complete and validated before commit.
+    if let Some(events) = attempt.full_events.take() {
+        if !emit_translated_events(
+            events,
+            &mut encoder,
+            &tx,
+            &state,
+            &meta,
+            started,
+            &mut usage,
+            &mut ttft_ms,
+            &mut committed,
+            &mut trace,
+            &mut saw_reasoning,
+            &mut saw_tool,
+        )
+        .await
+        {
+            record_cancel(&state, &meta, started);
+            status = "client_disconnect";
+            status_code = 499;
+        } else {
+            for frame in encoder.finalize() {
+                if tx.send(Ok(frame)).await.is_err() {
+                    record_cancel(&state, &meta, started);
+                    status = "client_disconnect";
+                    status_code = 499;
+                    break;
+                }
+            }
+        }
+
+        finalize_log(
+            &state,
+            &snap,
+            &mut meta,
+            &req,
+            &attempt,
+            &model_display,
+            started,
+            ttft_ms,
+            status,
+            status_code,
+            usage,
+            error_message,
+            key,
+            trace,
+            committed,
+        )
+        .await;
+        return;
+    }
+
+    let upstream = attempt.stream.take().expect("validated SSE stream present");
+    let prefetched = std::mem::take(&mut attempt.prefetched);
+    let replay = futures::stream::iter(
+        prefetched
+            .into_iter()
+            .map(Ok::<Bytes, reqwest::Error>),
+    );
+    let chunks = replay.chain(upstream.bytes_stream());
+    tokio::pin!(chunks);
+
     let mut framer = crate::sse::SseFramer::new();
+    let mut terminal_seen = false;
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
-        // Abort promptly on client disconnect, even between upstream chunks
-        // (NFR-1.10: cancellation signal within ~100ms).
+    'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
             status = "client_disconnect";
@@ -1744,120 +1882,115 @@ async fn drive_stream(
                 }
             }
             _ = keepalive.tick() => {
-                // Keepalive comment (FR-9.4): keeps Cloudflare's ~100s idle
-                // timeout from dropping a long silent thinking phase.
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
-                    // Client disconnected: cancel upstream (FR-2.9).
                     record_cancel(&state, &meta, started);
                     status = "client_disconnect";
                     status_code = 499;
                     break;
                 }
             }
-            chunk = upstream.chunk() => {
+            chunk = chunks.next() => {
                 match chunk {
-                    Ok(Some(bytes)) => {
-                        for frame in framer.push(&bytes) {
-                            let payload = crate::sse::extract_data(&frame);
-                            let Some(payload) = payload else { continue };
-                            if payload.trim() == "[DONE]" { continue; }
-                            match adapter.parse_stream_chunk(&payload) {
-                                Ok(events) => {
-                                    for ev in events {
-                                        if let StreamEvent::Usage(u) = &ev {
-                                            usage.merge(u);
-                                        }
-                                        // Flight recorder: event classes, metadata
-                                        // only (FR-13.1, FR-13.2).
-                                        match &ev {
-                                            StreamEvent::ThinkingDelta { .. } if !saw_reasoning => {
-                                                saw_reasoning = true;
-                                                state.flight.record(
-                                                    &meta.request_id,
-                                                    started.elapsed().as_millis() as u64,
-                                                    "reasoning_event",
-                                                    "first thinking delta",
-                                                );
-                                            }
-                                            StreamEvent::ToolCallStart { .. } if !saw_tool => {
-                                                saw_tool = true;
-                                                state.flight.record(
-                                                    &meta.request_id,
-                                                    started.elapsed().as_millis() as u64,
-                                                    "tool_call_event",
-                                                    "first tool call",
-                                                );
-                                            }
-                                            _ => {}
-                                        }
-                                        let frames = encoder.encode(ev);
-                                        if ttft_ms.is_none() && !frames.is_empty() {
-                                            ttft_ms = Some(started.elapsed().as_millis() as i64);
-                                            state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
-                                            state.live.mark_streaming(&meta.request_id);
-                                            state.flight.record(
-                                                &meta.request_id,
-                                                started.elapsed().as_millis() as u64,
-                                                "upstream_first_frame",
-                                                "first upstream frame",
-                                            );
-                                        }
-                                        for f in frames {
-                                            if !committed {
-                                                committed = true;
-                                                trace.commit();
-                                                state.live.mark_committed(&meta.request_id);
-                                                state.flight.record(&meta.request_id, started.elapsed().as_millis() as u64, "commit", "first client bytes");
-                                            }
-                                            if tx.send(Ok(f)).await.is_err() {
-                                                record_cancel(&state, &meta, started);
-                                                status = "client_disconnect";
-                                                status_code = 499;
-                                                return finalize_log(
-                                                    &state, &snap, &mut meta, &req, &attempt, &model_display,
-                                                    started, ttft_ms, status, status_code, usage,
-                                                    error_message, key, trace, committed,
-                                                ).await;
-                                            }
-                                        }
-                                    }
+                    Some(Ok(bytes)) => {
+                        let frames = match framer.push(&bytes) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(error.to_string());
+                                break 'outer;
+                            }
+                        };
+                        for frame in frames {
+                            let Some(payload) = crate::sse::extract_data(&frame) else {
+                                continue;
+                            };
+                            if payload.trim() == "[DONE]" {
+                                terminal_seen = true;
+                                continue;
+                            }
+                            if let Some(failure) = payload_error_failure(&adapter, &payload) {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(failure.message.clone());
+                                for out in encoder.error_frame(&failure.message) {
+                                    let _ = tx.send(Ok(out)).await;
                                 }
-                                Err(f) => {
+                                break 'outer;
+                            }
+                            let events = match adapter.parse_stream_chunk(&payload) {
+                                Ok(events) => events,
+                                Err(failure) => {
                                     status = "stream_error";
                                     status_code = 502;
-                                    error_message = Some(f.message.clone());
-                                    if committed {
-                                        state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
+                                    error_message = Some(failure.message.clone());
+                                    for out in encoder.error_frame(&failure.message) {
+                                        let _ = tx.send(Ok(out)).await;
                                     }
-                                    for f in encoder.error_frame(&f.message) {
-                                        let _ = tx.send(Ok(f)).await;
-                                    }
-                                    break;
+                                    break 'outer;
                                 }
+                            };
+                            if payload_is_terminal(&payload, &events) {
+                                terminal_seen = true;
+                            }
+                            if !emit_translated_events(
+                                events,
+                                &mut encoder,
+                                &tx,
+                                &state,
+                                &meta,
+                                started,
+                                &mut usage,
+                                &mut ttft_ms,
+                                &mut committed,
+                                &mut trace,
+                                &mut saw_reasoning,
+                                &mut saw_tool,
+                            )
+                            .await
+                            {
+                                record_cancel(&state, &meta, started);
+                                status = "client_disconnect";
+                                status_code = 499;
+                                break 'outer;
                             }
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
+                    Some(Err(error)) => {
                         status = "stream_error";
                         status_code = 502;
-                        error_message = Some(classify_reqwest(&e));
-                        if committed {
-                            state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
-                        }
-                        for f in encoder.error_frame("upstream stream interrupted") {
-                            let _ = tx.send(Ok(f)).await;
-                        }
+                        error_message = Some(classify_reqwest(&error));
                         break;
                     }
+                    None => break,
                 }
             }
         }
     }
 
-    if status == "success" {
-        for f in encoder.finalize() {
-            if tx.send(Ok(f)).await.is_err() {
+    if status == "success" && framer.pending_bytes() > 0 {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended with an incomplete frame".into());
+    } else if status == "success" && !terminal_seen {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended before a terminal event".into());
+    }
+
+    if status == "stream_error" {
+        if committed {
+            state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
+        }
+        let message = error_message
+            .as_deref()
+            .unwrap_or("upstream stream interrupted");
+        for frame in encoder.error_frame(message) {
+            let _ = tx.send(Ok(frame)).await;
+        }
+    } else if status == "success" {
+        for frame in encoder.finalize() {
+            if tx.send(Ok(frame)).await.is_err() {
                 record_cancel(&state, &meta, started);
                 status = "client_disconnect";
                 status_code = 499;
