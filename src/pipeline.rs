@@ -44,6 +44,30 @@ const CIRCUIT_OPEN_SECS: i64 = 30;
 const BACKOFF_BASE_MS: u64 = 100;
 const BACKOFF_CAP_MS: u64 = 1000;
 
+fn provider_phase_timeout(provider: &db::ProviderRow) -> Duration {
+    Duration::from_millis(provider.timeout_ms.max(1) as u64)
+}
+
+fn timeout_failure(message: &'static str) -> UpstreamFailure {
+    UpstreamFailure {
+        kind: FailureKind::Timeout,
+        status: None,
+        retry_after_secs: None,
+        message: message.into(),
+        quota_reset_at: None,
+    }
+}
+
+fn phase_budget(deadline: Instant, provider_timeout: Duration) -> Option<(Instant, Duration)> {
+    let now = Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return None;
+    }
+    let budget = remaining.min(provider_timeout);
+    Some((now + budget, budget))
+}
+
 /// Request-scoped metadata carried into the usage log and Route Trace.
 pub struct RequestMeta {
     pub request_id: String,
@@ -101,6 +125,9 @@ struct Attempt {
     prefetched: Vec<Bytes>,
     /// Parsed complete events for a successful non-SSE JSON response.
     full_events: Option<Vec<StreamEvent>>,
+    /// Maximum silence between upstream transport chunks after pre-commit
+    /// validation. This is a per-gap timer, never a total stream lifetime.
+    idle_timeout: Duration,
     adapter: Arc<dyn Adapter>,
     /// Same-format passthrough is only possible when the upstream is actually
     /// SSE. A JSON response is normalized through parse_full_response().
@@ -117,9 +144,9 @@ struct Attempt {
 /// body's drop-guard, which only exists once a response is produced. During the
 /// pre-commit selection/connect window there is no body to observe, so a client
 /// that goes away then is noticed only when the upstream responds or the
-/// provider timeout elapses. That window is bounded by `provider.timeout_ms`.
-/// Post-commit cancellation is immediate (the guard flips the flag and wakes the
-/// driver).
+/// first-event phase budget elapses. The whole pre-commit window is also capped
+/// by `MAX_PRE_COMMIT_DEADLINE`. Post-commit cancellation is immediate; active
+/// streams have no total wall-clock timeout and only enforce per-gap idle time.
 pub async fn run(
     state: &AppState,
     format: FrontendFormat,
