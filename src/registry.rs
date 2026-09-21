@@ -57,6 +57,10 @@ pub struct ResolvedTarget {
     pub account: AccountRow,
     pub model: ModelRow,
     pub provider: ProviderRow,
+    /// Stable logical route-target identity. Multiple account candidates for an
+    /// unpinned route target share this id so route strategy/weight is applied
+    /// once to the logical target, not once per account.
+    pub route_target_id: Option<String>,
     pub priority: i64,
     pub weight: i64,
     /// Optional typed eligibility predicate (FR-12.3).
@@ -208,27 +212,38 @@ impl Registry {
             let Some(provider) = snap.providers.get(&model.provider_id).cloned() else {
                 continue;
             };
-            // Account: explicit, or the first healthy account of the provider.
-            let account = match &t.account_id {
-                Some(aid) => snap.accounts.get(aid).cloned(),
+            // An explicit account remains pinned. An unpinned target expands
+            // to the provider's full account pool; the pipeline later orders
+            // these siblings without multiplying this logical target's route
+            // priority/weight.
+            let accounts: Vec<AccountRow> = match &t.account_id {
+                Some(aid) => snap
+                    .accounts
+                    .get(aid)
+                    .filter(|a| a.provider_id == model.provider_id)
+                    .cloned()
+                    .into_iter()
+                    .collect(),
                 None => snap
                     .accounts
                     .values()
-                    .filter(|a| a.provider_id == model.provider_id && a.status != "disabled")
-                    .min_by_key(|a| a.priority)
-                    .cloned(),
+                    .filter(|a| a.provider_id == model.provider_id)
+                    .cloned()
+                    .collect(),
             };
-            let Some(account) = account else { continue };
-            targets.push(ResolvedTarget {
-                account,
-                model,
-                provider,
-                priority: t.priority,
-                weight: t.weight,
-                predicate: crate::predicate::TargetPredicate::parse(&t.predicate),
-                param_overrides: serde_json::from_str(&t.param_overrides)
-                    .unwrap_or(serde_json::Value::Null),
-            });
+            for account in accounts {
+                targets.push(ResolvedTarget {
+                    account,
+                    model: model.clone(),
+                    provider: provider.clone(),
+                    route_target_id: Some(t.id.clone()),
+                    priority: t.priority,
+                    weight: t.weight,
+                    predicate: crate::predicate::TargetPredicate::parse(&t.predicate),
+                    param_overrides: serde_json::from_str(&t.param_overrides)
+                        .unwrap_or(serde_json::Value::Null),
+                });
+            }
         }
         if targets.is_empty() {
             return None;
