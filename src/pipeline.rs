@@ -1548,7 +1548,7 @@ fn check_param_policy(target: &ResolvedTarget, req: &InternalRequest) -> Result<
 
 /// Build the client response: streaming or aggregated non-streaming.
 #[allow(clippy::too_many_arguments)]
-fn stream_response(
+async fn stream_response(
     state: &AppState,
     snap: Arc<crate::registry::Snapshot>,
     format: FrontendFormat,
@@ -1665,40 +1665,29 @@ fn stream_response(
                 .unwrap()
         })
     } else {
-        // Non-streaming: aggregate the whole stream, then return JSON (FR-1.4).
-        let (agg_tx, agg_rx) = tokio::sync::oneshot::channel::<Value>();
+        // Non-streaming stays uncommitted until aggregation completes, allowing
+        // a real HTTP error status when the validated upstream later truncates.
         let model_name = req.requested_model.clone();
-        // Ensure the aggregate driver sees stream=true so usage is delivered
-        // (OpenAI-compatible upstreams only emit the usage chunk when
-        // streaming). The client-visible response is still a single JSON body.
         let mut req = req;
         req.stream = true;
-        tokio::spawn(async move {
-            let result = drive_aggregate(
-                state,
-                snap,
-                format,
-                meta,
-                req,
-                attempt,
-                encoder_ctx,
-                started,
-                key,
-                model_name,
-                trace,
-            )
-            .await;
-            let _ = agg_tx.send(result);
-        });
-        let body = Body::from_stream(async_stream::stream! {
-            match agg_rx.await {
-                Ok(v) => yield Ok::<Bytes, std::io::Error>(Bytes::from(v.to_string())),
-                Err(_) => yield Ok(Bytes::from("{\"error\":{\"message\":\"internal error\"}}")),
-            }
-        });
+        let result = drive_aggregate(
+            state,
+            snap,
+            format,
+            meta,
+            req,
+            attempt,
+            encoder_ctx,
+            started,
+            key,
+            model_name,
+            trace,
+        )
+        .await;
         builder
+            .status(result.status_code)
             .header("content-type", "application/json")
-            .body(body)
+            .body(Body::from(result.body.to_string()))
             .unwrap_or_else(|_| Response::new(Body::empty()))
     }
 }
@@ -2095,6 +2084,11 @@ fn record_cancel(state: &AppState, meta: &RequestMeta, started: Instant) {
     );
 }
 
+struct AggregateResult {
+    body: Value,
+    status_code: u16,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_aggregate(
     state: AppState,
@@ -2108,8 +2102,8 @@ async fn drive_aggregate(
     key: Option<db::VirtualKeyRow>,
     model_name: String,
     mut trace: RouteTrace,
-) -> Value {
-    let mut upstream = attempt.stream.take().expect("stream present");
+) -> AggregateResult {
+    let mut upstream = attempt.stream.take();
     let adapter = attempt.adapter.clone();
     let mut framer = crate::sse::SseFramer::new();
     let mut events: Vec<StreamEvent> = Vec::new();
@@ -2182,12 +2176,15 @@ async fn drive_aggregate(
     .await;
 
     if status != "success" {
-        return serde_json::json!({
-            "error": {
-                "message": error_message.unwrap_or_else(|| "upstream stream interrupted".into()),
-                "type": "upstream_error"
-            }
-        });
+        return AggregateResult {
+            body: serde_json::json!({
+                "error": {
+                    "message": error_message.unwrap_or_else(|| "upstream stream interrupted".into()),
+                    "type": "upstream_error"
+                }
+            }),
+            status_code: status_code.clamp(400, 599) as u16,
+        };
     }
 
     let body = frontends::aggregate(format, &model_name, &encoder_ctx.request_id, events, &usage);
@@ -2206,7 +2203,10 @@ async fn drive_aggregate(
             .await;
         }
     }
-    body
+    AggregateResult {
+        body,
+        status_code: 200,
+    }
 }
 
 /// Compute cost and enqueue the usage row (never blocks the request path),
