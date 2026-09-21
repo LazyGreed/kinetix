@@ -125,10 +125,7 @@ pub fn is_available(account: &AccountRow) -> bool {
 /// Order accounts by priority while using account weight to choose the order
 /// within each priority tier. Sampling is without replacement so every account
 /// remains available for fallback while higher-weight accounts lead more often.
-pub fn order_accounts(
-    mut accounts: Vec<AccountRow>,
-    preferred: Option<&str>,
-) -> Vec<AccountRow> {
+pub fn order_accounts(mut accounts: Vec<AccountRow>, preferred: Option<&str>) -> Vec<AccountRow> {
     use rand::Rng;
 
     accounts.sort_by_key(|a| a.priority);
