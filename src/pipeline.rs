@@ -2392,7 +2392,7 @@ pub async fn dry_run(
             "account_id": t.account.id,
             "account_status": status.as_str(),
             "half_open_probe": half_open_probe,
-            "route_target_id": t.route_target_id,
+            "route_target_id": t.route_target_id.as_deref(),
             "priority": t.priority,
             "weight": t.weight,
             "predicate_result": elig.result.as_str(),
