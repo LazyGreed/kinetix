@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 use crate::adapters::UpstreamContext;
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
-use crate::credentials::CredentialStrategy;
 use crate::crypto;
 use crate::db::{self, Pool};
 use crate::frontends::FrontendFormat;
