@@ -54,6 +54,8 @@ pub enum Command {
     Status,
     /// Run diagnostics against the local installation.
     Doctor,
+    /// Check for or install a released Kinetix binary.
+    Update(UpdateArgs),
     /// Show or change the dashboard admin password.
     Password(PasswordArgs),
     /// Manage virtual keys.
@@ -86,6 +88,25 @@ pub struct ServeArgs {
     pub allow_private_upstreams: bool,
     #[arg(long)]
     pub allow_insecure_tls: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpdateArgs {
+    /// Check for an update without downloading or replacing the binary.
+    #[arg(short = 'c', long)]
+    pub check: bool,
+    /// Install/check a specific release tag, e.g. v0.4.0.
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Skip the interactive replacement confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Reinstall even when the target version is already installed.
+    #[arg(short = 'f', long)]
+    pub force: bool,
+    /// Download and verify the release without replacing the binary.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -498,6 +519,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Init => cmd_init(&cli).await,
         Command::Status => cmd_status(&cli).await,
         Command::Doctor => cmd_doctor(&cli).await,
+        Command::Update(a) => crate::update::run(a).await,
         Command::Password(a) => cmd_password(&cli, a).await,
         Command::Key(a) => cmd_key(&cli, a).await,
         Command::Provider(a) => cmd_provider(&cli, a).await,
