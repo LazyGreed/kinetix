@@ -1288,8 +1288,7 @@ pub async fn test_provider(
             .ok_or_else(|| ApiError::bad("provider has no credentials to test with"))?
     };
     let credential = state
-        .credentials
-        .resolve(&account)
+        .credential_for(&provider, &account)
         .await
         .map(|c| {
             crate::alerts::record_credential_success();
