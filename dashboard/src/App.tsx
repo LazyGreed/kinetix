@@ -401,6 +401,7 @@ export default function App() {
         label: acc.label,
         api_key: acc.apiKey,
         priority: acc.priority,
+        weight: acc.weight,
         soft_quota_usd: acc.softQuotaSpendLimit ?? null,
         quota_type: acc.quotaType,
       }),
@@ -409,11 +410,13 @@ export default function App() {
   const handleUpdateAccount = (acc: Account) =>
     withRefresh(() =>
       Kinetix.updateAccount(acc.id, {
+        provider_id: acc.providerId,
         label: acc.label,
         priority: acc.priority,
-        weight: 1,
+        weight: acc.weight,
         soft_quota_usd: acc.softQuotaSpendLimit ?? null,
         quota_type: acc.quotaType,
+        status: acc.status,
       }),
     );
 
