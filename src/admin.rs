@@ -4505,11 +4505,11 @@ pub async fn plugin_auth_callback(
         ));
     }
 
-    // Bind ordinary callbacks to the admin session that started the flow. Claude
-    // Code is the narrow exception: Anthropic requires a localhost loopback
-    // callback, so a flow started from 127.0.0.1/::1 cannot carry that origin's
-    // host-only cookie to localhost. Only when the cookie is absent do we allow
-    // the dedicated Claude loopback consumer to validate and consume the
+    // Bind ordinary callbacks to the admin session that started the flow. A
+    // small set of reviewed OAuth integrations use loopback redirects whose
+    // hostname can differ from the dashboard hostname, so their host-only admin
+    // cookie cannot cross the callback boundary. Only when the cookie is absent
+    // do we allow the dedicated loopback consumer to validate and consume the
     // host-generated one-time state.
     let initiator = jar
         .get(SESSION_COOKIE)
@@ -4518,7 +4518,7 @@ pub async fn plugin_auth_callback(
         Some(initiator) => state.plugin_auth_sessions.take(&query.state, &initiator),
         None => state
             .plugin_auth_sessions
-            .take_claude_loopback(&query.state),
+            .take_loopback_callback(&query.state),
     }
     .ok_or_else(|| ApiError::bad("invalid or expired plugin auth state"))?;
 
