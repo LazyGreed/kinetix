@@ -117,5 +117,4 @@ mod tests {
         assert_eq!(v["stream"], true);
         assert!(v.get("stream_options").is_none());
     }
-
 }
