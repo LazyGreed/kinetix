@@ -1930,6 +1930,7 @@ async fn drive_stream(
     let mut terminal_seen = false;
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
@@ -1955,9 +1956,16 @@ async fn drive_stream(
                     break;
                 }
             }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                status = "stream_error";
+                status_code = 504;
+                error_message = Some("upstream stream idle timeout".into());
+                break 'outer;
+            }
             chunk = chunks.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
+                        idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
@@ -2125,6 +2133,7 @@ async fn drive_stream_passthrough(
     let mut pending_frames: Vec<String> = Vec::new();
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
@@ -2150,9 +2159,16 @@ async fn drive_stream_passthrough(
                     break;
                 }
             }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                status = "stream_error";
+                status_code = 504;
+                error_message = Some("upstream stream idle timeout".into());
+                break 'outer;
+            }
             chunk = chunks.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
+                        idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
