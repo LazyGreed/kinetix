@@ -559,10 +559,7 @@ mod tests {
     fn anthropic_reset_headers_supply_retry_delay() {
         let mut headers = reqwest::header::HeaderMap::new();
         let reset = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
-        headers.insert(
-            "anthropic-ratelimit-requests-reset",
-            reset.parse().unwrap(),
-        );
+        headers.insert("anthropic-ratelimit-requests-reset", reset.parse().unwrap());
         let delay = anthropic_reset_delay(&headers).unwrap();
         assert!((1..=60).contains(&delay));
     }
