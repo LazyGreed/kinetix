@@ -251,7 +251,10 @@ mod tests {
         // next must still be recognized.
         let mut f = SseFramer::new();
         assert!(f.push(b"data: a\r\n\r").unwrap().is_empty());
-        assert_eq!(f.push(b"\ndata: b\r\n\r\n").unwrap(), vec!["data: a", "data: b"]);
+        assert_eq!(
+            f.push(b"\ndata: b\r\n\r\n").unwrap(),
+            vec!["data: a", "data: b"]
+        );
     }
 
     #[test]
@@ -310,5 +313,4 @@ mod tests {
         }
         assert!(f.push(b"x").is_err());
     }
-
 }
