@@ -3539,6 +3539,9 @@ pub struct PluginInstallBody {
     /// Base64-encoded `.kxp` package (dashboard/API upload).
     #[serde(default)]
     pub package_base64: Option<String>,
+    /// Downloadable URL to a `.kxp` package.
+    #[serde(default)]
+    pub url: Option<String>,
     /// Server-side path to a `.kxp` (operator convenience).
     #[serde(default)]
     pub path: Option<String>,
@@ -3748,19 +3751,50 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
     }
 }
 
-/// `GET /admin/api/plugins/catalog` — embedded official discovery metadata.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct PluginCatalogQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// `GET /admin/api/plugins/catalog` — official discovery metadata.
 ///
-/// Catalog metadata is not a package trust root. Installation continues to use
-/// the normal SHA/signature/permission-review pipeline.
-pub async fn plugin_catalog(_auth: AdminAuth) -> ApiResult {
-    let catalog = crate::plugins::catalog::embedded_catalog().map_err(ApiError::internal)?;
+/// Supports remote sync, local disk caching, and query filtering (`q`, `capability`, `refresh`).
+/// Annotates each entry with `installed`, `installed_version`, and `update_available`.
+pub async fn plugin_catalog(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<PluginCatalogQuery>,
+) -> ApiResult {
+    let cache_file = state.config.paths.plugin_catalog_cache_file();
+    let catalog =
+        crate::plugins::catalog::load_catalog(Some(&state.http), Some(&cache_file), query.refresh)
+            .await
+            .map_err(ApiError::internal)?;
+
     let trust = crate::plugins::catalog::embedded_trust_store().map_err(ApiError::internal)?;
 
-    let mut plugins = Vec::with_capacity(catalog.plugins.len());
-    for plugin in catalog.plugins {
+    let installed_plugins = if let Ok(manager) = plugin_manager(&state) {
+        manager.list().await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let filtered = crate::plugins::catalog::filter_catalog(
+        &catalog.plugins,
+        query.q.as_deref(),
+        query.capability.as_deref(),
+    );
+
+    let mut plugins = Vec::with_capacity(filtered.len());
+    for plugin in filtered {
         let ready =
-            crate::plugins::catalog::install_ready(&plugin, &trust).map_err(ApiError::internal)?;
-        let mut value = serde_json::to_value(&plugin).map_err(ApiError::internal)?;
+            crate::plugins::catalog::install_ready(plugin, &trust).map_err(ApiError::internal)?;
+        let mut value = serde_json::to_value(plugin).map_err(ApiError::internal)?;
         value["install_ready"] = json!(ready);
         value["trust_status"] = json!(if ready {
             "trusted"
@@ -3769,12 +3803,40 @@ pub async fn plugin_catalog(_auth: AdminAuth) -> ApiResult {
         } else {
             "discovery_only"
         });
+
+        let installed = installed_plugins.iter().find(|p| p.id == plugin.id);
+        if let Some(inst) = installed {
+            value["installed"] = json!(true);
+            value["installed_version"] = json!(inst.version);
+            value["update_available"] = json!(crate::plugins::catalog::is_update_available(
+                &inst.version,
+                &plugin.latest_version
+            ));
+        } else {
+            value["installed"] = json!(false);
+            value["installed_version"] = json!(null);
+            value["update_available"] = json!(false);
+        }
         plugins.push(value);
     }
 
     Ok(Json(json!({
         "schema_version": catalog.schema_version,
         "plugins": plugins,
+    })))
+}
+
+/// `POST /admin/api/plugins/catalog/refresh` — force remote synchronization of the marketplace catalog.
+pub async fn refresh_plugin_catalog(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
+    let cache_file = state.config.paths.plugin_catalog_cache_file();
+    let catalog = crate::plugins::catalog::load_catalog(Some(&state.http), Some(&cache_file), true)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(json!({
+        "schema_version": catalog.schema_version,
+        "count": catalog.plugins.len(),
+        "refreshed": true,
     })))
 }
 
@@ -3846,7 +3908,7 @@ async fn download_catalog_package(
 struct VerifiedCatalogPackage {
     plugin: crate::plugins::catalog::CatalogPlugin,
     bytes: Vec<u8>,
-    key: [u8; 32],
+    keys: Vec<[u8; 32]>,
     validated: crate::plugins::ValidatedManifest,
 }
 
@@ -3855,7 +3917,15 @@ async fn verify_catalog_package(
     manager: &crate::plugins::PluginManager,
     id: &str,
 ) -> Result<VerifiedCatalogPackage, ApiError> {
-    let plugin = crate::plugins::catalog::find_plugin(id).map_err(plugin_bad)?;
+    let cache_file = state.config.paths.plugin_catalog_cache_file();
+    let catalog =
+        crate::plugins::catalog::load_catalog(Some(&state.http), Some(&cache_file), false)
+            .await
+            .map_err(ApiError::internal)?;
+
+    let plugin = crate::plugins::catalog::find_plugin_in_catalog(&catalog, id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("catalog plugin '{id}' not found")))?;
     let distribution = plugin
         .distribution
         .as_ref()
@@ -3866,9 +3936,10 @@ async fn verify_catalog_package(
             "catalog plugin is not install-ready: signed artifact metadata or publisher trust is unavailable",
         ));
     }
-    let key = crate::plugins::catalog::trusted_key(&trust, &plugin)
-        .map_err(plugin_bad)?
-        .ok_or_else(|| ApiError::bad("catalog publisher key is not trusted"))?;
+    let keys = crate::plugins::catalog::trusted_keys(&trust, &plugin).map_err(plugin_bad)?;
+    if keys.is_empty() {
+        return Err(ApiError::bad("catalog publisher key is not trusted"));
+    }
 
     let bytes = download_catalog_package(state, distribution).await?;
     let pkg = crate::plugins::package::read_package(&bytes).map_err(plugin_bad)?;
@@ -3895,7 +3966,7 @@ async fn verify_catalog_package(
             plugin.latest_version, validated.manifest.version
         )));
     }
-    let signature = crate::plugins::package::verify_signature(&pkg, &[key]).map_err(plugin_bad)?;
+    let signature = crate::plugins::package::verify_signature(&pkg, &keys).map_err(plugin_bad)?;
     if signature != crate::plugins::package::SignatureStatus::Verified {
         return Err(ApiError::bad(
             "catalog package is not signed by its trusted publisher key",
@@ -3905,7 +3976,7 @@ async fn verify_catalog_package(
     Ok(VerifiedCatalogPackage {
         plugin,
         bytes,
-        key,
+        keys,
         validated,
     })
 }
@@ -3978,7 +4049,7 @@ pub async fn install_catalog_plugin(
         .install_from_source(
             &verified.bytes,
             Some(&distribution.sha256),
-            &[verified.key],
+            &verified.keys,
             false,
             &source,
         )
@@ -4104,15 +4175,23 @@ pub async fn install_plugin(
     Json(body): Json<PluginInstallBody>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    let bytes = if let Some(b64) = &body.package_base64 {
+    let (bytes, source) = if let Some(b64) = &body.package_base64 {
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD
+        let b = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
-            .map_err(|e| ApiError::bad(format!("invalid package_base64: {e}")))?
+            .map_err(|e| ApiError::bad(format!("invalid package_base64: {e}")))?;
+        (b, "upload".to_string())
+    } else if let Some(url_str) = &body.url {
+        let b = crate::plugins::catalog::download_package_from_url(&state.http, url_str)
+            .await
+            .map_err(|e| ApiError::bad(e.to_string()))?;
+        (b, format!("url:{}", url_str.trim()))
     } else if let Some(path) = &body.path {
-        std::fs::read(path).map_err(|e| ApiError::bad(format!("cannot read {path}: {e}")))?
+        let b =
+            std::fs::read(path).map_err(|e| ApiError::bad(format!("cannot read {path}: {e}")))?;
+        (b, format!("file:{path}"))
     } else {
-        return Err(ApiError::bad("provide package_base64 or path"));
+        return Err(ApiError::bad("provide package_base64, url, or path"));
     };
 
     let trusted: Vec<[u8; 32]> = body
@@ -4122,11 +4201,12 @@ pub async fn install_plugin(
         .collect();
 
     let outcome = manager
-        .install(
+        .install_from_source(
             &bytes,
             body.sha256.as_deref(),
             &trusted,
             body.allow_untrusted_signature,
+            &source,
         )
         .await
         .map_err(plugin_bad)?;

@@ -66,6 +66,7 @@ libc = "0.2"
 wasmtime = { version = "48.0.2", features = ["component-model", "async", "cranelift", "pooling-allocator", "runtime"] }
 tar = "0.4.46"
 ed25519-dalek = "3.0.0"
+semver = "1.0"
 
 [features]
 # NFR-1.8: opt-in allocation accounting for the benchmark harness.

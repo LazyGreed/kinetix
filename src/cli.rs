@@ -6,7 +6,7 @@
 //! the config directory), so an operator never needs a `.env` file, an admin
 //! password, or the dashboard to configure the system.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -314,10 +314,20 @@ pub struct PluginArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum PluginAction {
-    /// Install a `.kxp` package (installed-disabled).
+    /// Install a `.kxp` package from a file or from the official marketplace catalog.
     Install {
-        /// Path to a `.kxp` file.
-        path: String,
+        /// Path to a local `.kxp` file.
+        #[arg(conflicts_with = "catalog")]
+        path: Option<String>,
+        /// Install directly by official catalog/marketplace plugin ID.
+        #[arg(long, conflicts_with = "path")]
+        catalog: Option<String>,
+        /// Automatically approve declared permissions after installation.
+        #[arg(long)]
+        approve: bool,
+        /// Enable the plugin immediately (requires approved permissions).
+        #[arg(long)]
+        enable: bool,
         /// Expected SHA-256 (optional; recorded regardless).
         #[arg(long)]
         sha256: Option<String>,
@@ -327,6 +337,27 @@ pub enum PluginAction {
         /// Allow a present-but-untrusted signature.
         #[arg(long)]
         allow_untrusted_signature: bool,
+    },
+    /// Search available marketplace plugins.
+    Search {
+        /// Search query (matches ID, name, description, publisher).
+        query: String,
+        /// Filter by capability.
+        #[arg(long)]
+        capability: Option<String>,
+    },
+    /// Browse the official marketplace catalog.
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
+    /// Check for updates or update an installed catalog plugin.
+    Update {
+        /// Plugin ID to update (or all installed plugins if omitted).
+        id: Option<String>,
+        /// Automatically approve new permissions and enable after update.
+        #[arg(long)]
+        approve: bool,
     },
     /// List installed plugins.
     List,
@@ -346,6 +377,27 @@ pub enum PluginAction {
     Approve { id: String },
     /// Revoke one permission grant (KV state is retained).
     Revoke { id: String, permission: String },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CatalogAction {
+    /// List plugins in the official marketplace.
+    List {
+        /// Refresh catalog from remote before listing.
+        #[arg(long)]
+        refresh: bool,
+        /// Filter by capability.
+        #[arg(long)]
+        capability: Option<String>,
+    },
+    /// View detailed marketplace metadata and release information.
+    Show {
+        /// Catalog plugin ID.
+        id: String,
+        /// Refresh catalog from remote before showing.
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1018,6 +1070,58 @@ async fn cmd_alias(cli: &Cli, args: AliasArgs) -> Result<()> {
     }
 }
 
+async fn download_catalog_bytes(
+    client: &reqwest::Client,
+    distribution: &crate::plugins::catalog::CatalogDistribution,
+) -> Result<Vec<u8>> {
+    let mut url = url::Url::parse(&distribution.url)
+        .with_context(|| format!("invalid catalog artifact URL: {}", distribution.url))?;
+
+    for redirect_count in 0..=5 {
+        crate::plugins::catalog::validate_download_url(distribution, &url)?;
+
+        let response = client
+            .get(url.clone())
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .with_context(|| format!("catalog artifact download failed for {url}"))?;
+
+        if response.status().is_redirection() {
+            if redirect_count == 5 {
+                bail!("catalog artifact exceeded redirect limit");
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow!("catalog artifact redirect has no valid Location"))?;
+            url = url
+                .join(location)
+                .with_context(|| format!("invalid catalog artifact redirect: {location}"))?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            bail!("catalog artifact returned HTTP {}", response.status());
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .context("reading catalog artifact response body")?
+            .to_vec();
+
+        if bytes.len() as u64 > crate::plugins::package::MAX_PACKAGE_BYTES {
+            bail!("catalog artifact exceeds package size limit");
+        }
+
+        return Ok(bytes);
+    }
+
+    bail!("catalog artifact download failed")
+}
+
 async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
     let (config, pool, crypto) = open(cli).await?;
     let crypto = std::sync::Arc::new(crypto);
@@ -1029,34 +1133,424 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
     )
     .context("building plugin host")?;
 
+    let http_client = reqwest::Client::builder()
+        .user_agent(concat!("kinetix-cli/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let cache_file = config.paths.plugin_catalog_cache_file();
+
     match args.action {
         PluginAction::Install {
             path,
+            catalog: catalog_id,
+            approve,
+            enable,
             sha256,
             trusted_keys,
             allow_untrusted_signature,
         } => {
-            let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
-            let trusted: Vec<[u8; 32]> =
-                trusted_keys.iter().filter_map(|k| decode_key(k)).collect();
-            let outcome = manager
-                .install(
-                    &bytes,
-                    sha256.as_deref(),
-                    &trusted,
-                    allow_untrusted_signature,
+            if let Some(cat_id) = catalog_id {
+                let catalog = crate::plugins::catalog::load_catalog(
+                    Some(&http_client),
+                    Some(&cache_file),
+                    false,
                 )
                 .await?;
-            println!(
-                "installed {} v{} (signature: {}); {} capabilities; installed-disabled",
-                outcome.id,
-                outcome.version,
-                outcome.signature.as_str(),
-                outcome.provides.len()
-            );
-            for p in &outcome.provides {
-                println!("  provides {:?} = {}", p.capability, p.name);
+
+                let plugin = crate::plugins::catalog::find_plugin_in_catalog(&catalog, &cat_id)
+                    .ok_or_else(|| anyhow!("catalog plugin '{cat_id}' not found in marketplace"))?;
+
+                let distribution = plugin.distribution.as_ref().ok_or_else(|| {
+                    anyhow!("catalog plugin '{cat_id}' has no installable distribution")
+                })?;
+
+                let trust = crate::plugins::catalog::embedded_trust_store()?;
+                if !crate::plugins::catalog::install_ready(plugin, &trust)? {
+                    bail!("catalog plugin '{cat_id}' is not install-ready: signed artifact metadata or publisher trust is unavailable");
+                }
+
+                let keys = crate::plugins::catalog::trusted_keys(&trust, plugin)?;
+                if keys.is_empty() {
+                    bail!("catalog publisher key is not trusted");
+                }
+
+                println!("Downloading {} v{}...", plugin.id, plugin.latest_version);
+                let bytes = download_catalog_bytes(&http_client, distribution).await?;
+
+                let pkg = crate::plugins::package::read_package(&bytes)?;
+                if !distribution
+                    .sha256
+                    .eq_ignore_ascii_case(&pkg.package_sha256)
+                {
+                    bail!(
+                        "catalog package hash mismatch: expected {}, computed {}",
+                        distribution.sha256,
+                        pkg.package_sha256
+                    );
+                }
+
+                let validated = crate::plugins::package::validate_manifest(&pkg, manager.policy())?;
+                if validated.manifest.id != plugin.id {
+                    bail!(
+                        "catalog artifact id mismatch: expected '{}', package declares '{}'",
+                        plugin.id,
+                        validated.manifest.id
+                    );
+                }
+                if validated.manifest.version != plugin.latest_version {
+                    bail!(
+                        "catalog artifact version mismatch: expected '{}', package declares '{}'",
+                        plugin.latest_version,
+                        validated.manifest.version
+                    );
+                }
+
+                let sig_status = crate::plugins::package::verify_signature(&pkg, &keys)?;
+                if sig_status != crate::plugins::package::SignatureStatus::Verified {
+                    bail!("catalog package is not signed by trusted publisher key");
+                }
+
+                let source = format!("catalog:{}@{}", plugin.id, plugin.latest_version);
+                let outcome = manager
+                    .install_from_source(&bytes, Some(&distribution.sha256), &keys, false, &source)
+                    .await?;
+
+                println!(
+                    "installed {} v{} (signature: {}); {} capabilities",
+                    outcome.id,
+                    outcome.version,
+                    outcome.signature.as_str(),
+                    outcome.provides.len()
+                );
+                for p in &outcome.provides {
+                    println!("  provides {:?} = {}", p.capability, p.name);
+                }
+
+                let perms = &validated.manifest.permissions;
+                println!("\nRequested permissions:");
+                if perms.network_hosts.is_empty()
+                    && perms.credential_scopes.is_empty()
+                    && !perms.credential_read
+                {
+                    println!("  (none)");
+                } else {
+                    if !perms.network_hosts.is_empty() {
+                        println!("  network_hosts: {}", perms.network_hosts.join(", "));
+                    }
+                    if !perms.credential_scopes.is_empty() {
+                        println!(
+                            "  credential_scopes: {}",
+                            perms.credential_scopes.join(", ")
+                        );
+                    }
+                    if perms.credential_read {
+                        println!("  credential_read: true");
+                    }
+                }
+
+                if approve || enable {
+                    let grants = manager.approve_permissions(&outcome.id).await?;
+                    println!("approved {} grant(s) for '{}'", grants.len(), outcome.id);
+                } else {
+                    println!("\nInstalled disabled pending permission review. Run:");
+                    println!("  kinetix plugin approve {}", outcome.id);
+                    println!("  kinetix plugin enable {}", outcome.id);
+                }
+
+                if enable {
+                    manager.enable(&outcome.id).await?;
+                    println!("enabled '{}'", outcome.id);
+                }
+
+                Ok(())
+            } else if let Some(target) = path {
+                let (bytes, source) = if target.starts_with("http://")
+                    || target.starts_with("https://")
+                {
+                    println!("Downloading package from {}...", target);
+                    let b =
+                        crate::plugins::catalog::download_package_from_url(&http_client, &target)
+                            .await?;
+                    (b, format!("url:{}", target))
+                } else {
+                    let b = std::fs::read(&target).with_context(|| format!("reading {target}"))?;
+                    (b, format!("file:{}", target))
+                };
+
+                let mut trusted: Vec<[u8; 32]> =
+                    trusted_keys.iter().filter_map(|k| decode_key(k)).collect();
+
+                if trusted.is_empty() {
+                    if let Ok(store) = crate::plugins::catalog::embedded_trust_store() {
+                        for publ in store
+                            .publishers
+                            .iter()
+                            .filter(|p| p.enabled && p.algorithm == "ed25519")
+                        {
+                            if let Some(k) = decode_key(&publ.public_key_base64) {
+                                trusted.push(k);
+                            }
+                        }
+                    }
+                }
+
+                let outcome = manager
+                    .install_from_source(
+                        &bytes,
+                        sha256.as_deref(),
+                        &trusted,
+                        allow_untrusted_signature,
+                        &source,
+                    )
+                    .await?;
+                println!(
+                    "installed {} v{} (signature: {}); {} capabilities",
+                    outcome.id,
+                    outcome.version,
+                    outcome.signature.as_str(),
+                    outcome.provides.len()
+                );
+                for p in &outcome.provides {
+                    println!("  provides {:?} = {}", p.capability, p.name);
+                }
+
+                if approve || enable {
+                    let grants = manager.approve_permissions(&outcome.id).await?;
+                    println!("approved {} grant(s) for '{}'", grants.len(), outcome.id);
+                }
+
+                if enable {
+                    manager.enable(&outcome.id).await?;
+                    println!("enabled '{}'", outcome.id);
+                }
+
+                Ok(())
+            } else {
+                bail!("specify either a local file path or --catalog <id>");
             }
+        }
+        PluginAction::Search { query, capability } => {
+            let catalog =
+                crate::plugins::catalog::load_catalog(Some(&http_client), Some(&cache_file), false)
+                    .await?;
+
+            let filtered = crate::plugins::catalog::filter_catalog(
+                &catalog.plugins,
+                Some(&query),
+                capability.as_deref(),
+            );
+
+            if filtered.is_empty() {
+                println!("No marketplace plugins matched '{query}'.");
+                return Ok(());
+            }
+
+            let installed = manager.list().await.unwrap_or_default();
+
+            println!(
+                "{:<32} {:<10} {:<12} {}",
+                "ID", "VERSION", "STATUS", "NAME / DESCRIPTION"
+            );
+            println!("{}", "-".repeat(80));
+            for p in filtered {
+                let inst = installed.iter().find(|i| i.id == p.id);
+                let status = match inst {
+                    Some(i) if i.version == p.latest_version => "installed",
+                    Some(_) => "update avail",
+                    None => "available",
+                };
+                println!(
+                    "{:<32} {:<10} {:<12} {}",
+                    p.id, p.latest_version, status, p.name
+                );
+                println!("  {}", p.description);
+                println!("  Capabilities: {}", p.capabilities.join(", "));
+                println!();
+            }
+            Ok(())
+        }
+        PluginAction::Catalog { action } => match action {
+            CatalogAction::List {
+                refresh,
+                capability,
+            } => {
+                let catalog = crate::plugins::catalog::load_catalog(
+                    Some(&http_client),
+                    Some(&cache_file),
+                    refresh,
+                )
+                .await?;
+
+                let filtered = crate::plugins::catalog::filter_catalog(
+                    &catalog.plugins,
+                    None,
+                    capability.as_deref(),
+                );
+
+                let installed = manager.list().await.unwrap_or_default();
+
+                println!("{:<32} {:<10} {:<12} {}", "ID", "VERSION", "STATUS", "NAME");
+                println!("{}", "-".repeat(80));
+                for p in filtered {
+                    let inst = installed.iter().find(|i| i.id == p.id);
+                    let status = match inst {
+                        Some(i) if i.version == p.latest_version => "installed",
+                        Some(_) => "update avail",
+                        None => "available",
+                    };
+                    println!(
+                        "{:<32} {:<10} {:<12} {}",
+                        p.id, p.latest_version, status, p.name
+                    );
+                }
+                Ok(())
+            }
+            CatalogAction::Show { id, refresh } => {
+                let catalog = crate::plugins::catalog::load_catalog(
+                    Some(&http_client),
+                    Some(&cache_file),
+                    refresh,
+                )
+                .await?;
+
+                let p = crate::plugins::catalog::find_plugin_in_catalog(&catalog, &id)
+                    .ok_or_else(|| anyhow!("plugin '{id}' not found in marketplace catalog"))?;
+
+                let trust = crate::plugins::catalog::embedded_trust_store()?;
+                let ready = crate::plugins::catalog::install_ready(p, &trust).unwrap_or(false);
+
+                println!("ID:           {}", p.id);
+                println!("Name:         {}", p.name);
+                println!("Publisher:    {}", p.publisher);
+                println!("Latest:       v{}", p.latest_version);
+                println!("Homepage:     {}", p.homepage);
+                println!("Description:  {}", p.description);
+                println!("Capabilities: {}", p.capabilities.join(", "));
+                println!("Installable:  {}", if p.installable { "yes" } else { "no" });
+                println!(
+                    "Trust Status: {}",
+                    if ready {
+                        "trusted & ready"
+                    } else {
+                        "verification pending"
+                    }
+                );
+                if let Some(dist) = &p.distribution {
+                    println!("Artifact URL: {}", dist.url);
+                    println!("SHA-256:      {}", dist.sha256);
+                    println!("Publisher Key:{}", dist.publisher_key_id);
+                    println!("Allowed Hosts:{}", dist.allowed_hosts.join(", "));
+                }
+                if let Some(note) = &p.note {
+                    println!("Note:         {}", note);
+                }
+                Ok(())
+            }
+        },
+        PluginAction::Update { id, approve } => {
+            let catalog =
+                crate::plugins::catalog::load_catalog(Some(&http_client), Some(&cache_file), true)
+                    .await?;
+
+            let trust = crate::plugins::catalog::embedded_trust_store()?;
+            let installed = manager.list().await?;
+
+            let to_update: Vec<_> = match id {
+                Some(ref target_id) => {
+                    let inst = installed
+                        .into_iter()
+                        .find(|p| p.id == *target_id)
+                        .ok_or_else(|| anyhow!("plugin '{target_id}' is not installed"))?;
+                    vec![inst]
+                }
+                None => installed,
+            };
+
+            let mut updated_any = false;
+            for inst in to_update {
+                let Some(cat_entry) =
+                    crate::plugins::catalog::find_plugin_in_catalog(&catalog, &inst.id)
+                else {
+                    continue;
+                };
+
+                if !crate::plugins::catalog::is_update_available(
+                    &inst.version,
+                    &cat_entry.latest_version,
+                ) {
+                    println!(
+                        "{}: already up to date (installed: v{}, latest: v{})",
+                        inst.id, inst.version, cat_entry.latest_version
+                    );
+                    continue;
+                }
+
+                println!(
+                    "Updating {} from v{} to v{}...",
+                    inst.id, inst.version, cat_entry.latest_version
+                );
+
+                let Some(distribution) = &cat_entry.distribution else {
+                    println!("  Skipping {}: no distribution metadata", inst.id);
+                    continue;
+                };
+
+                let keys = crate::plugins::catalog::trusted_keys(&trust, cat_entry)?;
+                if keys.is_empty() {
+                    println!("  Skipping {}: untrusted publisher key", inst.id);
+                    continue;
+                }
+
+                let bytes = download_catalog_bytes(&http_client, distribution).await?;
+                let pkg = crate::plugins::package::read_package(&bytes)?;
+                if !distribution
+                    .sha256
+                    .eq_ignore_ascii_case(&pkg.package_sha256)
+                {
+                    bail!("package hash mismatch for {}", inst.id);
+                }
+
+                let sig_status = crate::plugins::package::verify_signature(&pkg, &keys)?;
+                if sig_status != crate::plugins::package::SignatureStatus::Verified {
+                    bail!("signature verification failed for {}", inst.id);
+                }
+
+                let source = format!("catalog:{}@{}", cat_entry.id, cat_entry.latest_version);
+                let was_enabled = inst.status().is_enabled();
+
+                let outcome = manager
+                    .install_from_source(&bytes, Some(&distribution.sha256), &keys, false, &source)
+                    .await?;
+
+                println!(
+                    "  Installed {} v{} (installed-disabled pending permission approval)",
+                    outcome.id, outcome.version
+                );
+
+                if approve {
+                    let grants = manager.approve_permissions(&outcome.id).await?;
+                    println!("  Approved {} permission grant(s)", grants.len());
+                    if was_enabled {
+                        manager.enable(&outcome.id).await?;
+                        println!("  Re-enabled {}", outcome.id);
+                    }
+                } else {
+                    println!("  To review permissions and re-enable:");
+                    println!("    kinetix plugin approve {}", outcome.id);
+                    if was_enabled {
+                        println!("    kinetix plugin enable {}", outcome.id);
+                    }
+                }
+
+                updated_any = true;
+            }
+
+            if !updated_any {
+                println!("All catalog plugins are up to date.");
+            }
+
             Ok(())
         }
         PluginAction::List => {

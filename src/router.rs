@@ -129,6 +129,10 @@ pub fn build(state: AppState) -> Router {
         .route("/plugins", get(admin::list_plugins))
         .route("/plugins/catalog", get(admin::plugin_catalog))
         .route(
+            "/plugins/catalog/refresh",
+            post(admin::refresh_plugin_catalog),
+        )
+        .route(
             "/plugins/catalog/{id}/preview",
             get(admin::preview_catalog_plugin),
         )

@@ -34,7 +34,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - WebAssembly Component Model runtime powered by `wasmtime` 48.
   - WIT contract defined in `wit/kinetix-plugin.wit` with host capabilities (HTTP egress, logging, key-value storage, credential refreshing).
   - The guest SDK, first-party plugins, catalog source, and packaging tooling live in `PrightCord/kinetix-plugins`.
-  - Kinetix vendors only the default catalog/trust snapshots under `src/plugins/` for offline discovery.
+  - Kinetix vendors official catalog/trust snapshots under `src/plugins/` for offline discovery, and supports dynamic remote synchronization with disk caching (`catalog.cache.json`) and verified CLI / dashboard marketplace installation.
 - **CLI & Daemon Runner (`src/main.rs`, `src/cli.rs`, `src/server.rs`)**:
   - Unified binary providing both the proxy daemon (`kinetix serve`) and administrative CLI commands (`kinetix provider`, `model`, `key`, `route`, `user`, etc.).
 

@@ -504,3 +504,50 @@ async fn kv_is_encrypted_and_namespaced_by_plugin() {
         .unwrap();
     assert_ne!(raw, b"v1");
 }
+
+#[tokio::test]
+async fn catalog_filtering_and_loading_works() {
+    let catalog = kinetix::plugins::catalog::embedded_catalog().unwrap();
+    assert!(!catalog.plugins.is_empty());
+
+    // Search query filter
+    let res =
+        kinetix::plugins::catalog::filter_catalog(&catalog.plugins, Some("antigravity"), None);
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].id, "dev.kinetix.antigravity-oauth");
+
+    // Capability filter
+    let res =
+        kinetix::plugins::catalog::filter_catalog(&catalog.plugins, None, Some("model_source"));
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].id, "dev.kinetix.opencode-free");
+
+    // Both filters
+    let res = kinetix::plugins::catalog::filter_catalog(
+        &catalog.plugins,
+        Some("Google"),
+        Some("provider_adapter"),
+    );
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].id, "dev.kinetix.antigravity-oauth");
+
+    // Empty match
+    let res = kinetix::plugins::catalog::filter_catalog(
+        &catalog.plugins,
+        Some("nonexistent_keyword"),
+        None,
+    );
+    assert!(res.is_empty());
+
+    // Cache file round trip
+    let dir = std::env::temp_dir().join(format!(
+        "kinetix-catalog-cache-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let cache_file = dir.join("catalog.cache.json");
+    kinetix::plugins::catalog::write_cached_catalog(&cache_file, &catalog).unwrap();
+    assert!(cache_file.exists());
+
+    let loaded = kinetix::plugins::catalog::read_cached_catalog(&cache_file).unwrap();
+    assert_eq!(loaded.plugins.len(), catalog.plugins.len());
+}

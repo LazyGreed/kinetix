@@ -11,6 +11,7 @@ import {
   Power,
   PowerOff,
   RefreshCw,
+  Search,
   ShieldCheck,
   Trash2,
   Upload,
@@ -21,6 +22,7 @@ import {
   PluginCatalogEntry,
   PluginCatalogPreview,
   PluginDetail,
+  PluginInstallResult,
   PluginPermissionResponse,
   PluginRollbackPreview,
   PluginSettingState,
@@ -95,10 +97,15 @@ export const PluginsView: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [showInstall, setShowInstall] = useState(false);
+  const [installTab, setInstallTab] = useState<'upload' | 'url'>('upload');
+  const [installUrl, setInstallUrl] = useState('');
   const [packageFile, setPackageFile] = useState<File | null>(null);
   const [sha256, setSha256] = useState('');
   const [trustedKeys, setTrustedKeys] = useState('');
   const [allowUntrusted, setAllowUntrusted] = useState(false);
+  const [catalogQuery, setCatalogQuery] = useState('');
+  const [catalogCapabilityFilter, setCatalogCapabilityFilter] = useState<string>('all');
+  const [refreshingCatalog, setRefreshingCatalog] = useState(false);
 
   const loadDetail = useCallback(async (id: string) => {
     const [plugin, grants, settingState] = await Promise.all([
@@ -202,6 +209,41 @@ export const PluginsView: React.FC = () => {
       setBusy(null);
     }
   };
+
+  const handleRefreshCatalog = async () => {
+    setRefreshingCatalog(true);
+    setError(null);
+    try {
+      await Kinetix.refreshPluginCatalog();
+      const res = await Kinetix.pluginCatalog();
+      setCatalog(res.plugins);
+      setNotice('Marketplace catalog refreshed successfully.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRefreshingCatalog(false);
+    }
+  };
+
+  const filteredCatalog = useMemo(() => {
+    return catalog.filter((entry) => {
+      if (catalogCapabilityFilter !== 'all') {
+        if (!entry.capabilities.includes(catalogCapabilityFilter)) {
+          return false;
+        }
+      }
+      if (catalogQuery.trim()) {
+        const q = catalogQuery.trim().toLowerCase();
+        const matches =
+          entry.id.toLowerCase().includes(q) ||
+          entry.name.toLowerCase().includes(q) ||
+          entry.description.toLowerCase().includes(q) ||
+          entry.publisher.toLowerCase().includes(q);
+        if (!matches) return false;
+      }
+      return true;
+    });
+  }, [catalog, catalogCapabilityFilter, catalogQuery]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -391,7 +433,7 @@ export const PluginsView: React.FC = () => {
     }
   };
 
-  const confirmCatalogInstall = async () => {
+  const confirmCatalogInstall = async (approveAndEnable = false) => {
     if (!catalogPreview) return;
     const preview = catalogPreview;
     setBusy(`catalog:${preview.id}`);
@@ -399,10 +441,16 @@ export const PluginsView: React.FC = () => {
     setNotice(null);
     try {
       const outcome = await Kinetix.installCatalogPlugin(preview.id);
+      if (approveAndEnable) {
+        await Kinetix.approvePluginPermissions(outcome.id);
+        await Kinetix.enablePlugin(outcome.id);
+        setNotice(`Installed, approved, and enabled ${outcome.id} v${outcome.version}.`);
+      } else {
+        setNotice(
+          `Installed ${outcome.id} v${outcome.version} from the trusted catalog. Review permissions before enabling it.`,
+        );
+      }
       setCatalogPreview(null);
-      setNotice(
-        `Installed ${outcome.id} v${outcome.version} from the trusted catalog. Review permissions before enabling it.`,
-      );
       await refresh(outcome.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -413,30 +461,47 @@ export const PluginsView: React.FC = () => {
 
   const install = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!packageFile) {
+    if (installTab === 'upload' && !packageFile) {
       setError('Choose a .kxp package first.');
+      return;
+    }
+    if (installTab === 'url' && !installUrl.trim()) {
+      setError('Enter a valid .kxp download URL.');
       return;
     }
     setBusy('install');
     setError(null);
     setNotice(null);
     try {
-      const package_base64 = await fileAsBase64(packageFile);
       const keys = trustedKeys
         .split(/[\n,]/)
         .map((value) => value.trim())
         .filter(Boolean);
-      const outcome = await Kinetix.installPlugin({
-        package_base64,
-        sha256: sha256.trim() || undefined,
-        trusted_keys: keys,
-        allow_untrusted_signature: allowUntrusted,
-      });
+
+      let outcome: PluginInstallResult;
+      if (installTab === 'upload' && packageFile) {
+        const package_base64 = await fileAsBase64(packageFile);
+        outcome = await Kinetix.installPlugin({
+          package_base64,
+          sha256: sha256.trim() || undefined,
+          trusted_keys: keys,
+          allow_untrusted_signature: allowUntrusted,
+        });
+      } else {
+        outcome = await Kinetix.installPlugin({
+          url: installUrl.trim(),
+          sha256: sha256.trim() || undefined,
+          trusted_keys: keys,
+          allow_untrusted_signature: allowUntrusted,
+        });
+      }
+
       setNotice(
         `Installed ${outcome.id} v${outcome.version}. Review permissions before enabling it.`,
       );
       setShowInstall(false);
       setPackageFile(null);
+      setInstallUrl('');
       setSha256('');
       setTrustedKeys('');
       setAllowUntrusted(false);
@@ -627,20 +692,58 @@ export const PluginsView: React.FC = () => {
                 Install Kinetix Extension Package
               </h3>
               <p className="text-sm font-body text-[var(--ink)]/75">
-                Packages are installed disabled. Requested permissions must be reviewed before enablement.
+                Install a custom <span className="font-mono">.kxp</span> package from a local file or remote URL (GitHub release, CDN, or raw git host).
               </p>
             </div>
 
+            <div className="flex gap-2 border-b border-[var(--ink)]/20 pb-2">
+              <button
+                type="button"
+                onClick={() => setInstallTab('upload')}
+                className={`text-sm font-heading font-bold px-3 py-1.5 rounded transition-all cursor-pointer ${
+                  installTab === 'upload'
+                    ? 'bg-[var(--ink)] text-[var(--paper)]'
+                    : 'bg-[var(--surface)] text-[var(--ink)]/70 hover:text-[var(--ink)]'
+                }`}
+              >
+                Upload File (.kxp)
+              </button>
+              <button
+                type="button"
+                onClick={() => setInstallTab('url')}
+                className={`text-sm font-heading font-bold px-3 py-1.5 rounded transition-all cursor-pointer ${
+                  installTab === 'url'
+                    ? 'bg-[var(--ink)] text-[var(--paper)]'
+                    : 'bg-[var(--surface)] text-[var(--ink)]/70 hover:text-[var(--ink)]'
+                }`}
+              >
+                Install from URL
+              </button>
+            </div>
+
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <label className="block">
-                <span className="block text-sm font-heading font-bold mb-1">Package</span>
-                <input
-                  type="file"
-                  accept=".kxp,application/octet-stream"
-                  onChange={(e) => setPackageFile(e.target.files?.[0] ?? null)}
-                  className="w-full px-3 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm"
-                />
-              </label>
+              {installTab === 'upload' ? (
+                <label className="block">
+                  <span className="block text-sm font-heading font-bold mb-1">Package file</span>
+                  <input
+                    type="file"
+                    accept=".kxp,application/octet-stream"
+                    onChange={(e) => setPackageFile(e.target.files?.[0] ?? null)}
+                    className="w-full px-3 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm"
+                  />
+                </label>
+              ) : (
+                <label className="block">
+                  <span className="block text-sm font-heading font-bold mb-1">Package URL (.kxp)</span>
+                  <input
+                    type="url"
+                    value={installUrl}
+                    onChange={(e) => setInstallUrl(e.target.value)}
+                    placeholder="https://github.com/user/repo/releases/download/v1.0/plugin.kxp"
+                    className="w-full px-3 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm"
+                  />
+                </label>
+              )}
               <label className="block">
                 <span className="block text-sm font-heading font-bold mb-1">Expected SHA-256 (optional)</span>
                 <input
@@ -660,25 +763,30 @@ export const PluginsView: React.FC = () => {
                 value={trustedKeys}
                 onChange={(e) => setTrustedKeys(e.target.value)}
                 rows={3}
+                placeholder="Base64 or hex Ed25519 public keys to trust for this installation"
                 className="w-full px-3 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-xs"
               />
             </label>
 
-            <label className="flex items-start gap-2 text-sm font-body">
+            <label className="flex items-start gap-2 text-sm font-body cursor-pointer">
               <input
                 type="checkbox"
                 checked={allowUntrusted}
                 onChange={(e) => setAllowUntrusted(e.target.checked)}
-                className="mt-1"
+                className="mt-1 cursor-pointer"
               />
               <span>
-                Allow an unsigned or untrusted signature. Use this only for packages you built or otherwise
-                verified yourself.
+                Allow unsigned or untrusted signature (check this if the custom package is self-built or signed with a custom/unregistered key).
               </span>
             </label>
 
             <div className="flex gap-2">
-              <SketchButton type="submit" variant="primary" disabled={busy === 'install' || !packageFile} className="gap-2">
+              <SketchButton
+                type="submit"
+                variant="primary"
+                disabled={busy === 'install' || (installTab === 'upload' ? !packageFile : !installUrl.trim())}
+                className="gap-2"
+              >
                 <Upload className="w-4 h-4" />
                 {busy === 'install' ? 'Installing…' : 'Install package'}
               </SketchButton>
@@ -694,77 +802,142 @@ export const PluginsView: React.FC = () => {
         <WobblyCard variant="muted" className="p-5">
           <div className="flex items-start justify-between gap-3 flex-wrap">
             <div>
-              <h3 className="text-xl font-heading font-bold">Discover</h3>
+              <h3 className="text-xl font-heading font-bold">Discover Marketplace</h3>
               <p className="text-sm font-body text-[var(--ink)]/70">
-                Official catalog metadata is discovery-only. Installing a package still goes through
-                Kinetix&apos;s normal package verification and permission-review flow.
+                Official plugins verified and distributed through the Kinetix ecosystem.
+                Installing or updating validates cryptographic signatures and prompts for operator permission approval.
               </p>
             </div>
-            <SketchBadge variant="blue">Official catalog</SketchBadge>
+            <div className="flex items-center gap-2">
+              <SketchButton
+                variant="secondary"
+                className="gap-2 text-xs py-1.5 px-3"
+                disabled={refreshingCatalog || busy !== null}
+                onClick={() => void handleRefreshCatalog()}
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${refreshingCatalog ? 'animate-spin' : ''}`} />
+                {refreshingCatalog ? 'Refreshing…' : 'Refresh Marketplace'}
+              </SketchButton>
+              <SketchBadge variant="blue">Official catalog</SketchBadge>
+            </div>
           </div>
 
-          <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-3">
-            {catalog.map((entry) => {
-              const installed = plugins.find((plugin) => plugin.id === entry.id);
-              return (
-                <div
-                  key={entry.id}
-                  className="p-4 border-2 border-[var(--ink)]/25 bg-[var(--surface)]"
-                  style={{ borderRadius: '12px 9px 14px 10px / 9px 14px 9px 12px' }}
+          <div className="mt-4 flex flex-col sm:flex-row gap-3 items-center justify-between">
+            <div className="relative w-full sm:max-w-md">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[var(--ink)]/40 pointer-events-none" />
+              <input
+                type="text"
+                value={catalogQuery}
+                onChange={(e) => setCatalogQuery(e.target.value)}
+                placeholder="Search marketplace plugins by name, ID, or description…"
+                className="w-full pl-9 pr-3 py-1.5 text-sm rounded border border-[var(--ink)]/30 bg-[var(--surface)] focus:outline-none focus:border-[var(--ink)] font-body"
+              />
+            </div>
+            <div className="flex flex-wrap gap-1.5 self-start sm:self-auto">
+              {[
+                { id: 'all', label: 'All' },
+                { id: 'credential_strategy', label: 'OAuth / Credential' },
+                { id: 'provider_adapter', label: 'Provider Adapter' },
+                { id: 'model_source', label: 'Model Discovery' },
+                { id: 'auth_flow', label: 'Auth Flow' },
+              ].map((chip) => (
+                <button
+                  key={chip.id}
+                  type="button"
+                  onClick={() => setCatalogCapabilityFilter(chip.id)}
+                  className={`text-xs px-2.5 py-1 rounded-full font-medium transition-colors border ${
+                    catalogCapabilityFilter === chip.id
+                      ? 'bg-[var(--ink)] text-[var(--paper)] border-[var(--ink)]'
+                      : 'bg-[var(--surface)] text-[var(--ink)]/70 border-[var(--ink)]/20 hover:border-[var(--ink)]/40'
+                  }`}
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="font-heading font-bold">{entry.name}</div>
-                      <div className="text-xs font-mono text-[var(--ink)]/55">{entry.publisher}</div>
-                    </div>
-                    <SketchBadge variant={installed ? 'green' : 'default'}>
-                      {installed ? `Installed v${installed.version}` : `v${entry.latest_version}`}
-                    </SketchBadge>
-                  </div>
-
-                  <p className="mt-2 text-sm font-body text-[var(--ink)]/75">{entry.description}</p>
-                  <div className="mt-3 flex flex-wrap gap-1">
-                    {entry.capabilities.map((capability) => (
-                      <code key={capability} className="text-xs bg-[var(--erased)] px-2 py-1">
-                        {capability}
-                      </code>
-                    ))}
-                  </div>
-                  {entry.note && (
-                    <p className="mt-3 text-xs font-body text-[var(--ink)]/60">{entry.note}</p>
-                  )}
-                  <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
-                    <div className="text-xs font-mono text-[var(--ink)]/55">
-                      Artifact: {entry.artifact_name}
-                    </div>
-                    {installed?.version === entry.latest_version ? (
-                      <SketchBadge variant="green">Current</SketchBadge>
-                    ) : entry.install_ready ? (
-                      <SketchButton
-                        variant="primary"
-                        className="gap-2"
-                        disabled={busy !== null}
-                        onClick={() => void reviewCatalogInstall(entry)}
-                      >
-                        <ShieldCheck className="w-4 h-4" />
-                        {busy === `catalog-preview:${entry.id}`
-                          ? 'Verifying…'
-                          : installed
-                            ? `Review update to v${entry.latest_version}`
-                            : 'Review install'}
-                      </SketchButton>
-                    ) : (
-                      <SketchBadge variant="yellow">
-                        {entry.trust_status === 'unavailable'
-                          ? 'Trust unavailable'
-                          : 'Discovery only'}
-                      </SketchBadge>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+                  {chip.label}
+                </button>
+              ))}
+            </div>
           </div>
+
+          {filteredCatalog.length === 0 ? (
+            <div className="mt-6 text-center py-8 border border-dashed border-[var(--ink)]/20 rounded">
+              <p className="text-sm font-body text-[var(--ink)]/60">
+                No marketplace plugins match the current filters.
+              </p>
+            </div>
+          ) : (
+            <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-3">
+              {filteredCatalog.map((entry) => {
+                const installed = plugins.find((plugin) => plugin.id === entry.id);
+                const hasUpdate = Boolean(installed && entry.update_available);
+
+                return (
+                  <div
+                    key={entry.id}
+                    className={`p-4 border-2 ${
+                      hasUpdate ? 'border-amber-400 bg-amber-50/20' : 'border-[var(--ink)]/25 bg-[var(--surface)]'
+                    }`}
+                    style={{ borderRadius: '12px 9px 14px 10px / 9px 14px 9px 12px' }}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="font-heading font-bold flex items-center gap-2">
+                          <span>{entry.name}</span>
+                          {hasUpdate && (
+                            <span className="text-[10px] bg-amber-200 text-amber-900 font-bold px-1.5 py-0.5 rounded uppercase tracking-wider">
+                              Update Available
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs font-mono text-[var(--ink)]/55">{entry.publisher}</div>
+                      </div>
+                      <SketchBadge variant={installed ? (hasUpdate ? 'yellow' : 'green') : 'default'}>
+                        {installed ? `Installed v${installed.version}` : `v${entry.latest_version}`}
+                      </SketchBadge>
+                    </div>
+
+                    <p className="mt-2 text-sm font-body text-[var(--ink)]/75">{entry.description}</p>
+                    <div className="mt-3 flex flex-wrap gap-1">
+                      {entry.capabilities.map((capability) => (
+                        <code key={capability} className="text-xs bg-[var(--erased)] px-2 py-1">
+                          {capability}
+                        </code>
+                      ))}
+                    </div>
+                    {entry.note && (
+                      <p className="mt-3 text-xs font-body text-[var(--ink)]/60">{entry.note}</p>
+                    )}
+                    <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
+                      <div className="text-xs font-mono text-[var(--ink)]/55">
+                        Artifact: {entry.artifact_name}
+                      </div>
+                      {installed && !hasUpdate ? (
+                        <SketchBadge variant="green">Current (v{installed.version})</SketchBadge>
+                      ) : entry.install_ready ? (
+                        <SketchButton
+                          variant="primary"
+                          className="gap-2"
+                          disabled={busy !== null}
+                          onClick={() => void reviewCatalogInstall(entry)}
+                        >
+                          <ShieldCheck className="w-4 h-4" />
+                          {busy === `catalog-preview:${entry.id}`
+                            ? 'Verifying…'
+                            : hasUpdate
+                              ? `Review update to v${entry.latest_version}`
+                              : 'Review install'}
+                        </SketchButton>
+                      ) : (
+                        <SketchBadge variant="yellow">
+                          {entry.trust_status === 'unavailable'
+                            ? 'Trust unavailable'
+                            : 'Discovery only'}
+                        </SketchBadge>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </WobblyCard>
       )}
 
@@ -840,18 +1013,26 @@ export const PluginsView: React.FC = () => {
             </div>
           </div>
 
-          <div className="mt-4 flex gap-2 flex-wrap">
+          <div className="mt-4 flex gap-2 flex-wrap items-center">
             <SketchButton
               variant="primary"
               disabled={busy !== null}
-              onClick={() => void confirmCatalogInstall()}
+              onClick={() => void confirmCatalogInstall(true)}
             >
-              <PackagePlus className="w-4 h-4" />
+              <CheckCircle2 className="w-4 h-4" />
               {busy === `catalog:${catalogPreview.id}`
                 ? 'Installing…'
                 : catalogPreview.current_version
-                  ? `Confirm update to v${catalogPreview.target_version}`
-                  : `Confirm install v${catalogPreview.target_version}`}
+                  ? `Update & Enable (v${catalogPreview.target_version})`
+                  : `Install & Enable (v${catalogPreview.target_version})`}
+            </SketchButton>
+            <SketchButton
+              variant="secondary"
+              disabled={busy !== null}
+              onClick={() => void confirmCatalogInstall(false)}
+            >
+              <PackagePlus className="w-4 h-4" />
+              Install Disabled (Review Later)
             </SketchButton>
             <SketchButton
               variant="secondary"

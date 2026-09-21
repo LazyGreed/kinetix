@@ -74,6 +74,9 @@ export interface PluginCatalogEntry {
   installable: boolean;
   install_ready?: boolean;
   trust_status?: 'trusted' | 'unavailable' | 'discovery_only' | string;
+  installed?: boolean;
+  installed_version?: string | null;
+  update_available?: boolean;
   distribution?: {
     url: string;
     sha256: string;
@@ -249,7 +252,8 @@ export interface PluginDetail extends PluginSummary {
 }
 
 export interface PluginInstallInput {
-  package_base64: string;
+  package_base64?: string;
+  url?: string;
   sha256?: string;
   trusted_keys?: string[];
   allow_untrusted_signature?: boolean;
@@ -386,8 +390,19 @@ export const Kinetix = {
     const r = await api.get<{ plugins: PluginSummary[] }>('/admin/api/plugins');
     return r.plugins;
   },
-  pluginCatalog: () =>
-    api.get<PluginCatalogResponse>('/admin/api/plugins/catalog'),
+  pluginCatalog: (params?: { q?: string; capability?: string; refresh?: boolean }) => {
+    const sp = new URLSearchParams();
+    if (params?.q) sp.set('q', params.q);
+    if (params?.capability) sp.set('capability', params.capability);
+    if (params?.refresh) sp.set('refresh', 'true');
+    const qs = sp.toString();
+    return api.get<PluginCatalogResponse>(`/admin/api/plugins/catalog${qs ? `?${qs}` : ''}`);
+  },
+  refreshPluginCatalog: () =>
+    api.post<{ schema_version: number; count: number; refreshed: boolean }>(
+      '/admin/api/plugins/catalog/refresh',
+      {},
+    ),
   previewCatalogPlugin: (id: string) =>
     api.get<PluginCatalogPreview>(
       `/admin/api/plugins/catalog/${encodeURIComponent(id)}/preview`,

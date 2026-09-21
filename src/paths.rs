@@ -83,6 +83,12 @@ impl Paths {
         self.data_dir.join("plugins").join("packages")
     }
 
+    /// Cached remote marketplace catalog file.
+    pub fn plugin_catalog_cache_file(&self) -> PathBuf {
+        self.plugin_packages_dir()
+            .join(crate::plugins::catalog::CATALOG_CACHE_FILE)
+    }
+
     /// Operational logs (only used when the process is run detached).
     pub fn log_file(&self) -> PathBuf {
         self.state_dir.join("kinetix.log")
