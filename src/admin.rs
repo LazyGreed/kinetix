@@ -181,6 +181,86 @@ pub async fn me(_auth: AdminAuth) -> Json<Value> {
     Json(json!({ "authenticated": true, "user": "admin" }))
 }
 
+const PUBLIC_BASE_URL_SETTING: &str = "public_base_url";
+
+fn normalize_public_base_url(value: &str) -> Result<String, ApiError> {
+    let value = value.trim().trim_end_matches('/');
+    let parsed =
+        url::Url::parse(value).map_err(|_| ApiError::bad("public base URL is not a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::bad("public base URL must use http or https"));
+    }
+    if parsed.host_str().is_none() {
+        return Err(ApiError::bad("public base URL must include a host"));
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ApiError::bad(
+            "public base URL must not contain credentials, a query, or a fragment",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+async fn effective_public_base_url(state: &AppState) -> Result<String, ApiError> {
+    Ok(db::get_setting(&state.pool, PUBLIC_BASE_URL_SETTING)
+        .await
+        .map_err(ApiError::internal)?
+        .unwrap_or_else(|| state.config.public_base_url.clone()))
+}
+
+#[derive(Deserialize)]
+pub struct PublicBaseUrlBody {
+    pub public_base_url: String,
+}
+
+pub async fn get_public_base_url(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+) -> Result<Json<Value>, ApiError> {
+    let configured = db::get_setting(&state.pool, PUBLIC_BASE_URL_SETTING)
+        .await
+        .map_err(ApiError::internal)?;
+    let (value, source) = match configured {
+        Some(value) => (value, "dashboard"),
+        None => (state.config.public_base_url.clone(), "environment"),
+    };
+    Ok(Json(json!({
+        "public_base_url": value,
+        "source": source,
+        "environment_default": state.config.public_base_url,
+    })))
+}
+
+pub async fn update_public_base_url(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<PublicBaseUrlBody>,
+) -> Result<Json<Value>, ApiError> {
+    let value = normalize_public_base_url(&body.public_base_url)?;
+    db::set_setting(&state.pool, PUBLIC_BASE_URL_SETTING, &value)
+        .await
+        .map_err(ApiError::internal)?;
+    let _ = db::insert_audit(
+        &state.pool,
+        "admin",
+        "public_base_url_changed",
+        "system",
+        "",
+        "Public Base URL",
+        &format!("Public base URL changed to {value}."),
+    )
+    .await;
+    Ok(Json(json!({
+        "ok": true,
+        "public_base_url": value,
+        "source": "dashboard",
+    })))
+}
+
 /// `POST /admin/api/test-stream` — run a real request through the pipeline for a
 /// chosen virtual key + model and stream the encoded result back to the
 /// browser. The raw virtual key never leaves the server (it is stored hashed).
@@ -4415,6 +4495,101 @@ pub struct PluginAuthStartBody {
     pub provider_id: String,
 }
 
+fn loopback_bind_port(bind: &str) -> Result<u16, ApiError> {
+    let base = url::Url::parse(&format!("http://{bind}"))
+        .map_err(|_| ApiError::bad("KINETIX_BIND is not a valid host:port"))?;
+    let host = base
+        .host_str()
+        .ok_or_else(|| ApiError::bad("KINETIX_BIND has no host"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if !matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "::") {
+        return Err(ApiError::bad(
+            "loopback OAuth requires KINETIX_BIND to be loopback or unspecified",
+        ));
+    }
+    base.port()
+        .ok_or_else(|| ApiError::bad("KINETIX_BIND must include a port"))
+}
+
+fn claude_code_loopback_redirect(bind: &str) -> Result<String, ApiError> {
+    let port = loopback_bind_port(bind)?;
+    Ok(format!("http://localhost:{port}/callback"))
+}
+
+fn antigravity_loopback_redirect(bind: &str) -> Result<String, ApiError> {
+    let base = url::Url::parse(&format!("http://{bind}"))
+        .map_err(|_| ApiError::bad("KINETIX_BIND is not a valid host:port"))?;
+    let host = base
+        .host_str()
+        .ok_or_else(|| ApiError::bad("KINETIX_BIND has no host"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = loopback_bind_port(bind)?;
+
+    let callback_host = match host {
+        "127.0.0.1" | "0.0.0.0" => "127.0.0.1",
+        "localhost" => "localhost",
+        "::1" | "::" => "[::1]",
+        _ => unreachable!("loopback_bind_port already validated the host"),
+    };
+
+    Ok(format!("http://{callback_host}:{port}/callback"))
+}
+
+#[cfg(test)]
+mod plugin_oauth_redirect_tests {
+    use super::{antigravity_loopback_redirect, claude_code_loopback_redirect};
+
+    #[test]
+    fn claude_code_redirect_uses_bind_port_not_public_origin() {
+        assert_eq!(
+            claude_code_loopback_redirect("127.0.0.1:8080")
+                .ok()
+                .unwrap(),
+            "http://localhost:8080/callback"
+        );
+        assert_eq!(
+            claude_code_loopback_redirect("0.0.0.0:9090").ok().unwrap(),
+            "http://localhost:9090/callback"
+        );
+    }
+
+    #[test]
+    fn antigravity_redirect_uses_ipv4_loopback_bind_port() {
+        assert_eq!(
+            antigravity_loopback_redirect("127.0.0.1:8080")
+                .ok()
+                .unwrap(),
+            "http://127.0.0.1:8080/callback"
+        );
+    }
+
+    #[test]
+    fn antigravity_redirect_maps_unspecified_ipv4_to_loopback() {
+        assert_eq!(
+            antigravity_loopback_redirect("0.0.0.0:8080").ok().unwrap(),
+            "http://127.0.0.1:8080/callback"
+        );
+    }
+
+    #[test]
+    fn antigravity_redirect_uses_ipv6_loopback_for_ipv6_bind() {
+        assert_eq!(
+            antigravity_loopback_redirect("[::1]:8080").ok().unwrap(),
+            "http://[::1]:8080/callback"
+        );
+        assert_eq!(
+            antigravity_loopback_redirect("[::]:8080").ok().unwrap(),
+            "http://[::1]:8080/callback"
+        );
+    }
+
+    #[test]
+    fn loopback_oauth_rejects_non_loopback_specific_bind() {
+        assert!(claude_code_loopback_redirect("192.0.2.10:8080").is_err());
+        assert!(antigravity_loopback_redirect("192.0.2.10:8080").is_err());
+    }
+}
+
 /// Start a one-time browser authorization session for a plugin integration.
 pub async fn start_plugin_auth(
     State(state): State<AppState>,
@@ -4454,26 +4629,12 @@ pub async fn start_plugin_auth(
     }
 
     let redirect_uri = if body.plugin_id == "dev.kinetix.claude-code-oauth" {
-        let base = url::Url::parse(&state.config.public_base_url)
-            .map_err(|_| ApiError::bad("public_base_url is not a valid URL"))?;
-        let host = base
-            .host_str()
-            .ok_or_else(|| ApiError::bad("public_base_url has no host"))?;
-        if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
-            return Err(ApiError::bad(
-                "Claude Code OAuth requires a loopback public_base_url",
-            ));
-        }
-        let port = base
-            .port()
-            .map(|port| format!(":{port}"))
-            .unwrap_or_default();
-        format!("http://localhost{port}/callback")
+        claude_code_loopback_redirect(&state.config.bind)?
+    } else if body.plugin_id == "dev.kinetix.antigravity-oauth" {
+        antigravity_loopback_redirect(&state.config.bind)?
     } else {
-        format!(
-            "{}/admin/api/plugins/auth/callback",
-            state.config.public_base_url.trim_end_matches('/')
-        )
+        let public_base_url = effective_public_base_url(&state).await?;
+        format!("{public_base_url}/admin/api/plugins/auth/callback")
     };
     let pending = state.plugin_auth_sessions.create(
         &body.plugin_id,
@@ -4559,8 +4720,13 @@ pub async fn start_plugin_auth(
 
     Ok(Json(json!({
         "authorize_url": authorize_url,
+        "redirect_uri": redirect_uri,
         "state": pending.state,
         "expires_in_secs": 600,
+        "manual_callback_supported": matches!(
+            body.plugin_id.as_str(),
+            "dev.kinetix.claude-code-oauth" | "dev.kinetix.antigravity-oauth"
+        ),
     })))
 }
 
@@ -4573,35 +4739,17 @@ pub struct PluginAuthCallbackQuery {
 
 /// Browser callback. The one-time high-entropy state is the callback
 /// credential and is consumed before code exchange, so replay fails closed.
-pub async fn plugin_auth_callback(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Query(query): Query<PluginAuthCallbackQuery>,
-) -> Result<Redirect, ApiError> {
-    if !db_healthy(&state).await {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "plugin account authorization unavailable: control plane degraded".into(),
-        ));
-    }
+#[derive(serde::Serialize)]
+struct PluginAuthCompletion {
+    result: &'static str,
+    provider_id: Option<String>,
+}
 
-    // Bind ordinary callbacks to the admin session that started the flow. A
-    // small set of reviewed OAuth integrations use loopback redirects whose
-    // hostname can differ from the dashboard hostname, so their host-only admin
-    // cookie cannot cross the callback boundary. Only when the cookie is absent
-    // do we allow the dedicated loopback consumer to validate and consume the
-    // host-generated one-time state.
-    let initiator = jar
-        .get(SESSION_COOKIE)
-        .map(|cookie| cookie.value().to_string());
-    let session = match initiator {
-        Some(initiator) => state.plugin_auth_sessions.take(&query.state, &initiator),
-        None => state
-            .plugin_auth_sessions
-            .take_loopback_callback(&query.state),
-    }
-    .ok_or_else(|| ApiError::bad("invalid or expired plugin auth state"))?;
-
+async fn complete_plugin_auth(
+    state: &AppState,
+    session: auth::PluginAuthSession,
+    query: &PluginAuthCallbackQuery,
+) -> Result<PluginAuthCompletion, ApiError> {
     if query.error.is_some() {
         let _ = db::insert_audit(
             &state.pool,
@@ -4613,7 +4761,10 @@ pub async fn plugin_auth_callback(
             "Provider authorization was cancelled or rejected.",
         )
         .await;
-        return Ok(Redirect::to("/admin/plugins?plugin_auth=cancelled"));
+        return Ok(PluginAuthCompletion {
+            result: "cancelled",
+            provider_id: None,
+        });
     }
 
     let code = query
@@ -4622,8 +4773,12 @@ pub async fn plugin_auth_callback(
         .filter(|code| !code.trim().is_empty())
         .ok_or_else(|| ApiError::bad("authorization callback is missing code"))?;
 
-    let manager = plugin_manager(&state)?;
-    let exchange_code = format!("{code}#{}", query.state);
+    let manager = plugin_manager(state)?;
+    let exchange_code = if session.plugin_id == "dev.kinetix.claude-code-oauth" {
+        format!("{code}#{}", query.state)
+    } else {
+        code.to_string()
+    };
     let result = match manager
         .auth_exchange(
             &session.plugin_id,
@@ -4652,7 +4807,10 @@ pub async fn plugin_auth_callback(
                 "Provider authorization code exchange failed.",
             )
             .await;
-            return Ok(Redirect::to("/admin/plugins?plugin_auth=error"));
+            return Ok(PluginAuthCompletion {
+                result: "error",
+                provider_id: None,
+            });
         }
     };
 
@@ -4682,16 +4840,16 @@ pub async fn plugin_auth_callback(
             "Provider credential binding changed during browser authorization; enrollment refused.",
         )
         .await;
-        return Ok(Redirect::to("/admin/plugins?plugin_auth=binding_changed"));
+        return Ok(PluginAuthCompletion {
+            result: "binding_changed",
+            provider_id: Some(provider.id),
+        });
     }
 
     let encrypted = state
         .crypto
         .encrypt(&result.secret_json)
         .map_err(ApiError::internal)?;
-    // The label is plugin-controlled (typically provider userinfo). Strip
-    // control characters and cap the length so it cannot inject terminal/log
-    // noise or bloat the audit trail before it is stored and displayed.
     let label = result
         .account_label
         .as_deref()
@@ -4731,11 +4889,153 @@ pub async fn plugin_auth_callback(
         .await
         .map_err(ApiError::internal)?;
 
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("plugin_auth", "success")
-        .append_pair("plugin_auth_provider", &provider.id)
-        .finish();
+    Ok(PluginAuthCompletion {
+        result: "success",
+        provider_id: Some(provider.id),
+    })
+}
+
+/// Browser callback. The one-time high-entropy state is the callback
+/// credential and is consumed before code exchange, so replay fails closed.
+pub async fn plugin_auth_callback(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<PluginAuthCallbackQuery>,
+) -> Result<Redirect, ApiError> {
+    if !db_healthy(&state).await {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "plugin account authorization unavailable: control plane degraded".into(),
+        ));
+    }
+
+    let initiator = jar
+        .get(SESSION_COOKIE)
+        .map(|cookie| cookie.value().to_string());
+    let session = match initiator {
+        Some(initiator) => state.plugin_auth_sessions.take(&query.state, &initiator),
+        None => state
+            .plugin_auth_sessions
+            .take_loopback_callback(&query.state),
+    }
+    .ok_or_else(|| ApiError::bad("invalid or expired plugin auth state"))?;
+
+    let completion = complete_plugin_auth(&state, session.clone(), &query).await?;
+    state.plugin_auth_sessions.record_completion(
+        &query.state,
+        &session.initiator,
+        completion.result,
+        completion.provider_id.clone(),
+    );
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("plugin_auth", completion.result);
+    if let Some(provider_id) = completion.provider_id.as_deref() {
+        serializer.append_pair("plugin_auth_provider", provider_id);
+    }
+    let query = serializer.finish();
     Ok(Redirect::to(&format!("/admin/plugins?{query}")))
+}
+
+#[derive(Deserialize)]
+pub struct PluginAuthStatusQuery {
+    pub state: String,
+}
+
+pub async fn plugin_auth_status(
+    State(state): State<AppState>,
+    auth: AdminAuth,
+    Query(query): Query<PluginAuthStatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let status = state
+        .plugin_auth_sessions
+        .status(&query.state, &auth.token)
+        .ok_or_else(|| ApiError::bad("invalid or expired plugin auth state"))?;
+    Ok(Json(json!({
+        "result": status.result,
+        "provider_id": status.provider_id,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PluginAuthManualCallbackBody {
+    pub callback_url: String,
+}
+
+/// Complete a native/desktop OAuth flow from a callback URL pasted into the
+/// authenticated dashboard. This is the remote/VPS counterpart to the normal
+/// loopback browser callback: the provider still sees the exact native
+/// redirect_uri, while Kinetix receives the short-lived code through the
+/// existing authenticated admin session.
+pub async fn complete_plugin_auth_manual(
+    State(state): State<AppState>,
+    auth: AdminAuth,
+    Json(body): Json<PluginAuthManualCallbackBody>,
+) -> Result<Json<Value>, ApiError> {
+    if !db_healthy(&state).await {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "plugin account authorization unavailable: control plane degraded".into(),
+        ));
+    }
+
+    let callback = url::Url::parse(body.callback_url.trim())
+        .map_err(|_| ApiError::bad("callback URL is not a valid URL"))?;
+    let state_value = callback
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .ok_or_else(|| ApiError::bad("callback URL is missing state"))?;
+    let session = state
+        .plugin_auth_sessions
+        .peek(&state_value, &auth.token)
+        .ok_or_else(|| ApiError::bad("invalid or expired plugin auth state"))?;
+
+    if !matches!(
+        session.plugin_id.as_str(),
+        "dev.kinetix.claude-code-oauth" | "dev.kinetix.antigravity-oauth"
+    ) {
+        return Err(ApiError::bad(
+            "manual callback completion is only available for reviewed loopback OAuth integrations",
+        ));
+    }
+
+    let expected = url::Url::parse(&session.redirect_uri)
+        .map_err(|_| ApiError::bad("stored plugin redirect URI is invalid"))?;
+    let callback_origin_matches = callback.scheme() == expected.scheme()
+        && callback.host_str() == expected.host_str()
+        && callback.port_or_known_default() == expected.port_or_known_default()
+        && callback.path() == expected.path();
+    if !callback_origin_matches {
+        return Err(ApiError::bad(
+            "pasted callback URL does not match the OAuth redirect URI for this session",
+        ));
+    }
+
+    let session = state
+        .plugin_auth_sessions
+        .take(&state_value, &auth.token)
+        .ok_or_else(|| ApiError::bad("invalid or expired plugin auth state"))?;
+
+    let query = PluginAuthCallbackQuery {
+        state: state_value.clone(),
+        code: callback
+            .query_pairs()
+            .find_map(|(key, value)| (key == "code").then(|| value.into_owned())),
+        error: callback
+            .query_pairs()
+            .find_map(|(key, value)| (key == "error").then(|| value.into_owned())),
+    };
+    let completion = complete_plugin_auth(&state, session, &query).await?;
+    state.plugin_auth_sessions.record_completion(
+        &state_value,
+        &auth.token,
+        completion.result,
+        completion.provider_id.clone(),
+    );
+    Ok(Json(json!({
+        "ok": completion.result == "success",
+        "result": completion.result,
+        "provider_id": completion.provider_id,
+    })))
 }
 
 /// `GET /admin/api/plugins/{id}/packages/{sha256}/preview` — inspect a retained rollback target.
