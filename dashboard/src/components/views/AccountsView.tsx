@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2 } from 'lucide-react';
+import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2, Sliders } from 'lucide-react';
 import { Account, Provider } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens, DESIGN_TOKENS } from '../../lib/designSystem';
@@ -22,6 +22,12 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
 }) => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [confirmDeleteAccountId, setConfirmDeleteAccountId] = useState<string | null>(null);
+  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [editLabel, setEditLabel] = useState('');
+  const [editPriority, setEditPriority] = useState(1);
+  const [editWeight, setEditWeight] = useState(1);
+  const [editQuota, setEditQuota] = useState('');
+  const [editQuotaType, setEditQuotaType] = useState<Account['quotaType']>('none');
   const [label, setLabel] = useState('');
   const [providerId, setProviderId] = useState(providers[0]?.id || '');
   const [apiKey, setApiKey] = useState('');
@@ -67,7 +73,8 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
       currentSpend: 0,
       requestsCount: 0,
       tokensCount: 0,
-      priority: accounts.length + 1,
+      priority: accounts.filter((a) => a.providerId === prov.id).length + 1,
+      weight: 1,
       apiKey: apiKey.trim(),
     };
 
@@ -84,6 +91,31 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
       cooldownUntil: null,
       lastError: undefined,
     });
+  };
+
+  const openConfigure = (acc: Account) => {
+    setEditingAccount(acc);
+    setEditLabel(acc.label);
+    setEditPriority(acc.priority);
+    setEditWeight(acc.weight || 1);
+    setEditQuota(acc.softQuotaSpendLimit == null ? '' : String(acc.softQuotaSpendLimit));
+    setEditQuotaType(acc.quotaType);
+  };
+
+  const handleConfigureSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingAccount || !editLabel.trim() || editPriority < 1 || editWeight < 1) return;
+    const quota = editQuota.trim() === '' ? undefined : Number(editQuota);
+    if (quota !== undefined && (!Number.isFinite(quota) || quota < 0)) return;
+    onUpdateAccount({
+      ...editingAccount,
+      label: editLabel.trim(),
+      priority: Math.trunc(editPriority),
+      weight: Math.trunc(editWeight),
+      softQuotaSpendLimit: quota,
+      quotaType: editQuotaType,
+    });
+    setEditingAccount(null);
   };
 
   return (
@@ -229,6 +261,16 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                     <span>Priority: <strong>Tier #{acc.priority}</strong></span>
                   </div>
 
+                  <div className="flex items-center gap-2 ml-auto">
+                    <button
+                      onClick={() => openConfigure(acc)}
+                      className="px-2 py-1 text-xs font-heading font-bold text-[var(--pen-blue)] hover:bg-[var(--tint-blue)] border border-[var(--pen-blue)]/40 hover:border-[var(--pen-blue)] rounded flex items-center gap-1 cursor-pointer transition-colors"
+                      title="Configure this account"
+                    >
+                      <Sliders className="w-3.5 h-3.5" />
+                      <span>Configure</span>
+                    </button>
+
                   {confirmDeleteAccountId === acc.id ? (
                     <div className="flex items-center gap-1 bg-[var(--tint-red)] px-2 py-1 border border-[var(--marker-red)] rounded text-xs font-heading">
                       <span className="text-[var(--danger-text)] font-bold">Remove pool key?</span>
@@ -258,10 +300,110 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                       <span>Remove Pool Key</span>
                     </button>
                   )}
+                  </div>
                 </div>
               </WobblyCard>
             );
           })}
+        </div>
+      )}
+
+      {editingAccount && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+          <div className="w-full max-w-lg">
+            <WobblyCard decoration="tape" className="bg-[var(--paper)] p-6 relative">
+              <button
+                onClick={() => setEditingAccount(null)}
+                className="absolute top-4 right-4 text-[var(--ink)] font-bold text-xl hover:text-[var(--marker-red)] cursor-pointer"
+              >
+                ✕
+              </button>
+              <h3 className="text-2xl font-heading font-bold text-[var(--ink)] mb-4 flex items-center gap-2">
+                <Sliders className="w-6 h-6 text-[var(--pen-blue)]" />
+                Configure Account
+              </h3>
+              <form onSubmit={handleConfigureSubmit} className="space-y-4 font-body">
+                <div>
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">Label</label>
+                  <input
+                    autoFocus
+                    required
+                    value={editLabel}
+                    onChange={(e) => setEditLabel(e.target.value)}
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base focus:outline-none"
+                    style={{ borderRadius: DESIGN_TOKENS.radii.wobbly }}
+                  />
+                  {!editLabel.trim() && <p className="text-xs text-[var(--danger-text)] mt-1">Label cannot be blank.</p>}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">Priority Tier</label>
+                    <input
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={editPriority}
+                      onChange={(e) => setEditPriority(Number(e.target.value))}
+                      className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">Weight</label>
+                    <input
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={editWeight}
+                      onChange={(e) => setEditWeight(Number(e.target.value))}
+                      className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">Soft Quota (USD)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      placeholder="Unlimited"
+                      value={editQuota}
+                      onChange={(e) => setEditQuota(e.target.value)}
+                      className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">Quota Reset</label>
+                    <select
+                      value={editQuotaType}
+                      onChange={(e) => setEditQuotaType(e.target.value as Account['quotaType'])}
+                      className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2"
+                    >
+                      <option value="none">None</option>
+                      <option value="daily">Daily</option>
+                      <option value="monthly">Monthly</option>
+                      <option value="rolling">Rolling</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-3 pt-2">
+                  <SketchButton type="button" variant="ghost" onClick={() => setEditingAccount(null)}>
+                    Cancel
+                  </SketchButton>
+                  <SketchButton
+                    type="submit"
+                    variant="primary"
+                    disabled={!editLabel.trim() || editPriority < 1 || editWeight < 1 || (editQuota.trim() !== '' && Number(editQuota) < 0)}
+                  >
+                    Save Changes
+                  </SketchButton>
+                </div>
+              </form>
+            </WobblyCard>
+          </div>
         </div>
       )}
 
