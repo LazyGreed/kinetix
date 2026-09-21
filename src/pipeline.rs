@@ -2302,11 +2302,7 @@ async fn drive_aggregate(
     } else {
         let upstream = attempt.stream.take().expect("validated SSE stream present");
         let prefetched = std::mem::take(&mut attempt.prefetched);
-        let replay = futures::stream::iter(
-            prefetched
-                .into_iter()
-                .map(Ok::<Bytes, reqwest::Error>),
-        );
+        let replay = futures::stream::iter(prefetched.into_iter().map(Ok::<Bytes, reqwest::Error>));
         let chunks = replay.chain(upstream.bytes_stream());
         tokio::pin!(chunks);
 
