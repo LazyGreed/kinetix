@@ -122,34 +122,45 @@ impl PluginAuthSessions {
         Some(session)
     }
 
-    /// Consume the one-time state for the Claude Code loopback callback when
-    /// browser cookie isolation prevents the initiating admin cookie from
-    /// crossing from another loopback host (for example 127.0.0.1) to
-    /// Anthropic's required localhost callback.
+    /// Consume one-time state for explicitly approved loopback OAuth callbacks
+    /// when browser cookie isolation prevents the initiating admin cookie from
+    /// crossing between equivalent loopback hosts.
     ///
-    /// This deliberately does not generalize state-only callbacks: the pending
-    /// session itself must be for the Claude Code plugin and its host-generated
-    /// redirect URI must be exactly an HTTP localhost /callback endpoint.
-    pub fn take_claude_loopback(&self, state: &str) -> Option<PluginAuthSession> {
+    /// This deliberately does not generalize state-only callbacks. Each plugin
+    /// allowed here must have a host-generated redirect with a narrowly checked
+    /// loopback host and callback path.
+    pub fn take_loopback_callback(&self, state: &str) -> Option<PluginAuthSession> {
         let now = Instant::now();
         let mut map = self.inner.lock();
         map.retain(|_, session| session.expires_at > now);
         let session = map.remove(state)?;
-        if session.expires_at <= now || session.plugin_id != "dev.kinetix.claude-code-oauth" {
+        if session.expires_at <= now {
             return None;
         }
 
         let redirect = url::Url::parse(&session.redirect_uri).ok()?;
         if redirect.scheme() != "http"
-            || redirect.host_str() != Some("localhost")
-            || redirect.path() != "/callback"
+            || !redirect.username().is_empty()
+            || redirect.password().is_some()
             || redirect.query().is_some()
             || redirect.fragment().is_some()
         {
             return None;
         }
 
-        Some(session)
+        let host = redirect.host_str();
+        let allowed = match session.plugin_id.as_str() {
+            "dev.kinetix.claude-code-oauth" => {
+                host == Some("localhost") && redirect.path() == "/callback"
+            }
+            "dev.kinetix.antigravity-oauth" => {
+                matches!(host, Some("localhost" | "127.0.0.1" | "::1"))
+                    && redirect.path() == "/admin/api/plugins/auth/callback"
+            }
+            _ => false,
+        };
+
+        allowed.then_some(session)
     }
 
     pub fn revoke(&self, state: &str) {
@@ -500,15 +511,38 @@ mod plugin_auth_tests {
         );
 
         let session = sessions
-            .take_claude_loopback(&pending.state)
+            .take_loopback_callback(&pending.state)
             .expect("Claude localhost callback should consume its one-time state");
         assert_eq!(session.plugin_id, "dev.kinetix.claude-code-oauth");
         assert_eq!(session.redirect_uri, "http://localhost:20128/callback");
-        assert!(sessions.take_claude_loopback(&pending.state).is_none());
+        assert!(sessions.take_loopback_callback(&pending.state).is_none());
     }
 
     #[test]
-    fn state_only_callback_is_rejected_for_non_claude_or_wrong_redirect() {
+    fn antigravity_loopback_state_can_cross_loopback_cookie_hosts_once() {
+        let sessions = PluginAuthSessions::new();
+        let pending = sessions.create(
+            "dev.kinetix.antigravity-oauth",
+            "antigravity",
+            "prov_1",
+            "plugin:dev.kinetix.antigravity-oauth/antigravity-oauth",
+            "http://127.0.0.1:20128/admin/api/plugins/auth/callback",
+            "session-token-from-localhost",
+        );
+
+        let session = sessions
+            .take_loopback_callback(&pending.state)
+            .expect("Antigravity loopback callback should consume its one-time state");
+        assert_eq!(session.plugin_id, "dev.kinetix.antigravity-oauth");
+        assert_eq!(
+            session.redirect_uri,
+            "http://127.0.0.1:20128/admin/api/plugins/auth/callback"
+        );
+        assert!(sessions.take_loopback_callback(&pending.state).is_none());
+    }
+
+    #[test]
+    fn state_only_callback_is_rejected_for_unapproved_plugin_or_wrong_redirect() {
         let sessions = PluginAuthSessions::new();
         let generic = sessions.create(
             "dev.example.plugin",
@@ -518,7 +552,7 @@ mod plugin_auth_tests {
             "http://localhost:20128/callback",
             "session-token-1",
         );
-        assert!(sessions.take_claude_loopback(&generic.state).is_none());
+        assert!(sessions.take_loopback_callback(&generic.state).is_none());
 
         let wrong_redirect = sessions.create(
             "dev.kinetix.claude-code-oauth",
@@ -529,7 +563,7 @@ mod plugin_auth_tests {
             "session-token-1",
         );
         assert!(sessions
-            .take_claude_loopback(&wrong_redirect.state)
+            .take_loopback_callback(&wrong_redirect.state)
             .is_none());
     }
 }
