@@ -719,7 +719,8 @@ pub async fn run(
         .map(|c| format!("route '{}'", c.name))
         .unwrap_or_else(|| req.requested_model.clone());
     let msg = last_error
-        .map(|e| e.message)
+        .as_ref()
+        .map(|e| e.message.clone())
         .unwrap_or_else(|| format!("all targets of {name} are currently unavailable"));
     trace.finish("all_targets_unavailable");
     state.live.finish(
