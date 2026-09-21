@@ -949,6 +949,7 @@ async fn send_upstream(
             json_body: Some(body),
             accept_event_stream: true,
             request_id: Some(request_id.to_string()),
+            total_timeout: None,
         },
     )
     .await
