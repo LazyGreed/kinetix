@@ -91,24 +91,12 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         .build()
         .context("building HTTP client")?;
 
-    // A separate client that follows redirects, used only for providers that
-    // explicitly opt in (NFR-3.10).
-    let http_redirect = reqwest::Client::builder()
-        .pool_max_idle_per_host(16)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent(concat!("kinetix/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building redirect HTTP client")?;
-
     let state = AppState::new(
         config.clone(),
         pool.clone(),
         registry.clone(),
         crypto,
         http,
-        http_redirect,
         log_queue,
         config.ip_rate_limit_per_min,
     );
