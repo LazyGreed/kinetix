@@ -77,6 +77,7 @@ impl AnthropicAdapter {
         for m in &req.messages {
             let role = match m.role {
                 Role::Assistant => "assistant",
+                Role::System => continue,
                 _ => "user",
             };
             let blocks = Self::content_blocks(&m.parts);
@@ -139,9 +140,14 @@ impl Adapter for AnthropicAdapter {
     fn apply_auth(
         &self,
         ctx: &UpstreamContext<'_>,
-        req: reqwest::RequestBuilder,
+        mut req: reqwest::RequestBuilder,
     ) -> reqwest::RequestBuilder {
         use crate::types::AuthScheme;
+        if ctx.credential.starts_with("sk-ant-oat")
+            || ctx.provider.credential_plugin.contains("claude-code")
+        {
+            req = req.header("user-agent", "claude-cli/1.18.31 (external, cli)");
+        }
         match ctx.provider.auth() {
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
@@ -168,8 +174,39 @@ impl Adapter for AnthropicAdapter {
         body.insert("model".to_string(), json!(ctx.model.upstream_id));
         body.insert("stream".to_string(), json!(true));
 
-        if !req.system.is_empty() {
-            body.insert("system".to_string(), json!(req.system.join("\n\n")));
+        let mut system = req.system.clone();
+        for m in &req.messages {
+            if m.role == Role::System {
+                for p in &m.parts {
+                    if let Part::Text(t) = p {
+                        if !t.trim().is_empty() {
+                            system.push(t.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if ctx.credential.starts_with("sk-ant-oat")
+            || ctx.provider.credential_plugin.contains("claude-code")
+        {
+            const BILLING_HEADER: &str =
+                "x-anthropic-billing-header: cc_version=1.18.31; cc_entrypoint=cli; cch=00000;";
+            const SENTINEL: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+            if !system
+                .iter()
+                .any(|s| s.contains("x-anthropic-billing-header:"))
+            {
+                system.insert(0, BILLING_HEADER.to_string());
+            }
+            if !system.iter().any(|s| s.contains("You are Claude Code")) {
+                let idx = if system.is_empty() { 0 } else { 1 };
+                system.insert(idx, SENTINEL.to_string());
+            }
+        }
+
+        if !system.is_empty() {
+            body.insert("system".to_string(), json!(system.join("\n\n")));
         }
         body.insert("messages".to_string(), json!(Self::build_messages(req)));
 
@@ -488,5 +525,217 @@ impl Adapter for AnthropicAdapter {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{ModelRow, ProviderRow};
+    use crate::types::Message;
+
+    fn provider() -> ProviderRow {
+        ProviderRow {
+            id: "prov_anthropic".into(),
+            name: "Anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            wire_format: "anthropic".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: "{}".into(),
+            timeout_ms: 10000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: "{}".into(),
+            enabled: 1,
+            follow_redirects: 0,
+            credential_hosts: String::new(),
+            allow_insecure_tls: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            wire_plugin: String::new(),
+            credential_plugin: String::new(),
+            model_source_plugin: String::new(),
+        }
+    }
+
+    fn model() -> ModelRow {
+        ModelRow {
+            id: "m_sonnet".into(),
+            provider_id: "prov_anthropic".into(),
+            upstream_id: "claude-sonnet-5".into(),
+            display_name: "Claude Sonnet 5".into(),
+            enabled: 1,
+            context_window: Some(200000),
+            max_output_tokens: Some(8192),
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
+    fn base_request() -> InternalRequest {
+        InternalRequest {
+            requested_model: "claude-sonnet-5".into(),
+            system: vec![],
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![Part::Text("Hello".into())],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            tool_choice_name: None,
+            params: crate::types::SamplingParams::default(),
+            stream: true,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        }
+    }
+
+    #[test]
+    fn build_body_standard_key_does_not_inject_attribution() {
+        let p = provider();
+        let m = model();
+        let req = base_request();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn build_body_oauth_token_injects_billing_header_and_sentinel() {
+        let p = provider();
+        let m = model();
+        let req = base_request();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            credential: "sk-ant-oat01-test-oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let system = body
+            .get("system")
+            .and_then(|v| v.as_str())
+            .expect("system prompt present");
+        assert!(system.contains("x-anthropic-billing-header: cc_version="));
+        assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
+    }
+
+    #[test]
+    fn build_body_claude_code_plugin_injects_attribution() {
+        let mut p = provider();
+        p.credential_plugin = "plugin:dev.kinetix.claude-code-oauth/claude-code-oauth".into();
+        let m = model();
+        let req = base_request();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            credential: "some-opaque-or-exchanged-credential".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let system = body
+            .get("system")
+            .and_then(|v| v.as_str())
+            .expect("system prompt present");
+        assert!(system.contains("x-anthropic-billing-header: cc_version="));
+        assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
+    }
+
+    #[test]
+    fn build_body_preserves_user_system_prompt() {
+        let p = provider();
+        let m = model();
+        let mut req = base_request();
+        req.system = vec!["You are a helpful coding assistant.".into()];
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            credential: "sk-ant-oat01-test-oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let system = body
+            .get("system")
+            .and_then(|v| v.as_str())
+            .expect("system prompt present");
+        assert!(system.starts_with("x-anthropic-billing-header: cc_version="));
+        assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
+        assert!(system.ends_with("You are a helpful coding assistant."));
+    }
+
+    #[test]
+    fn build_body_idempotent_if_billing_header_already_present() {
+        let p = provider();
+        let m = model();
+        let mut req = base_request();
+        req.system = vec![
+            "x-anthropic-billing-header: cc_version=1.18.31; cc_entrypoint=cli; cch=00000;".into(),
+            "You are Claude Code, Anthropic's official CLI for Claude.".into(),
+        ];
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            credential: "sk-ant-oat01-test-oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let system = body
+            .get("system")
+            .and_then(|v| v.as_str())
+            .expect("system prompt present");
+        let count = system.matches("x-anthropic-billing-header:").count();
+        assert_eq!(count, 1);
+        let sentinel_count = system.matches("You are Claude Code").count();
+        assert_eq!(sentinel_count, 1);
+    }
+
+    #[test]
+    fn build_body_extracts_role_system_from_messages() {
+        let p = provider();
+        let m = model();
+        let mut req = base_request();
+        req.messages.insert(
+            0,
+            Message {
+                role: Role::System,
+                parts: vec![Part::Text("Be concise.".into())],
+            },
+        );
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            credential: "sk-ant-oat01-test-oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let system = body
+            .get("system")
+            .and_then(|v| v.as_str())
+            .expect("system prompt present");
+        assert!(system.contains("Be concise."));
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        // Role::System should not be mapped into the outbound user messages.
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("role").and_then(|v| v.as_str()),
+            Some("user")
+        );
     }
 }

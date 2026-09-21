@@ -206,21 +206,18 @@ pub async fn test_stream(
     let stream = body.stream.unwrap_or(true);
 
     // Build a minimal internal request from the tester form.
-    let mut messages = Vec::new();
+    let mut system_prompts = Vec::new();
     if let Some(system) = body.system.filter(|s| !s.trim().is_empty()) {
-        messages.push(crate::types::Message {
-            role: crate::types::Role::System,
-            parts: vec![crate::types::Part::Text(system)],
-        });
+        system_prompts.push(system);
     }
-    messages.push(crate::types::Message {
+    let messages = vec![crate::types::Message {
         role: crate::types::Role::User,
         parts: vec![crate::types::Part::Text(body.prompt)],
-    });
+    }];
 
     let req = crate::types::InternalRequest {
         requested_model: body.model.clone(),
-        system: vec![],
+        system: system_prompts,
         messages,
         tools: vec![],
         tool_choice: None,
