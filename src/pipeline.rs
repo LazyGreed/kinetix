@@ -730,6 +730,25 @@ pub async fn run(
         None,
     );
     let _ = db::insert_route_trace(&state.pool, &trace).await;
+    // Preserve the actual upstream failure when we attempted a target. Routing
+    // exhaustion must not turn a useful 429/401/5xx into a generic 503.
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+
+    // No attempt was possible. If every candidate is cooling down from a prior
+    // rate limit, preserve rate-limit semantics for subsequent requests too.
+    if !all_accounts.is_empty()
+        && all_accounts
+            .iter()
+            .all(|a| matches!(pool::effective_status(a), pool::AccountStatus::Cooldown))
+    {
+        return Err(ProxyError::rate_limited(
+            format!("{name}: all targets are rate limited"),
+            retry_after,
+        ));
+    }
+
     Err(ProxyError::all_unavailable(
         format!("{name}: {msg}"),
         retry_after,
