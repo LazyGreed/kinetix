@@ -362,6 +362,8 @@ export const Kinetix = {
   updateAccount: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/accounts/${id}`, body),
   deleteAccount: (id: string) => api.del(`/admin/api/accounts/${id}`),
   resetAccount: (id: string) => api.post(`/admin/api/accounts/${id}/reset`),
+  testAccount: (id: string, model?: string) =>
+    api.post<TestResult>(`/admin/api/accounts/${id}/test`, model ? { model } : {}),
 
   // --- routes --------------------------------------------------------------
   async routes(): Promise<Route[]> {
