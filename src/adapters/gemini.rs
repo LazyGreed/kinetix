@@ -627,7 +627,6 @@ pub fn message_has_tool_result(m: &Message) -> bool {
     m.parts.iter().any(|p| matches!(p, Part::ToolResult { .. }))
 }
 
-
 #[cfg(test)]
 mod schema_tests {
     use super::*;
@@ -659,9 +658,21 @@ mod schema_tests {
         let got = sanitize_schema(&input);
         assert!(got.get("$schema").is_none());
         assert!(got.get("additionalProperties").is_none());
-        assert_eq!(got.pointer("/properties/config/properties/mode/enum"), Some(&json!(["fast"])));
-        assert!(got.pointer("/properties/config/additionalProperties").is_none());
-        assert!(got.pointer("/properties/config/properties/items/items/additionalProperties").is_none());
-        assert_eq!(got.pointer("/properties/config/properties/items/items/properties/kind/enum"), Some(&json!(["x"])));
+        assert_eq!(
+            got.pointer("/properties/config/properties/mode/enum"),
+            Some(&json!(["fast"]))
+        );
+        assert!(
+            got.pointer("/properties/config/additionalProperties")
+                .is_none()
+        );
+        assert!(
+            got.pointer("/properties/config/properties/items/items/additionalProperties")
+                .is_none()
+        );
+        assert_eq!(
+            got.pointer("/properties/config/properties/items/items/properties/kind/enum"),
+            Some(&json!(["x"]))
+        );
     }
 }
