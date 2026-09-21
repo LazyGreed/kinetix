@@ -46,4 +46,5 @@ pub mod sse;
 mod torture;
 pub mod trace;
 pub mod types;
+pub mod update;
 pub mod validate;
