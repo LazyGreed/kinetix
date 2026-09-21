@@ -241,7 +241,11 @@ pub struct AccountArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum AccountAction {
-    List,
+    List {
+        /// Filter by provider name or ID.
+        #[arg(long)]
+        provider: Option<String>,
+    },
     Add {
         #[arg(long)]
         provider: String,
@@ -936,11 +940,36 @@ async fn cmd_model(cli: &Cli, args: ModelArgs) -> Result<()> {
 async fn cmd_account(cli: &Cli, args: AccountArgs) -> Result<()> {
     let (_, pool, crypto) = open(cli).await?;
     match args.action {
-        AccountAction::List => {
-            for a in db::list_accounts(&pool).await? {
+        AccountAction::List { provider } => {
+            let mut accounts = db::list_accounts(&pool).await?;
+            let providers = db::list_providers(&pool).await?;
+            if let Some(provider) = provider {
+                let provider_id = resolve_provider(&pool, &provider).await?;
+                accounts.retain(|a| a.provider_id == provider_id);
+            }
+
+            for p in &providers {
+                let group: Vec<_> = accounts.iter().filter(|a| a.provider_id == p.id).collect();
+                if group.is_empty() {
+                    continue;
+                }
+                println!("{} ({})", p.name, p.id);
+                for a in group {
+                    println!(
+                        "  {}\t{}\tTier #{}\tstatus={}",
+                        a.id, a.label, a.priority, a.status
+                    );
+                }
+            }
+
+            for a in accounts
+                .iter()
+                .filter(|a| !providers.iter().any(|p| p.id == a.provider_id))
+            {
+                println!("{} ({})", a.provider_id, a.provider_id);
                 println!(
-                    "{}\t{}\t{}\tstatus={}",
-                    a.id, a.label, a.provider_id, a.status
+                    "  {}\t{}\tTier #{}\tstatus={}",
+                    a.id, a.label, a.priority, a.status
                 );
             }
             Ok(())

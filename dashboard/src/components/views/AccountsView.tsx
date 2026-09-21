@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2, Sliders } from 'lucide-react';
+import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2, Search, X, Sliders } from 'lucide-react';
 import { Account, Provider } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens, DESIGN_TOKENS } from '../../lib/designSystem';
@@ -21,7 +21,9 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
   onDeleteAccount,
 }) => {
   const [showAddModal, setShowAddModal] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const [confirmDeleteAccountId, setConfirmDeleteAccountId] = useState<string | null>(null);
+  const [providerFilter, setProviderFilter] = useState('all');
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [editLabel, setEditLabel] = useState('');
   const [editPriority, setEditPriority] = useState(1);
@@ -93,6 +95,25 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
     });
   };
 
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const filteredAccounts = accounts.filter((acc) => {
+    if (!normalizedSearch) return true;
+    return [acc.id, acc.label, acc.providerName, acc.keyMasked, acc.status]
+      .some((value) => String(value ?? '').toLowerCase().includes(normalizedSearch));
+  });
+
+  const visibleProviders = providers.filter((provider) =>
+    providerFilter === 'all' || provider.id === providerFilter,
+  );
+  const orphanAccounts = filteredAccounts.filter(
+    (account) => !providers.some((provider) => provider.id === account.providerId),
+  );
+
+  const openAddForProvider = (id: string) => {
+    setProviderId(id);
+    setShowAddModal(true);
+  };
+
   const openConfigure = (acc: Account) => {
     setEditingAccount(acc);
     setEditLabel(acc.label);
@@ -134,18 +155,66 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
           </p>
         </div>
 
-        <SketchButton
-          variant="primary"
-          size="md"
-          onClick={() => setShowAddModal(true)}
-          className="gap-2 font-heading font-bold"
-        >
-          <Plus className="w-5 h-5" />
-          Add Upstream Credential
-        </SketchButton>
+        <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
+          <div className="relative min-w-0 sm:w-72">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--ink)]/50" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search accounts…"
+              className="w-full pl-9 pr-9 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm focus:outline-none focus:border-[var(--pen-blue)]"
+              style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink)]/60 hover:text-[var(--marker-red)] cursor-pointer"
+                title="Clear search"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+          <SketchButton
+            variant="primary"
+            size="md"
+            onClick={() => setShowAddModal(true)}
+            className="gap-2 font-heading font-bold whitespace-nowrap"
+          >
+            <Plus className="w-5 h-5" />
+            Add Upstream Credential
+          </SketchButton>
+        </div>
       </div>
 
-      {/* Account Cards Grid */}
+      {providers.length > 1 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-mono text-[var(--ink)]/60">Pool:</span>
+          <button
+            onClick={() => setProviderFilter('all')}
+            className={`px-3 py-1.5 text-xs font-heading font-bold border border-[var(--ink)] rounded cursor-pointer ${
+              providerFilter === 'all' ? 'bg-[var(--postit)] sketch-shadow-sm' : 'bg-[var(--surface)]'
+            }`}
+          >
+            All Providers
+          </button>
+          {providers.map((provider) => (
+            <button
+              key={provider.id}
+              onClick={() => setProviderFilter(provider.id)}
+              className={`px-3 py-1.5 text-xs font-heading font-bold border border-[var(--ink)] rounded cursor-pointer ${
+                providerFilter === provider.id ? 'bg-[var(--postit)] sketch-shadow-sm' : 'bg-[var(--surface)]'
+              }`}
+            >
+              {provider.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Provider account pools */}
       {accounts.length === 0 ? (
         <WobblyCard decoration="tack" className="p-10 text-center bg-[var(--surface)]">
           <KeyRound className="w-12 h-12 text-[var(--pen-blue)] mx-auto mb-3 opacity-60" />
@@ -163,14 +232,51 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
             Add First Upstream Credential
           </SketchButton>
         </WobblyCard>
+      ) : normalizedSearch && filteredAccounts.length === 0 ? (
+        <WobblyCard decoration="tack" className="p-8 text-center bg-[var(--surface)]">
+          <Search className="w-10 h-10 text-[var(--ink)]/35 mx-auto mb-2" />
+          <p className="font-heading font-bold text-lg">No accounts match “{searchQuery}”.</p>
+          <button
+            onClick={() => setSearchQuery('')}
+            className="mt-2 text-sm font-heading font-bold text-[var(--pen-blue)] hover:underline cursor-pointer"
+          >
+            Clear search
+          </button>
+        </WobblyCard>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {accounts.map((acc, idx) => {
-            const isCooldown = acc.status === 'cooldown';
-            const isExhausted = acc.status === 'exhausted';
-            const rotation = idx % 2 === 0 ? '-0.5deg' : '0.5deg';
-
+        <div className="space-y-8">
+          {visibleProviders.map((provider) => {
+            const poolAccounts = filteredAccounts.filter((acc) => acc.providerId === provider.id);
+            const healthy = poolAccounts.filter((acc) => acc.status === 'healthy').length;
+            const cooldown = poolAccounts.filter((acc) => acc.status === 'cooldown').length;
+            const exhausted = poolAccounts.filter((acc) => acc.status === 'exhausted').length;
             return (
+              <section key={provider.id} className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b-2 border-dashed border-[var(--ink)]/25 pb-2">
+                  <div>
+                    <h3 className="text-xl font-heading font-bold text-[var(--ink)]">{provider.name} Pool</h3>
+                    <p className="text-xs font-mono text-[var(--ink)]/65">
+                      {poolAccounts.length} credential(s) · {healthy} healthy · {cooldown} cooldown · {exhausted} exhausted
+                    </p>
+                  </div>
+                  <SketchButton variant="secondary" size="sm" onClick={() => openAddForProvider(provider.id)} className="gap-1">
+                    <Plus className="w-4 h-4" />
+                    Add Credential
+                  </SketchButton>
+                </div>
+
+                {poolAccounts.length === 0 ? (
+                  <div className="p-5 text-sm font-body text-[var(--ink)]/65 bg-[var(--surface)] border-2 border-dashed border-[var(--ink)]/25 rounded">
+                    No credentials in this provider pool.
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {poolAccounts.map((acc, idx) => {
+                    const isCooldown = acc.status === 'cooldown';
+                    const isExhausted = acc.status === 'exhausted';
+                    const rotation = idx % 2 === 0 ? '-0.5deg' : '0.5deg';
+
+                    return (
               <WobblyCard
                 key={acc.id}
                 decoration={isCooldown ? 'tack' : idx % 2 === 0 ? 'tape' : 'none'}
@@ -258,7 +364,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                 {/* Footer */}
                 <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--ink)]/20 pt-3 text-xs font-mono">
                   <div className="text-[var(--ink)]/70">
-                    <span>Priority: <strong>Tier #{acc.priority}</strong></span>
+                    <span>Provider Priority: <strong>Tier #{acc.priority}</strong></span>
                   </div>
 
                   <div className="flex items-center gap-2 ml-auto">
@@ -303,8 +409,27 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                   </div>
                 </div>
               </WobblyCard>
+                    );
+                  })}
+                  </div>
+                )}
+              </section>
             );
           })}
+
+          {providerFilter === 'all' && orphanAccounts.length > 0 && (
+            <section className="space-y-3">
+              <h3 className="text-xl font-heading font-bold text-[var(--ink)]">Unknown Provider Pool</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {orphanAccounts.map((acc) => (
+                  <WobblyCard key={acc.id} className="p-5 bg-[var(--surface)]">
+                    <h4 className="font-heading font-bold">{acc.label}</h4>
+                    <p className="text-xs font-mono">{acc.providerId} · Tier #{acc.priority} · {acc.status}</p>
+                  </WobblyCard>
+                ))}
+              </div>
+            </section>
+          )}
         </div>
       )}
 
@@ -324,16 +449,21 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
               </h3>
               <form onSubmit={handleConfigureSubmit} className="space-y-4 font-body">
                 <div>
-                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">Label</label>
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Account Label
+                  </label>
                   <input
                     autoFocus
+                    type="text"
                     required
                     value={editLabel}
                     onChange={(e) => setEditLabel(e.target.value)}
-                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base focus:outline-none"
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base sketch-shadow-sm focus:outline-none"
                     style={{ borderRadius: DESIGN_TOKENS.radii.wobbly }}
                   />
-                  {!editLabel.trim() && <p className="text-xs text-[var(--danger-text)] mt-1">Label cannot be blank.</p>}
+                  {!editLabel.trim() && (
+                    <p className="text-xs text-[var(--danger-text)] mt-1">Label cannot be blank.</p>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
