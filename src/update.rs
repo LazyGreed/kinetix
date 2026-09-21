@@ -10,7 +10,7 @@ use semver::Version;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::cli::UpdateArgs;
@@ -141,8 +141,11 @@ fn validate_tag(tag: &str) -> Result<String> {
     if !tag.starts_with('v') {
         bail!("release tag must be vX.Y.Z (got {tag})");
     }
-    Version::parse(tag.trim_start_matches('v'))
+    let version = Version::parse(tag.trim_start_matches('v'))
         .with_context(|| format!("release tag must be vX.Y.Z (got {tag})"))?;
+    if !version.pre.is_empty() || !version.build.is_empty() {
+        bail!("release tag must be vX.Y.Z (got {tag})");
+    }
     Ok(tag.to_string())
 }
 
