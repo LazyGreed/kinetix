@@ -82,6 +82,9 @@ pub struct ProviderRequest {
     pub json_body: Option<Value>,
     pub accept_event_stream: bool,
     pub request_id: Option<String>,
+    /// Optional whole-request timeout for bounded control-plane calls such as
+    /// probes/discovery. Streaming proxy traffic must leave this as `None`.
+    pub total_timeout: Option<Duration>,
 }
 
 /// Resolve a URL and validate the entire DNS answer set. The returned addresses
@@ -257,10 +260,12 @@ pub async fn send_provider_request(
         let client = pinned_client(cache, &destination, insecure_tls)?;
 
         let authorized = credentials_authorized(ctx, &current);
-        // Do not set RequestBuilder::timeout here: reqwest defines it as a
-        // whole-request deadline, including the streamed response body. That
-        // would kill healthy long-running reasoning/tool streams.
         let mut builder = client.request(method.clone(), current.clone());
+        // Whole-request deadlines are reserved for bounded control-plane calls.
+        // Proxy streaming uses phase timers in pipeline.rs instead.
+        if let Some(timeout) = request.total_timeout {
+            builder = builder.timeout(timeout);
+        }
 
         if body.is_some() {
             builder = builder.header("content-type", "application/json");
