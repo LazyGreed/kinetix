@@ -420,6 +420,9 @@ export default function App() {
   const handleDeleteAccount = (accountId: string) =>
     withRefresh(() => Kinetix.deleteAccount(accountId));
 
+  const handleResetAccount = (accountId: string) =>
+    withRefresh(() => Kinetix.resetAccount(accountId));
+
   const handleAddAlias = (alias: ModelAlias) =>
     withRefresh(() =>
       Kinetix.createAlias({
@@ -522,6 +525,7 @@ export default function App() {
             onAddAccount={handleAddAccount}
             onUpdateAccount={handleUpdateAccount}
             onDeleteAccount={handleDeleteAccount}
+            onResetAccount={handleResetAccount}
           />
         )}
 
