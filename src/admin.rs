@@ -1230,8 +1230,8 @@ async fn discover_models_native(
         model: &dummy_model,
         credential,
     };
-    let parsed_url = url::Url::parse(&url)
-        .map_err(|e| ApiError::bad(format!("invalid discovery URL: {e}")))?;
+    let parsed_url =
+        url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid discovery URL: {e}")))?;
     let resp = crate::outbound::send_provider_request(
         &state.outbound_clients,
         state.config.allow_private_upstreams,
@@ -1368,8 +1368,8 @@ pub async fn test_provider(
         .build_url(&ctx)
         .map_err(|e| ApiError::bad(e.message))?;
     let outbound = adapter.build_body(&ctx, &internal);
-    let parsed_url = url::Url::parse(&url)
-        .map_err(|e| ApiError::bad(format!("invalid probe URL: {e}")))?;
+    let parsed_url =
+        url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid probe URL: {e}")))?;
 
     let started = std::time::Instant::now();
     match crate::outbound::send_provider_request(
