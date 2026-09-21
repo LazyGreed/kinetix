@@ -940,7 +940,10 @@ async fn cmd_account(cli: &Cli, args: AccountArgs) -> Result<()> {
                 }
             }
 
-            for a in accounts.iter().filter(|a| !providers.iter().any(|p| p.id == a.provider_id)) {
+            for a in accounts
+                .iter()
+                .filter(|a| !providers.iter().any(|p| p.id == a.provider_id))
+            {
                 println!("{} ({})", a.provider_id, a.provider_id);
                 println!(
                     "  {}\t{}\tTier #{}\tstatus={}",
