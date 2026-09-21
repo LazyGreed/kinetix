@@ -95,8 +95,14 @@ struct Attempt {
     target: ResolvedTarget,
     upstream_request_id: Option<String>,
     stream: Option<reqwest::Response>,
+    /// Raw SSE transport chunks consumed during pre-commit validation. Drivers
+    /// replay them before reading the remaining response body.
+    prefetched: Vec<Bytes>,
+    /// Parsed complete events for a successful non-SSE JSON response.
+    full_events: Option<Vec<StreamEvent>>,
     adapter: Arc<dyn Adapter>,
-    /// Whether this attempt uses same-format passthrough (FR-2.7).
+    /// Same-format passthrough is only possible when the upstream is actually
+    /// SSE. A JSON response is normalized through parse_full_response().
     passthrough: bool,
 }
 
@@ -801,7 +807,12 @@ async fn send_upstream(
     // translation builds a fresh body from the internal model.
     let body: Value = if use_passthrough {
         let raw = req.raw_body.as_deref().unwrap_or("{}");
-        match passthrough::rewrite_model(raw, &ctx.model.upstream_id, !req.stream) {
+        match passthrough::rewrite_model(
+            raw,
+            &ctx.model.upstream_id,
+            !req.stream,
+            ctx.provider.wire(),
+        ) {
             Some(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
             None => adapter.build_body(ctx, req),
         }
@@ -835,6 +846,203 @@ async fn send_upstream(
         message: e.message,
         quota_reset_at: None,
     })
+}
+
+const MAX_FULL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+struct PreparedUpstream {
+    stream: Option<reqwest::Response>,
+    prefetched: Vec<Bytes>,
+    full_events: Option<Vec<StreamEvent>>,
+    is_sse: bool,
+}
+
+fn is_semantic_event(event: &StreamEvent) -> bool {
+    !matches!(event, StreamEvent::Start { .. } | StreamEvent::Usage(_))
+}
+
+fn payload_is_terminal(payload: &str, events: &[StreamEvent]) -> bool {
+    if payload.trim() == "[DONE]" {
+        return true;
+    }
+    if events.iter().any(|event| matches!(event, StreamEvent::Finish(_))) {
+        return true;
+    }
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("message_stop")
+}
+
+fn payload_error_failure(
+    adapter: &Arc<dyn Adapter>,
+    payload: &str,
+) -> Option<UpstreamFailure> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let looks_error = value.get("error").is_some()
+        || value.get("type").and_then(Value::as_str) == Some("error");
+    if !looks_error {
+        return None;
+    }
+    Some(adapter.classify_error(
+        502,
+        payload,
+        &reqwest::header::HeaderMap::new(),
+    ))
+}
+
+/// Validate a successful HTTP response before the client response is committed.
+/// SSE stays retryable until the first semantic model event. Normal JSON is
+/// parsed completely through the adapter's full-response path.
+async fn prepare_success_response(
+    mut response: reqwest::Response,
+    adapter: &Arc<dyn Adapter>,
+) -> Result<PreparedUpstream, UpstreamFailure> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_sse = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        == Some("text/event-stream");
+
+    if !is_sse {
+        if response
+            .content_length()
+            .map(|len| len > MAX_FULL_RESPONSE_BYTES as u64)
+            .unwrap_or(false)
+        {
+            return Err(UpstreamFailure {
+                kind: FailureKind::ServerError,
+                status: Some(502),
+                retry_after_secs: None,
+                message: "upstream JSON response exceeds size limit".into(),
+                quota_reset_at: None,
+            });
+        }
+        let body = response.bytes().await.map_err(|error| UpstreamFailure {
+            kind: if error.is_timeout() {
+                FailureKind::Timeout
+            } else {
+                FailureKind::ConnectionError
+            },
+            status: None,
+            retry_after_secs: None,
+            message: classify_reqwest(&error),
+            quota_reset_at: None,
+        })?;
+        if body.len() > MAX_FULL_RESPONSE_BYTES {
+            return Err(UpstreamFailure {
+                kind: FailureKind::ServerError,
+                status: Some(502),
+                retry_after_secs: None,
+                message: "upstream JSON response exceeds size limit".into(),
+                quota_reset_at: None,
+            });
+        }
+        let body_text = String::from_utf8_lossy(&body);
+        if let Some(failure) = payload_error_failure(adapter, &body_text) {
+            return Err(failure);
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|error| UpstreamFailure {
+            kind: FailureKind::ServerError,
+            status: Some(502),
+            retry_after_secs: None,
+            message: format!("invalid upstream JSON response: {error}"),
+            quota_reset_at: None,
+        })?;
+        let events = adapter.parse_full_response(&value)?;
+        if !events.iter().any(is_semantic_event) {
+            return Err(UpstreamFailure {
+                kind: FailureKind::ServerError,
+                status: Some(502),
+                retry_after_secs: None,
+                message: "upstream JSON response contained no model result".into(),
+                quota_reset_at: None,
+            });
+        }
+        return Ok(PreparedUpstream {
+            stream: None,
+            prefetched: Vec::new(),
+            full_events: Some(events),
+            is_sse: false,
+        });
+    }
+
+    let mut framer = crate::sse::SseFramer::new();
+    let mut prefetched = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => {
+                prefetched.push(bytes.clone());
+                let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
+                    kind: FailureKind::ServerError,
+                    status: Some(502),
+                    retry_after_secs: None,
+                    message: error.to_string(),
+                    quota_reset_at: None,
+                })?;
+                for frame in frames {
+                    let Some(payload) = crate::sse::extract_data(&frame) else {
+                        continue;
+                    };
+                    if let Some(failure) = payload_error_failure(adapter, &payload) {
+                        return Err(failure);
+                    }
+                    if payload.trim() == "[DONE]" {
+                        return Err(UpstreamFailure {
+                            kind: FailureKind::ServerError,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended before any model event".into(),
+                            quota_reset_at: None,
+                        });
+                    }
+                    let events = adapter.parse_stream_chunk(&payload)?;
+                    if events.iter().any(is_semantic_event) {
+                        return Ok(PreparedUpstream {
+                            stream: Some(response),
+                            prefetched,
+                            full_events: None,
+                            is_sse: true,
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                let message = if framer.pending_bytes() > 0 {
+                    "upstream SSE ended with an incomplete frame"
+                } else {
+                    "upstream SSE ended before any model event"
+                };
+                return Err(UpstreamFailure {
+                    kind: FailureKind::ServerError,
+                    status: Some(502),
+                    retry_after_secs: None,
+                    message: message.into(),
+                    quota_reset_at: None,
+                });
+            }
+            Err(error) => {
+                return Err(UpstreamFailure {
+                    kind: if error.is_timeout() {
+                        FailureKind::Timeout
+                    } else {
+                        FailureKind::ConnectionError
+                    },
+                    status: None,
+                    retry_after_secs: None,
+                    message: classify_reqwest(&error),
+                    quota_reset_at: None,
+                });
+            }
+        }
+    }
 }
 
 fn classify_reqwest(e: &reqwest::Error) -> String {
