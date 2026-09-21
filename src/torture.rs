@@ -178,7 +178,7 @@ fn fuzz_bounded_resources() {
         while i < bytes.len() {
             let step = (next() % 5 + 1) as usize;
             let end = (i + step).min(bytes.len());
-            frames.extend(f.push(&bytes[i..end]));
+            frames.extend(f.push(&bytes[i..end]).unwrap());
             i = end;
         }
         let adapter = crate::adapters::gemini::GeminiAdapter;
