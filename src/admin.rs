@@ -1661,10 +1661,25 @@ pub async fn delete_model(
 // Accounts
 // ===========================================================================
 
-pub async fn list_accounts(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
-    let accounts = db::list_accounts(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+#[derive(Deserialize)]
+pub struct AccountListQuery {
+    pub provider_id: Option<String>,
+}
+
+pub async fn list_accounts(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<AccountListQuery>,
+) -> ApiResult {
+    let accounts = if let Some(provider_id) = query.provider_id.as_deref() {
+        db::accounts_for_provider(&state.pool, provider_id)
+            .await
+            .map_err(ApiError::internal)?
+    } else {
+        db::list_accounts(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+    };
     let providers = db::list_providers(&state.pool)
         .await
         .map_err(ApiError::internal)?;
