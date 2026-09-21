@@ -636,20 +636,50 @@ pub async fn run(
         // (Monitoring). Excludes upstream network time.
         crate::alerts::record_added_latency(started.elapsed().as_millis() as u64);
 
-        match send_upstream(
-            state,
-            &adapter,
-            &ctx,
-            &req,
-            use_passthrough,
-            &meta.request_id,
+        let provider_timeout = provider_phase_timeout(&target.provider);
+        let Some((phase_deadline, send_budget)) = phase_budget(deadline, provider_timeout) else {
+            trace.step("skip", None, "pre-commit deadline exceeded");
+            break;
+        };
+        let send_result = match tokio::time::timeout(
+            send_budget,
+            send_upstream(
+                state,
+                &adapter,
+                &ctx,
+                &req,
+                use_passthrough,
+                &meta.request_id,
+            ),
         )
         .await
         {
+            Ok(result) => result,
+            Err(_) => Err(timeout_failure("upstream timed out before response headers")),
+        };
+
+        match send_result {
             Ok(resp) => {
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
-                    let prepared = match prepare_success_response(resp, &adapter).await {
+                    let first_event_remaining =
+                        phase_deadline.saturating_duration_since(Instant::now());
+                    let prepared_result = if first_event_remaining.is_zero() {
+                        Err(timeout_failure("upstream timed out before first valid event"))
+                    } else {
+                        match tokio::time::timeout(
+                            first_event_remaining,
+                            prepare_success_response(resp, &adapter),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(timeout_failure(
+                                "upstream timed out before first valid event",
+                            )),
+                        }
+                    };
+                    let prepared = match prepared_result {
                         Ok(prepared) => prepared,
                         Err(failure) => {
                             state.flight.record(
@@ -712,6 +742,7 @@ pub async fn run(
                         stream: prepared.stream,
                         prefetched: prepared.prefetched,
                         full_events: prepared.full_events,
+                        idle_timeout: provider_timeout,
                         adapter: adapter.clone(),
                         passthrough: use_passthrough && prepared.is_sse,
                     };
@@ -721,11 +752,33 @@ pub async fn run(
                     .await);
                 }
 
-                // Classify and maybe fail over.
+                // Classify and maybe fail over. Reading an error body is still
+                // part of the pre-commit phase and cannot outlive its budget.
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
-                let body = resp.text().await.unwrap_or_default();
-                let failure = adapter.classify_error(status, &body, &headers);
+                let error_body_remaining =
+                    phase_deadline.saturating_duration_since(Instant::now());
+                let failure = if error_body_remaining.is_zero() {
+                    timeout_failure("upstream timed out while reading error response")
+                } else {
+                    match tokio::time::timeout(error_body_remaining, resp.text()).await {
+                        Ok(Ok(body)) => adapter.classify_error(status, &body, &headers),
+                        Ok(Err(error)) => UpstreamFailure {
+                            kind: if error.is_timeout() {
+                                FailureKind::Timeout
+                            } else {
+                                FailureKind::ConnectionError
+                            },
+                            status: Some(status),
+                            retry_after_secs: None,
+                            message: classify_reqwest(&error),
+                            quota_reset_at: None,
+                        },
+                        Err(_) => {
+                            timeout_failure("upstream timed out while reading error response")
+                        }
+                    }
+                };
                 state.flight.record(
                     &meta.request_id,
                     started.elapsed().as_millis() as u64,
