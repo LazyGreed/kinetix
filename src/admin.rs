@@ -1518,7 +1518,11 @@ pub async fn test_account(
     let _ = db::insert_audit(
         &state.pool,
         "admin",
-        if ok { "account_probe_succeeded" } else { "account_probe_failed" },
+        if ok {
+            "account_probe_succeeded"
+        } else {
+            "account_probe_failed"
+        },
         "account",
         &id,
         &account.label,
