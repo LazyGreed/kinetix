@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Key, Plus, Copy, Check, ShieldAlert, Sparkles, Terminal, Trash2, Power } from 'lucide-react';
+import { Key, Plus, Copy, Check, ShieldAlert, Sparkles, Terminal, Trash2, Power, Search, X } from 'lucide-react';
 import { VirtualKey } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens } from '../../lib/designSystem';
@@ -86,6 +86,7 @@ export const KeysView: React.FC<KeysViewProps> = ({
   const [newlyCreatedKey, setNewlyCreatedKey] = useState<{ name: string; key: string } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Form state
   const [name, setName] = useState('');
@@ -146,6 +147,20 @@ export const KeysView: React.FC<KeysViewProps> = ({
     setTag('');
   };
 
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const filteredKeys = keys.filter((k) => {
+    if (!normalizedSearch) return true;
+    return [
+      k.id,
+      k.name,
+      k.owner,
+      k.tag,
+      k.key,
+      k.status,
+      ...k.allowedModels,
+    ].some((value) => String(value ?? '').toLowerCase().includes(normalizedSearch));
+  });
+
   return (
     <div className="space-y-6">
       {confirmNode}
@@ -163,15 +178,32 @@ export const KeysView: React.FC<KeysViewProps> = ({
           </p>
         </div>
 
-        <SketchButton
-          variant="primary"
-          size="md"
-          onClick={() => setShowCreateModal(true)}
-          className="gap-2 font-heading font-bold"
-        >
-          <Plus className="w-5 h-5" />
-          Issue New Virtual Key
-        </SketchButton>
+        <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
+          <div className="relative min-w-0 sm:w-72">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--ink)]/50" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search virtual keys…"
+              className="w-full pl-9 pr-9 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm focus:outline-none focus:border-[var(--pen-blue)]"
+            />
+            {searchQuery && (
+              <button type="button" onClick={() => setSearchQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink)]/60 hover:text-[var(--marker-red)] cursor-pointer" title="Clear search">
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+          <SketchButton
+            variant="primary"
+            size="md"
+            onClick={() => setShowCreateModal(true)}
+            className="gap-2 font-heading font-bold whitespace-nowrap"
+          >
+            <Plus className="w-5 h-5" />
+            Issue New Virtual Key
+          </SketchButton>
+        </div>
       </div>
 
       {/* Newly Created Key Alert (Shown once!) */}
@@ -214,7 +246,16 @@ export const KeysView: React.FC<KeysViewProps> = ({
 
       {/* Keys List Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {keys.map((k, idx) => {
+        {keys.length > 0 && filteredKeys.length === 0 && (
+          <WobblyCard decoration="tack" className="md:col-span-2 p-8 text-center bg-[var(--surface)]">
+            <Search className="w-10 h-10 text-[var(--ink)]/35 mx-auto mb-2" />
+            <p className="font-heading font-bold text-lg">No keys match “{searchQuery}”.</p>
+            <button onClick={() => setSearchQuery('')} className="mt-2 text-sm font-heading font-bold text-[var(--pen-blue)] hover:underline cursor-pointer">
+              Clear search
+            </button>
+          </WobblyCard>
+        )}
+        {filteredKeys.map((k, idx) => {
           const rotation = idx % 2 === 0 ? '-0.5deg' : '0.5deg';
           const dailyPct =
             k.dailyBudget > 0
