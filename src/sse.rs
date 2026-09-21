@@ -8,10 +8,43 @@
 //! normalizes CRLF to LF, and yields complete frames — never a partial one.
 //! This is exercised by the protocol torture tests in `src/torture.rs`.
 
+/// Default maximum size of one incomplete SSE frame. Large model payloads
+/// should be split across normal SSE events; an unbounded single event is a
+/// memory-amplification risk.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SseFrameError {
+    FrameTooLarge { pending_bytes: usize, limit: usize },
+}
+
+impl std::fmt::Display for SseFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SseFrameError::FrameTooLarge {
+                pending_bytes,
+                limit,
+            } => write!(
+                f,
+                "upstream SSE frame exceeds {limit} byte limit ({pending_bytes} bytes buffered)"
+            ),
+        }
+    }
+}
+
 /// Splits an inbound SSE byte stream into complete frames.
-#[derive(Default)]
 pub struct SseFramer {
     buffer: Vec<u8>,
+    /// Offset already checked for a delimiter. We retain the last three bytes
+    /// between pushes because the longest delimiter is CRLF CRLF (4 bytes).
+    scan_from: usize,
+    max_frame_bytes: usize,
+}
+
+impl Default for SseFramer {
+    fn default() -> Self {
+        Self::with_max_frame_bytes(DEFAULT_MAX_FRAME_BYTES)
+    }
 }
 
 impl SseFramer {
@@ -19,49 +52,71 @@ impl SseFramer {
         Self::default()
     }
 
-    /// Feed one transport chunk (any byte boundary) and return every complete
-    /// frame it completed, in order. Frames keep their trailing blank line
-    /// stripped but are otherwise verbatim (comments, `event:`, `data:` lines).
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        // Normalize CRLF -> LF on raw bytes so a split CRLF pair is handled
-        // correctly regardless of where the chunk boundary falls.
-        for &b in bytes {
-            self.buffer.push(b);
+    pub fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            scan_from: 0,
+            max_frame_bytes: max_frame_bytes.max(1),
         }
-        self.buffer = normalize_crlf(&self.buffer);
-
-        let mut frames = Vec::new();
-        while let Some(idx) = find_double_lf(&self.buffer) {
-            let frame_bytes: Vec<u8> = self.buffer.drain(..idx + 2).collect();
-            // Strip the trailing blank line.
-            let mut end = frame_bytes.len();
-            while end > 0 && (frame_bytes[end - 1] == b'\n' || frame_bytes[end - 1] == b'\r') {
-                end -= 1;
-            }
-            if end == 0 {
-                continue;
-            }
-            // A frame boundary only occurs between complete code points, so this
-            // is guaranteed valid UTF-8.
-            frames.push(String::from_utf8_lossy(&frame_bytes[..end]).to_string());
-        }
-        frames
     }
 
-    /// Whether a partial frame is buffered awaiting more bytes.
+    /// Feed one transport chunk and return every complete frame. Delimiter
+    /// scanning resumes near the previous tail rather than rescanning the
+    /// entire accumulated frame on every tiny transport chunk.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, SseFrameError> {
+        self.buffer.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+
+        loop {
+            let Some((idx, delimiter_len)) = find_delimiter(&self.buffer, self.scan_from) else {
+                if self.buffer.len() > self.max_frame_bytes {
+                    let pending_bytes = self.buffer.len();
+                    self.buffer.clear();
+                    self.scan_from = 0;
+                    return Err(SseFrameError::FrameTooLarge {
+                        pending_bytes,
+                        limit: self.max_frame_bytes,
+                    });
+                }
+                self.scan_from = self.buffer.len().saturating_sub(3);
+                break;
+            };
+
+            let frame_bytes: Vec<u8> = self.buffer.drain(..idx).collect();
+            self.buffer.drain(..delimiter_len);
+            self.scan_from = 0;
+
+            if frame_bytes.is_empty() {
+                continue;
+            }
+            let normalized = normalize_crlf(&frame_bytes);
+            if normalized.is_empty() {
+                continue;
+            }
+            frames.push(String::from_utf8_lossy(&normalized).to_string());
+        }
+
+        Ok(frames)
+    }
+
     pub fn pending(&self) -> bool {
         !self.buffer.is_empty()
     }
 
-    /// Take whatever is buffered (used at end-of-stream).
+    pub fn pending_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Clear and return trailing incomplete data for diagnostics. Stream
+    /// drivers should normally treat any non-empty value at EOF as truncation.
     pub fn flush(&mut self) -> Option<String> {
-        let mut end = self.buffer.len();
-        while end > 0 && (self.buffer[end - 1] == b'\n' || self.buffer[end - 1] == b'\r') {
-            end -= 1;
+        if self.buffer.is_empty() {
+            return None;
         }
-        let rest = String::from_utf8_lossy(&self.buffer[..end]).to_string();
+        let rest = String::from_utf8_lossy(&normalize_crlf(&self.buffer)).to_string();
         self.buffer.clear();
-        if rest.is_empty() {
+        self.scan_from = 0;
+        if rest.trim().is_empty() {
             None
         } else {
             Some(rest)
@@ -69,48 +124,40 @@ impl SseFramer {
     }
 }
 
-/// Replace every `\r\n` with `\n`, and a lone trailing `\r` is left in place
-/// (it may be the first half of a CRLF whose `\n` arrives in the next chunk —
-/// the next call's normalization handles it because the `\r` stays buffered).
+fn find_delimiter(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut i = start.min(bytes.len());
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+            return Some((i, 2));
+        }
+        if i + 3 < bytes.len()
+            && bytes[i] == b'\r'
+            && bytes[i + 1] == b'\n'
+            && bytes[i + 2] == b'\r'
+            && bytes[i + 3] == b'\n'
+        {
+            return Some((i, 4));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Normalize CRLF inside a complete frame. This only runs once per completed
+/// frame, avoiding repeated whole-buffer normalization for partial chunks.
 fn normalize_crlf(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\r' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                out.push(b'\n');
-                i += 2;
-                continue;
-            }
-            if i + 1 == bytes.len() {
-                // Trailing CR: defer — keep it so a following LF can pair with
-                // it on the next push.
-                out.push(b'\r');
-                i += 1;
-                continue;
-            }
-            // A CR not followed by LF: emit as-is.
-            out.push(b'\r');
-            i += 1;
+        if i + 1 < bytes.len() && bytes[i] == b'\r' && bytes[i + 1] == b'\n' {
+            out.push(b'\n');
+            i += 2;
         } else {
             out.push(bytes[i]);
             i += 1;
         }
     }
     out
-}
-
-/// Find the index of the first `\n\n` in the buffer.
-fn find_double_lf(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 2 {
-        return None;
-    }
-    for i in 0..bytes.len() - 1 {
-        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
-            return Some(i);
-        }
-    }
-    None
 }
 
 /// Extract the `data:` payload from one SSE frame, joining multiple data lines
@@ -142,7 +189,7 @@ mod tests {
         let bytes = input.as_bytes();
         let mut out = Vec::new();
         for chunk in bytes.chunks(size) {
-            out.extend(framer.push(chunk));
+            out.extend(framer.push(chunk).unwrap());
         }
         out
     }
@@ -150,7 +197,7 @@ mod tests {
     #[test]
     fn splits_lf_frames() {
         let mut f = SseFramer::new();
-        let frames = f.push(b"data: a\n\ndata: b\n\n");
+        let frames = f.push(b"data: a\n\ndata: b\n\n").unwrap();
         assert_eq!(frames, vec!["data: a", "data: b"]);
         assert!(!f.pending());
     }
@@ -158,7 +205,7 @@ mod tests {
     #[test]
     fn splits_crlf_frames() {
         let mut f = SseFramer::new();
-        let frames = f.push(b"data: a\r\n\r\ndata: b\r\n\r\n");
+        let frames = f.push(b"data: a\r\n\r\ndata: b\r\n\r\n").unwrap();
         assert_eq!(frames, vec!["data: a", "data: b"]);
     }
 
@@ -188,8 +235,8 @@ mod tests {
         let bytes = input.as_bytes();
         for split in 1..bytes.len() {
             let mut f = SseFramer::new();
-            let mut frames = f.push(&bytes[..split]);
-            frames.extend(f.push(&bytes[split..]));
+            let mut frames = f.push(&bytes[..split]).unwrap();
+            frames.extend(f.push(&bytes[split..]).unwrap());
             assert_eq!(
                 frames,
                 vec!["data: {\"t\":\"héllo→世界\"}"],
@@ -203,23 +250,23 @@ mod tests {
         // The CRLF terminator split so that CR ends one chunk and LF starts the
         // next must still be recognized.
         let mut f = SseFramer::new();
-        assert!(f.push(b"data: a\r\n\r").is_empty());
-        assert_eq!(f.push(b"\ndata: b\r\n\r\n"), vec!["data: a", "data: b"]);
+        assert!(f.push(b"data: a\r\n\r").unwrap().is_empty());
+        assert_eq!(f.push(b"\ndata: b\r\n\r\n").unwrap(), vec!["data: a", "data: b"]);
     }
 
     #[test]
     fn partial_frame_is_not_emitted() {
         let mut f = SseFramer::new();
-        assert!(f.push(b"data: par").is_empty());
+        assert!(f.push(b"data: par").unwrap().is_empty());
         assert!(f.pending());
-        let frames = f.push(b"tial\n\n");
+        let frames = f.push(b"tial\n\n").unwrap();
         assert_eq!(frames, vec!["data: partial"]);
     }
 
     #[test]
     fn joins_multiple_data_lines() {
         let mut f = SseFramer::new();
-        let frames = f.push(b"data: line1\ndata: line2\n\n");
+        let frames = f.push(b"data: line1\ndata: line2\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(extract_data(&frames[0]).unwrap(), "line1\nline2");
     }
@@ -227,8 +274,41 @@ mod tests {
     #[test]
     fn comments_have_no_data() {
         let mut f = SseFramer::new();
-        let frames = f.push(b": keepalive\n\n");
+        let frames = f.push(b": keepalive\n\n").unwrap();
         assert_eq!(frames, vec![": keepalive"]);
         assert!(extract_data(&frames[0]).is_none());
     }
+    #[test]
+    fn reports_pending_byte_count() {
+        let mut f = SseFramer::new();
+        f.push(b"data: partial").unwrap();
+        assert_eq!(f.pending_bytes(), 13);
+        assert!(f.flush().is_some());
+        assert_eq!(f.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn rejects_oversized_frame() {
+        let mut f = SseFramer::with_max_frame_bytes(8);
+        let err = f.push(b"123456789").unwrap_err();
+        assert!(matches!(
+            err,
+            SseFrameError::FrameTooLarge {
+                pending_bytes: 9,
+                limit: 8
+            }
+        ));
+        assert_eq!(f.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn adversarial_one_byte_chunks_stay_bounded() {
+        let mut f = SseFramer::with_max_frame_bytes(64);
+        for _ in 0..64 {
+            assert!(f.push(b"x").unwrap().is_empty());
+            assert!(f.pending_bytes() <= 64);
+        }
+        assert!(f.push(b"x").is_err());
+    }
+
 }
