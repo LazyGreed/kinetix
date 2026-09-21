@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil } from 'lucide-react';
+import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil, Search } from 'lucide-react';
 import { Provider, ModelConfig } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
@@ -45,6 +45,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [discoveryResults, setDiscoveryResults] = useState<DiscoveredModel[] | null>(null);
   const [discoverySearch, setDiscoverySearch] = useState('');
+  const [providerSearch, setProviderSearch] = useState('');
   const [pingStatus, setPingStatus] = useState<Record<string, { ok: boolean; pingMs: number; error?: string }>>({});
 
   // New Provider Form State
@@ -100,7 +101,15 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [validatingModel, setValidatingModel] = useState(false);
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
 
-  const activeProvider = providers.find((p) => p.id === selectedProviderId) || providers[0];
+  const providerQuery = providerSearch.trim().toLowerCase();
+  const filteredProviders = providers.filter((p) => {
+    if (!providerQuery) return true;
+    return [p.id, p.name, p.baseUrl, p.wireFormat, p.authScheme]
+      .some((value) => String(value ?? '').toLowerCase().includes(providerQuery));
+  });
+  const activeProvider =
+    filteredProviders.find((p) => p.id === selectedProviderId) ||
+    filteredProviders[0];
   const providerModels = models.filter((m) => m.providerId === activeProvider?.id);
 
   // Fuzzy search over the discovered model list: case-insensitive, and every
@@ -493,10 +502,41 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
           <div className="space-y-4">
             <h3 className="text-xl font-heading font-bold text-[var(--ink)] flex items-center gap-2">
               <Server className="w-5 h-5 text-[var(--pen-blue)]" />
-              Configured Upstreams ({providers.length})
+              Configured Upstreams ({filteredProviders.length}/{providers.length})
             </h3>
 
-            {providers.map((prov, idx) => {
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--ink)]/50" />
+              <input
+                type="search"
+                value={providerSearch}
+                onChange={(e) => setProviderSearch(e.target.value)}
+                placeholder="Search providers…"
+                className="w-full pl-9 pr-9 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm focus:outline-none focus:border-[var(--pen-blue)]"
+                style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+              />
+              {providerSearch && (
+                <button
+                  type="button"
+                  onClick={() => setProviderSearch('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink)]/60 hover:text-[var(--marker-red)] cursor-pointer"
+                  title="Clear search"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            {filteredProviders.length === 0 && (
+              <div className="p-5 text-center bg-[var(--surface)] border-2 border-dashed border-[var(--ink)]/30 rounded">
+                <p className="text-sm font-mono text-[var(--ink)]/70">No providers match “{providerSearch}”.</p>
+                <button onClick={() => setProviderSearch('')} className="mt-2 text-xs font-heading font-bold text-[var(--pen-blue)] hover:underline cursor-pointer">
+                  Clear search
+                </button>
+              </div>
+            )}
+
+            {filteredProviders.map((prov, idx) => {
               const isSelected = prov.id === activeProvider?.id;
               const tilt = idx % 2 === 0 ? '-rotate-0.5' : 'rotate-0.5';
               const ping = pingStatus[prov.id];
