@@ -4519,7 +4519,9 @@ pub async fn plugin_auth_callback(
         .map(|cookie| cookie.value().to_string());
     let session = match initiator {
         Some(initiator) => state.plugin_auth_sessions.take(&query.state, &initiator),
-        None => state.plugin_auth_sessions.take_claude_loopback(&query.state),
+        None => state
+            .plugin_auth_sessions
+            .take_claude_loopback(&query.state),
     }
     .ok_or_else(|| ApiError::bad("invalid or expired plugin auth state"))?;
 
