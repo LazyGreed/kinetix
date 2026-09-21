@@ -135,9 +135,7 @@ impl PluginAuthSessions {
         let mut map = self.inner.lock();
         map.retain(|_, session| session.expires_at > now);
         let session = map.remove(state)?;
-        if session.expires_at <= now
-            || session.plugin_id != "dev.kinetix.claude-code-oauth"
-        {
+        if session.expires_at <= now || session.plugin_id != "dev.kinetix.claude-code-oauth" {
             return None;
         }
 
