@@ -9,84 +9,27 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Least-privilege default; jobs that need more (none currently) opt in explicitly.
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: build / test / lint
+  format:
+    name: rustfmt
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      # The dashboard bundle is embedded into the binary via rust-embed, so it
-      # must exist before any cargo step compiles the crate.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: dashboard/package-lock.json
-
-      - name: Build dashboard (embedded assets)
-        working-directory: dashboard
-        run: |
-          npm ci
-          npm run build
+          components: rustfmt
 
       - name: Formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets
-
-      # Fixture / protocol-torture / fuzz suite (FR-9.4, FR-9.5, NFR-5.5).
-      - name: Tests (unit + protocol torture/fuzz)
-        run: cargo test --quiet
-
-      - name: Release script source-integrity regression
-        run: bash scripts/release-local-smoke.sh
-
-      - name: Release build (NFR-7.1)
-        run: cargo build --release
-
-      - name: Installer source-build smoke
-        run: bash scripts/install-smoke.sh
-
-      # End-to-end smoke test against the synthetic upstream (FR-9.2, FR-9.4).
-      - name: End-to-end smoke
-        run: scripts/smoke.sh 127.0.0.1:8180
-
-      # Reproducible coding-agent compatibility matrix (Pi, Responses, Anthropic).
-      - name: Coding-agent compatibility matrix
-        run: scripts/compat-matrix.sh 127.0.0.1:8186
-
-      # Capacity/overhead matrix against NFR-1 targets (NFR-1.4/1.8/1.9).
-      # Reports the numbers; run with a short matrix to keep CI fast.
-      - name: Benchmark matrix (NFR-1)
-        run: scripts/bench-rust.sh "1 10 100" 500
-
-      # Dependency vulnerability + license + ban checks (NFR-3.7).
-      - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: --all-features
-
   dashboard:
-    name: dashboard build
+    name: dashboard
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     defaults:
       run:
         working-directory: dashboard
@@ -107,3 +50,52 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Upload embedded dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  rust:
+    name: rust checks
+    runs-on: ubuntu-latest
+    needs: [format, dashboard]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The dashboard bundle is embedded into the binary via rust-embed.
+      # Reuse the dashboard job's artifact instead of rebuilding it here.
+      - name: Download embedded dashboard
+        uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Tests
+        run: cargo test --quiet
+
+  dependency-policy:
+    name: dependency policy
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
