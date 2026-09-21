@@ -58,12 +58,13 @@ export interface Account {
   status: 'healthy' | 'cooldown' | 'exhausted' | 'disabled';
   cooldownUntil?: string | null;
   quotaResetTime?: string | null;
-  quotaType: 'daily' | 'monthly' | 'none';
+  quotaType: 'daily' | 'monthly' | 'rolling' | 'none';
   softQuotaSpendLimit?: number;
   currentSpend: number;
   requestsCount: number;
   tokensCount: number;
   priority: number;
+  weight: number;
   lastError?: string;
 }
 
