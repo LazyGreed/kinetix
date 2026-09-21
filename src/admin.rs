@@ -1443,7 +1443,11 @@ async fn read_probe_preview(resp: reqwest::Response, sse: bool) -> String {
             }
             continue;
         }
-        for frame in framer.push(&chunk) {
+        let frames = match framer.push(&chunk) {
+            Ok(frames) => frames,
+            Err(_) => break,
+        };
+        for frame in frames {
             if let Some(data) = crate::sse::extract_data(&frame) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                     // OpenAI shape (text, then reasoning as a fallback label)
