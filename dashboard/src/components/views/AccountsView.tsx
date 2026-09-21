@@ -3,7 +3,7 @@ import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sp
 import { Account, Provider } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens, DESIGN_TOKENS } from '../../lib/designSystem';
-import { Kinetix } from '../../lib/resources';
+import { Kinetix, TestResult } from '../../lib/resources';
 
 interface AccountsViewProps {
   accounts: Account[];
@@ -11,6 +11,7 @@ interface AccountsViewProps {
   onAddAccount: (acc: Account & { apiKey?: string }) => void;
   onUpdateAccount: (acc: Account) => void;
   onDeleteAccount: (accountId: string) => void;
+  onResetAccount: (accountId: string) => void;
 }
 
 export const AccountsView: React.FC<AccountsViewProps> = ({
@@ -19,6 +20,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
   onAddAccount,
   onUpdateAccount,
   onDeleteAccount,
+  onResetAccount,
 }) => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -36,6 +38,8 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
   const [softQuota, setSoftQuota] = useState(100);
   const [accountValidation, setAccountValidation] = useState<{ valid: boolean; problems: string[] } | null>(null);
   const [validatingAccount, setValidatingAccount] = useState(false);
+  const [testingAccountId, setTestingAccountId] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, TestResult>>({});
 
   const handleValidateAccount = async () => {
     const prov = providers.find((p) => p.id === providerId) || providers[0];
@@ -86,13 +90,26 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
     setApiKey('');
   };
 
-  const handleResetCooldown = (acc: Account) => {
-    onUpdateAccount({
-      ...acc,
-      status: 'healthy',
-      cooldownUntil: null,
-      lastError: undefined,
-    });
+  const probeAccount = async (acc: Account, resetOnSuccess = false) => {
+    setTestingAccountId(acc.id);
+    try {
+      const result = await Kinetix.testAccount(acc.id);
+      setTestResults((current) => ({ ...current, [acc.id]: result }));
+      if (resetOnSuccess && result.ok) {
+        onResetAccount(acc.id);
+      }
+    } catch (e) {
+      setTestResults((current) => ({
+        ...current,
+        [acc.id]: {
+          ok: false,
+          status: 0,
+          error: e instanceof Error ? e.message : String(e),
+        },
+      }));
+    } finally {
+      setTestingAccountId(null);
+    }
   };
 
   const normalizedSearch = searchQuery.trim().toLowerCase();
@@ -327,12 +344,33 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                       </div>
                       <div>Cooling down: {acc.cooldownUntil || 'until Retry-After passes'}</div>
                       <button
-                        onClick={() => handleResetCooldown(acc)}
-                        className="mt-2 px-2 py-1 bg-[var(--surface)] border border-[var(--ink)] text-[var(--ink)] hover:bg-[var(--erased)] rounded flex items-center gap-1 cursor-pointer font-bold"
+                        onClick={() => void probeAccount(acc, true)}
+                        disabled={testingAccountId === acc.id}
+                        className="mt-2 px-2 py-1 bg-[var(--surface)] border border-[var(--ink)] text-[var(--ink)] hover:bg-[var(--erased)] rounded flex items-center gap-1 cursor-pointer font-bold disabled:opacity-50"
                       >
-                        <RefreshCw className="w-3 h-3" />
-                        Clear Cooldown & Probe Upstream
+                        <RefreshCw className={`w-3 h-3 ${testingAccountId === acc.id ? 'animate-spin' : ''}`} />
+                        {testingAccountId === acc.id ? 'Testing…' : 'Test & Clear Cooldown'}
                       </button>
+                    </div>
+                  )}
+
+                  {testResults[acc.id] && (
+                    <div
+                      className={`mb-4 p-3 border-2 rounded text-xs font-mono ${
+                        testResults[acc.id].ok
+                          ? 'bg-[var(--tint-green)] border-[var(--pen-green)]'
+                          : 'bg-[var(--tint-red)] border-[var(--marker-red)]'
+                      }`}
+                    >
+                      <div className="font-bold">
+                        {testResults[acc.id].ok ? 'Proxy test passed' : 'Proxy test failed'}
+                        {testResults[acc.id].status ? ` · HTTP ${testResults[acc.id].status}` : ''}
+                        {testResults[acc.id].latency_ms != null ? ` · ${testResults[acc.id].latency_ms}ms` : ''}
+                      </div>
+                      {testResults[acc.id].error && <div className="mt-1 break-words">{testResults[acc.id].error}</div>}
+                      {testResults[acc.id].response_preview && (
+                        <div className="mt-1 text-[var(--ink)]/70 break-words">{testResults[acc.id].response_preview}</div>
+                      )}
                     </div>
                   )}
 
@@ -375,6 +413,15 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                     >
                       <Sliders className="w-3.5 h-3.5" />
                       <span>Configure</span>
+                    </button>
+                    <button
+                      onClick={() => void probeAccount(acc)}
+                      disabled={testingAccountId === acc.id}
+                      className="px-2 py-1 text-xs font-heading font-bold text-[var(--pen-blue)] hover:bg-[var(--tint-blue)] border border-[var(--pen-blue)]/40 hover:border-[var(--pen-blue)] rounded flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
+                      title="Send a minimal real proxy request through this account"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${testingAccountId === acc.id ? 'animate-spin' : ''}`} />
+                      <span>{testingAccountId === acc.id ? 'Testing…' : 'Test Proxy'}</span>
                     </button>
 
                   {confirmDeleteAccountId === acc.id ? (

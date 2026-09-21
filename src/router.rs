@@ -85,6 +85,7 @@ pub fn build(state: AppState) -> Router {
             put(admin::update_account).delete(admin::delete_account),
         )
         .route("/accounts/{id}/reset", post(admin::reset_account))
+        .route("/accounts/{id}/test", post(admin::test_account))
         // routes
         .route("/routes", get(admin::list_routes).post(admin::create_route))
         .route(

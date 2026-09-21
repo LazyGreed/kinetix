@@ -1270,13 +1270,23 @@ pub async fn test_provider(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
-    let accounts = db::accounts_for_provider(&state.pool, &id)
-        .await
-        .map_err(ApiError::internal)?;
-    let account = accounts
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::bad("provider has no credentials to test with"))?;
+    let account = if let Some(account_id) = body.account_id.as_deref() {
+        let account = db::get_account(&state.pool, account_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        if account.provider_id != id {
+            return Err(ApiError::bad("account does not belong to provider"));
+        }
+        account
+    } else {
+        db::accounts_for_provider(&state.pool, &id)
+            .await
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ApiError::bad("provider has no credentials to test with"))?
+    };
     let credential = state
         .credentials
         .resolve(&account)
@@ -1291,10 +1301,17 @@ pub async fn test_provider(
         })?
         .secret;
 
-    let upstream_id = body
-        .model
-        .clone()
-        .ok_or_else(|| ApiError::bad("provide a model to test"))?;
+    let upstream_id = if let Some(model) = body.model.clone().filter(|m| !m.trim().is_empty()) {
+        model
+    } else {
+        db::models_for_provider(&state.pool, &id)
+            .await
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .find(|model| model.enabled != 0)
+            .map(|model| model.upstream_id)
+            .ok_or_else(|| ApiError::bad("provider has no enabled model to test"))?
+    };
     let model = db::find_model_by_upstream(&state.pool, &id, &upstream_id)
         .await
         .map_err(ApiError::internal)?
@@ -1466,6 +1483,54 @@ async fn read_probe_preview(resp: reqwest::Response, sse: bool) -> String {
 #[derive(Deserialize)]
 pub struct TestBody {
     pub model: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+}
+
+/// `POST /admin/api/accounts/:id/test` — run a minimal real proxy-style probe
+/// through one specific credential instead of the provider pool default.
+pub async fn test_account(
+    State(state): State<AppState>,
+    auth: AdminAuth,
+    Path(id): Path<String>,
+    Json(mut body): Json<TestBody>,
+) -> ApiResult {
+    let account = db::get_account(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
+    let provider_id = account.provider_id.clone();
+    body.account_id = Some(id.clone());
+
+    let result = test_provider(State(state.clone()), auth, Path(provider_id), Json(body)).await?;
+    let ok = result.0.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let status = result.0.get("status").and_then(Value::as_u64).unwrap_or(0);
+    let latency = result
+        .0
+        .get("latency_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    if ok {
+        let _ = db::touch_probe_at(&state.pool, &id).await;
+        let _ = db::reset_account_failures(&state.pool, &id).await;
+    }
+    let _ = db::insert_audit(
+        &state.pool,
+        "admin",
+        if ok {
+            "account_probe_succeeded"
+        } else {
+            "account_probe_failed"
+        },
+        "account",
+        &id,
+        &account.label,
+        &format!("Account probe completed with status {status} in {latency} ms."),
+    )
+    .await;
+
+    Ok(result)
 }
 
 // ===========================================================================
