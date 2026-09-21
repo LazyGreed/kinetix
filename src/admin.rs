@@ -1230,21 +1230,24 @@ async fn discover_models_native(
         model: &dummy_model,
         credential,
     };
-    let mut req = state
-        .http
-        .get(&url)
-        .timeout(std::time::Duration::from_millis(provider.timeout_ms as u64));
-    req = adapter.apply_auth(&ctx, req);
-    for (k, v) in provider.extra_headers_map() {
-        req = req.header(k, v);
-    }
-
-    let resp = req.send().await.map_err(|e| {
-        ApiError::bad(format!(
-            "discovery request failed: {}",
-            crate::crypto::redact(&e.to_string())
-        ))
-    })?;
+    let parsed_url =
+        url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid discovery URL: {e}")))?;
+    let resp = crate::outbound::send_provider_request(
+        &state.outbound_clients,
+        state.config.allow_private_upstreams,
+        state.config.allow_insecure_tls,
+        &adapter,
+        &ctx,
+        crate::outbound::ProviderRequest {
+            method: reqwest::Method::GET,
+            url: parsed_url,
+            json_body: None,
+            accept_event_stream: false,
+            request_id: None,
+        },
+    )
+    .await
+    .map_err(|e| ApiError::bad(format!("discovery request failed: {}", e.message)))?;
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -1365,19 +1368,26 @@ pub async fn test_provider(
         .build_url(&ctx)
         .map_err(|e| ApiError::bad(e.message))?;
     let outbound = adapter.build_body(&ctx, &internal);
-    let mut req = state
-        .http
-        .post(&url)
-        .header("content-type", "application/json")
-        .timeout(std::time::Duration::from_millis(provider.timeout_ms as u64))
-        .json(&outbound);
-    req = adapter.apply_auth(&ctx, req);
-    for (k, v) in provider.extra_headers_map() {
-        req = req.header(k, v);
-    }
+    let parsed_url =
+        url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid probe URL: {e}")))?;
 
     let started = std::time::Instant::now();
-    match req.send().await {
+    match crate::outbound::send_provider_request(
+        &state.outbound_clients,
+        state.config.allow_private_upstreams,
+        state.config.allow_insecure_tls,
+        &adapter,
+        &ctx,
+        crate::outbound::ProviderRequest {
+            method: reqwest::Method::POST,
+            url: parsed_url,
+            json_body: Some(outbound),
+            accept_event_stream: false,
+            request_id: None,
+        },
+    )
+    .await
+    {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let latency = started.elapsed().as_millis() as i64;
@@ -1405,7 +1415,7 @@ pub async fn test_provider(
         }
         Err(e) => Ok(Json(json!({
             "ok": false, "status": 0,
-            "error": crate::crypto::redact(&e.to_string()),
+            "error": e.message,
         }))),
     }
 }

@@ -31,6 +31,7 @@ pub mod limits;
 pub mod live;
 pub mod logqueue;
 pub mod net;
+pub mod outbound;
 pub mod passthrough;
 pub mod paths;
 pub mod pipeline;

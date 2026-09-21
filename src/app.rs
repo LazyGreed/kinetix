@@ -30,8 +30,9 @@ pub struct AppState {
         Arc<dashmap::DashMap<String, Arc<dyn crate::credentials::CredentialStrategy>>>,
     pub adapters: AdapterRegistry,
     pub http: reqwest::Client,
-    /// HTTP client that follows redirects (only for opt-in providers, NFR-3.10).
-    pub http_redirect: reqwest::Client,
+    /// Pinned provider clients keyed by validated host/address set. This keeps
+    /// connection pooling without reopening a DNS rebinding window.
+    pub outbound_clients: Arc<dashmap::DashMap<String, reqwest::Client>>,
     pub log_queue: UsageLogQueue,
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Diagnostic flight recorder (FR-13).
@@ -109,7 +110,6 @@ impl AppState {
         registry: Arc<Registry>,
         crypto: Arc<Crypto>,
         http: reqwest::Client,
-        http_redirect: reqwest::Client,
         log_queue: UsageLogQueue,
         config_ip_limit: u64,
     ) -> Self {
@@ -127,7 +127,7 @@ impl AppState {
             plugin_credentials: Arc::new(DashMap::new()),
             adapters: AdapterRegistry::new(),
             http,
-            http_redirect,
+            outbound_clients: Arc::new(DashMap::new()),
             log_queue,
             started_at: chrono::Utc::now(),
             flight: Arc::new(FlightRecorder::new(512, 128)),
