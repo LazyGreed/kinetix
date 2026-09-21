@@ -278,7 +278,10 @@ pub async fn send_provider_request(
             }
         }
 
-        let response = builder.send().await.map_err(|e| OutboundError::transport(&e))?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| OutboundError::transport(&e))?;
         if !response.status().is_redirection() || !ctx.provider.follows_redirects() {
             return Ok(response);
         }
@@ -290,9 +293,9 @@ pub async fn send_provider_request(
         }
 
         let location = match response.headers().get(reqwest::header::LOCATION) {
-            Some(value) => value
-                .to_str()
-                .map_err(|_| OutboundError::denied("upstream redirect has invalid Location header"))?,
+            Some(value) => value.to_str().map_err(|_| {
+                OutboundError::denied("upstream redirect has invalid Location header")
+            })?,
             None => return Ok(response),
         };
         let next = current
@@ -345,7 +348,9 @@ mod tests {
     fn rejects_mixed_public_private_dns_answers() {
         let public = SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 443);
         let private = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 443);
-        assert!(validate_destination_addrs("rebind.example", vec![public, private], false).is_err());
+        assert!(
+            validate_destination_addrs("rebind.example", vec![public, private], false).is_err()
+        );
         assert!(validate_destination_addrs("public.example", vec![public], false).is_ok());
     }
 
