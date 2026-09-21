@@ -1193,10 +1193,7 @@ async fn gather_plugin_facts(
 /// primary; weight biases the first choice within equal-priority tiers while
 /// retaining every sibling for fallback.
 fn order_route_account_candidates(targets: Vec<ResolvedTarget>) -> Vec<ResolvedTarget> {
-    let accounts = pool::order_accounts(
-        targets.iter().map(|t| t.account.clone()).collect(),
-        None,
-    );
+    let accounts = pool::order_accounts(targets.iter().map(|t| t.account.clone()).collect(), None);
     let mut by_account: std::collections::HashMap<String, ResolvedTarget> = targets
         .into_iter()
         .map(|target| (target.account.id.clone(), target))
@@ -1217,8 +1214,7 @@ async fn order_route_targets(
     targets: Vec<ResolvedTarget>,
 ) -> Vec<ResolvedTarget> {
     let mut groups: Vec<Vec<ResolvedTarget>> = Vec::new();
-    let mut positions: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for target in targets {
         let key = target
@@ -1280,9 +1276,7 @@ async fn order_route_targets(
             });
         }
         _ => {
-            groups.sort_by_key(|group| {
-                group.first().map(|t| t.priority).unwrap_or(i64::MAX)
-            });
+            groups.sort_by_key(|group| group.first().map(|t| t.priority).unwrap_or(i64::MAX));
         }
     }
 
@@ -2341,8 +2335,7 @@ pub async fn dry_run(
         let status = pool::effective_status(&t.account);
         let half_open_probe =
             matches!(status, pool::AccountStatus::CircuitOpen) && pool::should_probe(&t.account);
-        let account_eligible =
-            matches!(status, pool::AccountStatus::Healthy) || half_open_probe;
+        let account_eligible = matches!(status, pool::AccountStatus::Healthy) || half_open_probe;
         let caps_ok = t.model.caps().satisfies(&needs) || !t.provider.strict();
         let ctx_ok = t
             .model
@@ -2352,12 +2345,8 @@ pub async fn dry_run(
         let provider_allowed = descriptor.allowed_providers.is_empty()
             || descriptor.allowed_providers.contains(&t.provider.id);
         let quota_ok = !descriptor.soft_quota_reached;
-        let would_select = elig.eligible
-            && account_eligible
-            && caps_ok
-            && ctx_ok
-            && provider_allowed
-            && quota_ok;
+        let would_select =
+            elig.eligible && account_eligible && caps_ok && ctx_ok && provider_allowed && quota_ok;
         if would_select && selected.is_none() {
             selected = Some(format!("{} @ {}", t.model.display_name, t.account.label));
         }
