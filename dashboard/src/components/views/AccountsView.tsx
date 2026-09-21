@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2 } from 'lucide-react';
+import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2, Pencil } from 'lucide-react';
 import { Account, Provider } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens, DESIGN_TOKENS } from '../../lib/designSystem';
@@ -24,6 +24,8 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
 }) => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [confirmDeleteAccountId, setConfirmDeleteAccountId] = useState<string | null>(null);
+  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [editLabel, setEditLabel] = useState('');
   const [label, setLabel] = useState('');
   const [providerId, setProviderId] = useState(providers[0]?.id || '');
   const [apiKey, setApiKey] = useState('');
@@ -101,6 +103,19 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
     } finally {
       setTestingAccountId(null);
     }
+  };
+
+  const openRename = (acc: Account) => {
+    setEditingAccount(acc);
+    setEditLabel(acc.label);
+  };
+
+  const handleRenameSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingAccount || !editLabel.trim()) return;
+    onUpdateAccount({ ...editingAccount, label: editLabel.trim() });
+    setEditingAccount(null);
+    setEditLabel('');
   };
 
   return (
@@ -269,6 +284,14 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
 
                   <div className="flex items-center gap-2 ml-auto">
                     <button
+                      onClick={() => openRename(acc)}
+                      className="px-2 py-1 text-xs font-heading font-bold text-[var(--pen-blue)] hover:bg-[var(--tint-blue)] border border-[var(--pen-blue)]/40 hover:border-[var(--pen-blue)] rounded flex items-center gap-1 cursor-pointer transition-colors"
+                      title="Rename this account"
+                    >
+                      <Pencil className="w-3.5 h-3.5" />
+                      <span>Rename</span>
+                    </button>
+                    <button
                       onClick={() => void probeAccount(acc)}
                       disabled={testingAccountId === acc.id}
                       className="px-2 py-1 text-xs font-heading font-bold text-[var(--pen-blue)] hover:bg-[var(--tint-blue)] border border-[var(--pen-blue)]/40 hover:border-[var(--pen-blue)] rounded flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
@@ -312,6 +335,52 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
               </WobblyCard>
             );
           })}
+        </div>
+      )}
+
+      {editingAccount && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+          <div className="w-full max-w-md">
+            <WobblyCard decoration="tape" className="bg-[var(--paper)] p-6 relative">
+              <button
+                onClick={() => setEditingAccount(null)}
+                className="absolute top-4 right-4 text-[var(--ink)] font-bold text-xl hover:text-[var(--marker-red)] cursor-pointer"
+              >
+                ✕
+              </button>
+              <h3 className="text-2xl font-heading font-bold text-[var(--ink)] mb-4 flex items-center gap-2">
+                <Pencil className="w-5 h-5 text-[var(--pen-blue)]" />
+                Rename Account
+              </h3>
+              <form onSubmit={handleRenameSubmit} className="space-y-4 font-body">
+                <div>
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Account Label
+                  </label>
+                  <input
+                    autoFocus
+                    type="text"
+                    required
+                    value={editLabel}
+                    onChange={(e) => setEditLabel(e.target.value)}
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base sketch-shadow-sm focus:outline-none"
+                    style={{ borderRadius: DESIGN_TOKENS.radii.wobbly }}
+                  />
+                  {!editLabel.trim() && (
+                    <p className="text-xs text-[var(--danger-text)] mt-1">Label cannot be blank.</p>
+                  )}
+                </div>
+                <div className="flex justify-end gap-3">
+                  <SketchButton type="button" variant="ghost" onClick={() => setEditingAccount(null)}>
+                    Cancel
+                  </SketchButton>
+                  <SketchButton type="submit" variant="primary" disabled={!editLabel.trim()}>
+                    Save
+                  </SketchButton>
+                </div>
+              </form>
+            </WobblyCard>
+          </div>
         </div>
       )}
 
