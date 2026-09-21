@@ -129,6 +129,7 @@ export function mapAccount(j: any): Account {
     requestsCount: num(j.requests_count),
     tokensCount: num(j.tokens_count),
     priority: num(j.priority, 1),
+    weight: num(j.weight, 1),
     lastError: j.last_error ?? undefined,
   };
 }
