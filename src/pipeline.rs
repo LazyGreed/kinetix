@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::response::Response;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -95,8 +96,14 @@ struct Attempt {
     target: ResolvedTarget,
     upstream_request_id: Option<String>,
     stream: Option<reqwest::Response>,
+    /// Raw SSE transport chunks consumed during pre-commit validation. Drivers
+    /// replay them before reading the remaining response body.
+    prefetched: Vec<Bytes>,
+    /// Parsed complete events for a successful non-SSE JSON response.
+    full_events: Option<Vec<StreamEvent>>,
     adapter: Arc<dyn Adapter>,
-    /// Whether this attempt uses same-format passthrough (FR-2.7).
+    /// Same-format passthrough is only possible when the upstream is actually
+    /// SSE. A JSON response is normalized through parse_full_response().
     passthrough: bool,
 }
 
@@ -614,17 +621,51 @@ pub async fn run(
         {
             Ok(resp) => {
                 if resp.status().is_success() {
+                    let upstream_request_id = extract_upstream_request_id(&resp);
+                    let prepared = match prepare_success_response(resp, &adapter).await {
+                        Ok(prepared) => prepared,
+                        Err(failure) => {
+                            state.flight.record(
+                                &meta.request_id,
+                                started.elapsed().as_millis() as u64,
+                                "upstream_precommit_invalid",
+                                failure.message.clone(),
+                            );
+                            if !failure.kind.is_key_level() || !allow_fallback {
+                                trace.step(
+                                    "attempt",
+                                    Some(target.account.label.clone()),
+                                    format!("HTTP 2xx invalid before commit: {}", failure.message),
+                                );
+                                trace.finish("failed");
+                                state.live.finish(
+                                    &meta.request_id,
+                                    "failed",
+                                    started.elapsed().as_millis() as u64,
+                                    None,
+                                    None,
+                                );
+                                let _ = db::insert_route_trace(&state.pool, &trace).await;
+                                return Err(failure_to_error(&failure, target));
+                            }
+                            handle_key_failure(state, target, &failure, &mut meta, &mut trace)
+                                .await;
+                            last_error = Some(failure_to_error(&failure, target));
+                            continue;
+                        }
+                    };
+
                     meta.fallback_hops = (attempts_done - 1) as i64;
                     meta.retry_count = (attempts_done - 1) as i64;
                     if attempts_done > 1 {
                         state.record_fallback();
                     }
                     meta.fallback_path
-                        .push(format!("{}:200", target.account.label));
+                        .push(format!("{}:validated", target.account.label));
                     trace.step(
                         "attempt",
                         Some(target.account.label.clone()),
-                        format!("HTTP 200 (attempt {attempts_done})"),
+                        format!("HTTP 2xx validated (attempt {attempts_done})"),
                     );
                     trace.final_target = Some(format!(
                         "{} @ {}",
@@ -633,22 +674,24 @@ pub async fn run(
                     state.flight.record(
                         &meta.request_id,
                         started.elapsed().as_millis() as u64,
-                        "upstream_headers",
-                        "200",
+                        "upstream_validated",
+                        if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // A successful attempt clears the circuit-breaker counter.
+                    // Only validated responses clear the circuit-breaker counter.
                     let _ = pool::clear_circuit(&state.pool, &target.account.id).await;
-                    let upstream_request_id = extract_upstream_request_id(&resp);
                     let attempt = Attempt {
                         target: target.clone(),
                         upstream_request_id,
-                        stream: Some(resp),
+                        stream: prepared.stream,
+                        prefetched: prepared.prefetched,
+                        full_events: prepared.full_events,
                         adapter: adapter.clone(),
-                        passthrough: use_passthrough,
+                        passthrough: use_passthrough && prepared.is_sse,
                     };
                     return Ok(stream_response(
                         state, snap, format, meta, req, attempt, started, key, trace,
-                    ));
+                    )
+                    .await);
                 }
 
                 // Classify and maybe fail over.
@@ -801,7 +844,12 @@ async fn send_upstream(
     // translation builds a fresh body from the internal model.
     let body: Value = if use_passthrough {
         let raw = req.raw_body.as_deref().unwrap_or("{}");
-        match passthrough::rewrite_model(raw, &ctx.model.upstream_id, !req.stream) {
+        match passthrough::rewrite_model(
+            raw,
+            &ctx.model.upstream_id,
+            !req.stream,
+            ctx.provider.wire(),
+        ) {
             Some(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
             None => adapter.build_body(ctx, req),
         }
@@ -835,6 +883,195 @@ async fn send_upstream(
         message: e.message,
         quota_reset_at: None,
     })
+}
+
+const MAX_FULL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+struct PreparedUpstream {
+    stream: Option<reqwest::Response>,
+    prefetched: Vec<Bytes>,
+    full_events: Option<Vec<StreamEvent>>,
+    is_sse: bool,
+}
+
+fn is_semantic_event(event: &StreamEvent) -> bool {
+    !matches!(event, StreamEvent::Start { .. } | StreamEvent::Usage(_))
+}
+
+fn payload_is_terminal(payload: &str, events: &[StreamEvent]) -> bool {
+    if payload.trim() == "[DONE]" {
+        return true;
+    }
+    if events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::Finish(_)))
+    {
+        return true;
+    }
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("message_stop")
+}
+
+fn payload_error_failure(adapter: &Arc<dyn Adapter>, payload: &str) -> Option<UpstreamFailure> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let looks_error =
+        value.get("error").is_some() || value.get("type").and_then(Value::as_str) == Some("error");
+    if !looks_error {
+        return None;
+    }
+    Some(adapter.classify_error(502, payload, &reqwest::header::HeaderMap::new()))
+}
+
+/// Validate a successful HTTP response before the client response is committed.
+/// SSE stays retryable until the first semantic model event. Normal JSON is
+/// parsed completely through the adapter's full-response path.
+async fn prepare_success_response(
+    mut response: reqwest::Response,
+    adapter: &Arc<dyn Adapter>,
+) -> Result<PreparedUpstream, UpstreamFailure> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_sse = content_type.split(';').next().map(str::trim) == Some("text/event-stream");
+
+    if !is_sse {
+        if response
+            .content_length()
+            .map(|len| len > MAX_FULL_RESPONSE_BYTES as u64)
+            .unwrap_or(false)
+        {
+            return Err(UpstreamFailure {
+                kind: FailureKind::ServerError,
+                status: Some(502),
+                retry_after_secs: None,
+                message: "upstream JSON response exceeds size limit".into(),
+                quota_reset_at: None,
+            });
+        }
+        let body = response.bytes().await.map_err(|error| UpstreamFailure {
+            kind: if error.is_timeout() {
+                FailureKind::Timeout
+            } else {
+                FailureKind::ConnectionError
+            },
+            status: None,
+            retry_after_secs: None,
+            message: classify_reqwest(&error),
+            quota_reset_at: None,
+        })?;
+        if body.len() > MAX_FULL_RESPONSE_BYTES {
+            return Err(UpstreamFailure {
+                kind: FailureKind::ServerError,
+                status: Some(502),
+                retry_after_secs: None,
+                message: "upstream JSON response exceeds size limit".into(),
+                quota_reset_at: None,
+            });
+        }
+        let body_text = String::from_utf8_lossy(&body);
+        if let Some(failure) = payload_error_failure(adapter, &body_text) {
+            return Err(failure);
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|error| UpstreamFailure {
+            kind: FailureKind::ServerError,
+            status: Some(502),
+            retry_after_secs: None,
+            message: format!("invalid upstream JSON response: {error}"),
+            quota_reset_at: None,
+        })?;
+        let events = adapter.parse_full_response(&value)?;
+        if !events.iter().any(is_semantic_event) {
+            return Err(UpstreamFailure {
+                kind: FailureKind::ServerError,
+                status: Some(502),
+                retry_after_secs: None,
+                message: "upstream JSON response contained no model result".into(),
+                quota_reset_at: None,
+            });
+        }
+        return Ok(PreparedUpstream {
+            stream: None,
+            prefetched: Vec::new(),
+            full_events: Some(events),
+            is_sse: false,
+        });
+    }
+
+    let mut framer = crate::sse::SseFramer::new();
+    let mut prefetched = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => {
+                prefetched.push(bytes.clone());
+                let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
+                    kind: FailureKind::ServerError,
+                    status: Some(502),
+                    retry_after_secs: None,
+                    message: error.to_string(),
+                    quota_reset_at: None,
+                })?;
+                for frame in frames {
+                    let Some(payload) = crate::sse::extract_data(&frame) else {
+                        continue;
+                    };
+                    if let Some(failure) = payload_error_failure(adapter, &payload) {
+                        return Err(failure);
+                    }
+                    if payload.trim() == "[DONE]" {
+                        return Err(UpstreamFailure {
+                            kind: FailureKind::ServerError,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended before any model event".into(),
+                            quota_reset_at: None,
+                        });
+                    }
+                    let events = adapter.parse_stream_chunk(&payload)?;
+                    if events.iter().any(is_semantic_event) {
+                        return Ok(PreparedUpstream {
+                            stream: Some(response),
+                            prefetched,
+                            full_events: None,
+                            is_sse: true,
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                let message = if framer.pending_bytes() > 0 {
+                    "upstream SSE ended with an incomplete frame"
+                } else {
+                    "upstream SSE ended before any model event"
+                };
+                return Err(UpstreamFailure {
+                    kind: FailureKind::ServerError,
+                    status: Some(502),
+                    retry_after_secs: None,
+                    message: message.into(),
+                    quota_reset_at: None,
+                });
+            }
+            Err(error) => {
+                return Err(UpstreamFailure {
+                    kind: if error.is_timeout() {
+                        FailureKind::Timeout
+                    } else {
+                        FailureKind::ConnectionError
+                    },
+                    status: None,
+                    retry_after_secs: None,
+                    message: classify_reqwest(&error),
+                    quota_reset_at: None,
+                });
+            }
+        }
+    }
 }
 
 fn classify_reqwest(e: &reqwest::Error) -> String {
@@ -1303,7 +1540,7 @@ fn check_param_policy(target: &ResolvedTarget, req: &InternalRequest) -> Result<
 
 /// Build the client response: streaming or aggregated non-streaming.
 #[allow(clippy::too_many_arguments)]
-fn stream_response(
+async fn stream_response(
     state: &AppState,
     snap: Arc<crate::registry::Snapshot>,
     format: FrontendFormat,
@@ -1366,7 +1603,6 @@ fn stream_response(
         };
         let mut body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let watched = async_stream::stream! {
-            use tokio_stream::StreamExt as _;
             let _guard = guard;
             while let Some(v) = body_stream.next().await {
                 yield v;
@@ -1420,46 +1656,110 @@ fn stream_response(
                 .unwrap()
         })
     } else {
-        // Non-streaming: aggregate the whole stream, then return JSON (FR-1.4).
-        let (agg_tx, agg_rx) = tokio::sync::oneshot::channel::<Value>();
+        // Non-streaming stays uncommitted until aggregation completes, allowing
+        // a real HTTP error status when the validated upstream later truncates.
         let model_name = req.requested_model.clone();
-        // Ensure the aggregate driver sees stream=true so usage is delivered
-        // (OpenAI-compatible upstreams only emit the usage chunk when
-        // streaming). The client-visible response is still a single JSON body.
         let mut req = req;
         req.stream = true;
-        tokio::spawn(async move {
-            let result = drive_aggregate(
-                state,
-                snap,
-                format,
-                meta,
-                req,
-                attempt,
-                encoder_ctx,
-                started,
-                key,
-                model_name,
-                trace,
-            )
-            .await;
-            let _ = agg_tx.send(result);
-        });
-        let body = Body::from_stream(async_stream::stream! {
-            match agg_rx.await {
-                Ok(v) => yield Ok::<Bytes, std::io::Error>(Bytes::from(v.to_string())),
-                Err(_) => yield Ok(Bytes::from("{\"error\":{\"message\":\"internal error\"}}")),
-            }
-        });
+        let result = drive_aggregate(
+            state,
+            snap,
+            format,
+            meta,
+            req,
+            attempt,
+            encoder_ctx,
+            started,
+            key,
+            model_name,
+            trace,
+        )
+        .await;
         builder
+            .status(result.status_code)
             .header("content-type", "application/json")
-            .body(body)
+            .body(Body::from(result.body.to_string()))
             .unwrap_or_else(|_| Response::new(Body::empty()))
     }
 }
 
-/// The async streaming driver: reads upstream SSE, encodes to the client
-/// format, emits keepalives, and logs usage when done.
+/// Emit normalized events to a streaming client. Returns false when the client
+/// disconnected while writing.
+#[allow(clippy::too_many_arguments)]
+async fn emit_translated_events(
+    events: Vec<StreamEvent>,
+    encoder: &mut Encoder,
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    state: &AppState,
+    meta: &RequestMeta,
+    started: Instant,
+    usage: &mut TokenUsage,
+    ttft_ms: &mut Option<i64>,
+    committed: &mut bool,
+    trace: &mut RouteTrace,
+    saw_reasoning: &mut bool,
+    saw_tool: &mut bool,
+) -> bool {
+    for ev in events {
+        if let StreamEvent::Usage(u) = &ev {
+            usage.merge(u);
+        }
+        match &ev {
+            StreamEvent::ThinkingDelta { .. } if !*saw_reasoning => {
+                *saw_reasoning = true;
+                state.flight.record(
+                    &meta.request_id,
+                    started.elapsed().as_millis() as u64,
+                    "reasoning_event",
+                    "first thinking delta",
+                );
+            }
+            StreamEvent::ToolCallStart { .. } if !*saw_tool => {
+                *saw_tool = true;
+                state.flight.record(
+                    &meta.request_id,
+                    started.elapsed().as_millis() as u64,
+                    "tool_call_event",
+                    "first tool call",
+                );
+            }
+            _ => {}
+        }
+        let frames = encoder.encode(ev);
+        if ttft_ms.is_none() && !frames.is_empty() {
+            *ttft_ms = Some(started.elapsed().as_millis() as i64);
+            state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
+            state.live.mark_streaming(&meta.request_id);
+            state.flight.record(
+                &meta.request_id,
+                started.elapsed().as_millis() as u64,
+                "upstream_first_frame",
+                "first upstream model event",
+            );
+        }
+        for frame in frames {
+            if !*committed {
+                *committed = true;
+                trace.commit();
+                state.live.mark_committed(&meta.request_id);
+                state.flight.record(
+                    &meta.request_id,
+                    started.elapsed().as_millis() as u64,
+                    "commit",
+                    "first client bytes",
+                );
+            }
+            if tx.send(Ok(frame)).await.is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The async streaming driver: reads validated upstream SSE (or a complete JSON
+/// response), encodes to the client format, and treats incomplete EOF as a
+/// post-commit upstream failure.
 #[allow(clippy::too_many_arguments)]
 async fn drive_stream(
     state: AppState,
@@ -1485,15 +1785,73 @@ async fn drive_stream(
     let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
-    let mut upstream = attempt.stream.take().expect("stream present");
     let adapter = attempt.adapter.clone();
+
+    // A normal JSON response is already complete and validated before commit.
+    if let Some(events) = attempt.full_events.take() {
+        if !emit_translated_events(
+            events,
+            &mut encoder,
+            &tx,
+            &state,
+            &meta,
+            started,
+            &mut usage,
+            &mut ttft_ms,
+            &mut committed,
+            &mut trace,
+            &mut saw_reasoning,
+            &mut saw_tool,
+        )
+        .await
+        {
+            record_cancel(&state, &meta, started);
+            status = "client_disconnect";
+            status_code = 499;
+        } else {
+            for frame in encoder.finalize() {
+                if tx.send(Ok(frame)).await.is_err() {
+                    record_cancel(&state, &meta, started);
+                    status = "client_disconnect";
+                    status_code = 499;
+                    break;
+                }
+            }
+        }
+
+        finalize_log(
+            &state,
+            &snap,
+            &mut meta,
+            &req,
+            &attempt,
+            &model_display,
+            started,
+            ttft_ms,
+            status,
+            status_code,
+            usage,
+            error_message,
+            key,
+            trace,
+            committed,
+        )
+        .await;
+        return;
+    }
+
+    let upstream = attempt.stream.take().expect("validated SSE stream present");
+    let prefetched = std::mem::take(&mut attempt.prefetched);
+    let replay = futures::stream::iter(prefetched.into_iter().map(Ok::<Bytes, reqwest::Error>));
+    let chunks = replay.chain(upstream.bytes_stream());
+    tokio::pin!(chunks);
+
     let mut framer = crate::sse::SseFramer::new();
+    let mut terminal_seen = false;
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
-        // Abort promptly on client disconnect, even between upstream chunks
-        // (NFR-1.10: cancellation signal within ~100ms).
+    'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
             status = "client_disconnect";
@@ -1510,120 +1868,115 @@ async fn drive_stream(
                 }
             }
             _ = keepalive.tick() => {
-                // Keepalive comment (FR-9.4): keeps Cloudflare's ~100s idle
-                // timeout from dropping a long silent thinking phase.
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
-                    // Client disconnected: cancel upstream (FR-2.9).
                     record_cancel(&state, &meta, started);
                     status = "client_disconnect";
                     status_code = 499;
                     break;
                 }
             }
-            chunk = upstream.chunk() => {
+            chunk = chunks.next() => {
                 match chunk {
-                    Ok(Some(bytes)) => {
-                        for frame in framer.push(&bytes) {
-                            let payload = crate::sse::extract_data(&frame);
-                            let Some(payload) = payload else { continue };
-                            if payload.trim() == "[DONE]" { continue; }
-                            match adapter.parse_stream_chunk(&payload) {
-                                Ok(events) => {
-                                    for ev in events {
-                                        if let StreamEvent::Usage(u) = &ev {
-                                            usage.merge(u);
-                                        }
-                                        // Flight recorder: event classes, metadata
-                                        // only (FR-13.1, FR-13.2).
-                                        match &ev {
-                                            StreamEvent::ThinkingDelta { .. } if !saw_reasoning => {
-                                                saw_reasoning = true;
-                                                state.flight.record(
-                                                    &meta.request_id,
-                                                    started.elapsed().as_millis() as u64,
-                                                    "reasoning_event",
-                                                    "first thinking delta",
-                                                );
-                                            }
-                                            StreamEvent::ToolCallStart { .. } if !saw_tool => {
-                                                saw_tool = true;
-                                                state.flight.record(
-                                                    &meta.request_id,
-                                                    started.elapsed().as_millis() as u64,
-                                                    "tool_call_event",
-                                                    "first tool call",
-                                                );
-                                            }
-                                            _ => {}
-                                        }
-                                        let frames = encoder.encode(ev);
-                                        if ttft_ms.is_none() && !frames.is_empty() {
-                                            ttft_ms = Some(started.elapsed().as_millis() as i64);
-                                            state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
-                                            state.live.mark_streaming(&meta.request_id);
-                                            state.flight.record(
-                                                &meta.request_id,
-                                                started.elapsed().as_millis() as u64,
-                                                "upstream_first_frame",
-                                                "first upstream frame",
-                                            );
-                                        }
-                                        for f in frames {
-                                            if !committed {
-                                                committed = true;
-                                                trace.commit();
-                                                state.live.mark_committed(&meta.request_id);
-                                                state.flight.record(&meta.request_id, started.elapsed().as_millis() as u64, "commit", "first client bytes");
-                                            }
-                                            if tx.send(Ok(f)).await.is_err() {
-                                                record_cancel(&state, &meta, started);
-                                                status = "client_disconnect";
-                                                status_code = 499;
-                                                return finalize_log(
-                                                    &state, &snap, &mut meta, &req, &attempt, &model_display,
-                                                    started, ttft_ms, status, status_code, usage,
-                                                    error_message, key, trace, committed,
-                                                ).await;
-                                            }
-                                        }
-                                    }
+                    Some(Ok(bytes)) => {
+                        let frames = match framer.push(&bytes) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(error.to_string());
+                                break 'outer;
+                            }
+                        };
+                        for frame in frames {
+                            let Some(payload) = crate::sse::extract_data(&frame) else {
+                                continue;
+                            };
+                            if payload.trim() == "[DONE]" {
+                                terminal_seen = true;
+                                continue;
+                            }
+                            if let Some(failure) = payload_error_failure(&adapter, &payload) {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(failure.message.clone());
+                                for out in encoder.error_frame(&failure.message) {
+                                    let _ = tx.send(Ok(out)).await;
                                 }
-                                Err(f) => {
+                                break 'outer;
+                            }
+                            let events = match adapter.parse_stream_chunk(&payload) {
+                                Ok(events) => events,
+                                Err(failure) => {
                                     status = "stream_error";
                                     status_code = 502;
-                                    error_message = Some(f.message.clone());
-                                    if committed {
-                                        state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
+                                    error_message = Some(failure.message.clone());
+                                    for out in encoder.error_frame(&failure.message) {
+                                        let _ = tx.send(Ok(out)).await;
                                     }
-                                    for f in encoder.error_frame(&f.message) {
-                                        let _ = tx.send(Ok(f)).await;
-                                    }
-                                    break;
+                                    break 'outer;
                                 }
+                            };
+                            if payload_is_terminal(&payload, &events) {
+                                terminal_seen = true;
+                            }
+                            if !emit_translated_events(
+                                events,
+                                &mut encoder,
+                                &tx,
+                                &state,
+                                &meta,
+                                started,
+                                &mut usage,
+                                &mut ttft_ms,
+                                &mut committed,
+                                &mut trace,
+                                &mut saw_reasoning,
+                                &mut saw_tool,
+                            )
+                            .await
+                            {
+                                record_cancel(&state, &meta, started);
+                                status = "client_disconnect";
+                                status_code = 499;
+                                break 'outer;
                             }
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
+                    Some(Err(error)) => {
                         status = "stream_error";
                         status_code = 502;
-                        error_message = Some(classify_reqwest(&e));
-                        if committed {
-                            state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
-                        }
-                        for f in encoder.error_frame("upstream stream interrupted") {
-                            let _ = tx.send(Ok(f)).await;
-                        }
+                        error_message = Some(classify_reqwest(&error));
                         break;
                     }
+                    None => break,
                 }
             }
         }
     }
 
-    if status == "success" {
-        for f in encoder.finalize() {
-            if tx.send(Ok(f)).await.is_err() {
+    if status == "success" && framer.pending_bytes() > 0 {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended with an incomplete frame".into());
+    } else if status == "success" && !terminal_seen {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended before a terminal event".into());
+    }
+
+    if status == "stream_error" {
+        if committed {
+            state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
+        }
+        let message = error_message
+            .as_deref()
+            .unwrap_or("upstream stream interrupted");
+        for frame in encoder.error_frame(message) {
+            let _ = tx.send(Ok(frame)).await;
+        }
+    } else if status == "success" {
+        for frame in encoder.finalize() {
+            if tx.send(Ok(frame)).await.is_err() {
                 record_cancel(&state, &meta, started);
                 status = "client_disconnect";
                 status_code = 499;
@@ -1652,9 +2005,9 @@ async fn drive_stream(
     .await;
 }
 
-/// Same-format passthrough streaming (FR-2.7, FR-2.10): forward the upstream's
-/// SSE `data:` payloads verbatim (preserving unknown/provider-specific fields)
-/// while extracting usage metadata for accounting.
+/// Same-format passthrough streaming (FR-2.7, FR-2.10). Raw frames are
+/// preserved, but no client bytes are emitted until a semantic upstream event
+/// has been validated.
 #[allow(clippy::too_many_arguments)]
 async fn drive_stream_passthrough(
     state: AppState,
@@ -1679,13 +2032,21 @@ async fn drive_stream_passthrough(
     let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
-    let mut upstream = attempt.stream.take().expect("stream present");
     let adapter = attempt.adapter.clone();
+
+    let upstream = attempt.stream.take().expect("validated SSE stream present");
+    let prefetched = std::mem::take(&mut attempt.prefetched);
+    let replay = futures::stream::iter(prefetched.into_iter().map(Ok::<Bytes, reqwest::Error>));
+    let chunks = replay.chain(upstream.bytes_stream());
+    tokio::pin!(chunks);
+
     let mut framer = crate::sse::SseFramer::new();
+    let mut terminal_seen = false;
+    let mut pending_frames: Vec<String> = Vec::new();
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
+    'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
             status = "client_disconnect";
@@ -1701,9 +2062,7 @@ async fn drive_stream_passthrough(
                     break;
                 }
             }
-            _ = keepalive.tick() => {
-                // Keepalive comment (FR-9.4): keeps Cloudflare's ~100s idle
-                // timeout from dropping a long silent thinking phase.
+            _ = keepalive.tick(), if committed => {
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
                     record_cancel(&state, &meta, started);
                     status = "client_disconnect";
@@ -1711,86 +2070,139 @@ async fn drive_stream_passthrough(
                     break;
                 }
             }
-            chunk = upstream.chunk() => {
+            chunk = chunks.next() => {
                 match chunk {
-                    Ok(Some(bytes)) => {
-                        // Forward each complete frame verbatim (CRLF already
-                        // normalized by the framer); extract usage metadata only.
-                        for frame in framer.push(&bytes) {
-                            if let Some(payload) = crate::sse::extract_data(&frame) {
-                                if payload.trim() != "[DONE]" {
-                                    if let Ok(evs) = adapter.parse_stream_chunk(&payload) {
-                                        for ev in evs {
-                                            if let StreamEvent::Usage(u) = &ev {
-                                                usage.merge(u);
+                    Some(Ok(bytes)) => {
+                        let frames = match framer.push(&bytes) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(error.to_string());
+                                break 'outer;
+                            }
+                        };
+                        for frame in frames {
+                            let payload = crate::sse::extract_data(&frame);
+                            let mut semantic = false;
+                            if let Some(payload) = payload.as_deref() {
+                                if payload.trim() == "[DONE]" {
+                                    terminal_seen = true;
+                                } else {
+                                    if let Some(failure) = payload_error_failure(&adapter, payload) {
+                                        status = "stream_error";
+                                        status_code = 502;
+                                        error_message = Some(failure.message);
+                                        break 'outer;
+                                    }
+                                    match adapter.parse_stream_chunk(payload) {
+                                        Ok(events) => {
+                                            semantic = events.iter().any(is_semantic_event);
+                                            if payload_is_terminal(payload, &events) {
+                                                terminal_seen = true;
                                             }
-                                            match &ev {
-                                                StreamEvent::ThinkingDelta { .. } if !saw_reasoning => {
-                                                    saw_reasoning = true;
-                                                    state.flight.record(
-                                                        &meta.request_id,
-                                                        started.elapsed().as_millis() as u64,
-                                                        "reasoning_event",
-                                                        "first thinking delta",
-                                                    );
+                                            for event in events {
+                                                if let StreamEvent::Usage(value) = &event {
+                                                    usage.merge(value);
                                                 }
-                                                StreamEvent::ToolCallStart { .. } if !saw_tool => {
-                                                    saw_tool = true;
-                                                    state.flight.record(
-                                                        &meta.request_id,
-                                                        started.elapsed().as_millis() as u64,
-                                                        "tool_call_event",
-                                                        "first tool call",
-                                                    );
+                                                match event {
+                                                    StreamEvent::ThinkingDelta { .. } if !saw_reasoning => {
+                                                        saw_reasoning = true;
+                                                        state.flight.record(
+                                                            &meta.request_id,
+                                                            started.elapsed().as_millis() as u64,
+                                                            "reasoning_event",
+                                                            "first thinking delta",
+                                                        );
+                                                    }
+                                                    StreamEvent::ToolCallStart { .. } if !saw_tool => {
+                                                        saw_tool = true;
+                                                        state.flight.record(
+                                                            &meta.request_id,
+                                                            started.elapsed().as_millis() as u64,
+                                                            "tool_call_event",
+                                                            "first tool call",
+                                                        );
+                                                    }
+                                                    _ => {}
                                                 }
-                                                _ => {}
                                             }
+                                        }
+                                        Err(failure) => {
+                                            status = "stream_error";
+                                            status_code = 502;
+                                            error_message = Some(failure.message);
+                                            break 'outer;
                                         }
                                     }
                                 }
                             }
-                            if ttft_ms.is_none() {
+
+                            if !committed {
+                                pending_frames.push(frame);
+                                if !semantic {
+                                    continue;
+                                }
+                                committed = true;
+                                trace.commit();
+                                state.live.mark_committed(&meta.request_id);
                                 ttft_ms = Some(started.elapsed().as_millis() as i64);
                                 state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
                                 state.live.mark_streaming(&meta.request_id);
                                 state.flight.record(
                                     &meta.request_id,
                                     started.elapsed().as_millis() as u64,
-                                    "upstream_first_frame",
-                                    "first upstream frame",
+                                    "commit",
+                                    "first validated passthrough event",
                                 );
-                            }
-                            if !committed {
-                                committed = true;
-                                trace.commit();
-                                state.live.mark_committed(&meta.request_id);
-                            }
-                            let out = Bytes::from(format!("{frame}\n\n"));
-                            if tx.send(Ok(out)).await.is_err() {
+                                for buffered in pending_frames.drain(..) {
+                                    if tx
+                                        .send(Ok(Bytes::from(format!("{buffered}\n\n"))))
+                                        .await
+                                        .is_err()
+                                    {
+                                        record_cancel(&state, &meta, started);
+                                        status = "client_disconnect";
+                                        status_code = 499;
+                                        break 'outer;
+                                    }
+                                }
+                            } else if tx
+                                .send(Ok(Bytes::from(format!("{frame}\n\n"))))
+                                .await
+                                .is_err()
+                            {
                                 record_cancel(&state, &meta, started);
                                 status = "client_disconnect";
                                 status_code = 499;
-                                return finalize_log(
-                                    &state, &snap, &mut meta, &req, &attempt, &model_display,
-                                    started, ttft_ms, status, status_code, usage,
-                                    error_message, key, trace, committed,
-                                ).await;
+                                break 'outer;
                             }
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
+                    Some(Err(error)) => {
                         status = "stream_error";
                         status_code = 502;
-                        error_message = Some(classify_reqwest(&e));
-                        if committed {
-                            state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
-                        }
+                        error_message = Some(classify_reqwest(&error));
                         break;
                     }
+                    None => break,
                 }
             }
         }
+    }
+
+    if status == "success" && framer.pending_bytes() > 0 {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended with an incomplete frame".into());
+    } else if status == "success" && !terminal_seen {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended before a terminal event".into());
+    }
+
+    if status == "stream_error" && committed {
+        state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
     }
 
     let _ = format;
@@ -1850,6 +2262,11 @@ fn record_cancel(state: &AppState, meta: &RequestMeta, started: Instant) {
     );
 }
 
+struct AggregateResult {
+    body: Value,
+    status_code: u16,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_aggregate(
     state: AppState,
@@ -1863,10 +2280,8 @@ async fn drive_aggregate(
     key: Option<db::VirtualKeyRow>,
     model_name: String,
     mut trace: RouteTrace,
-) -> Value {
-    let mut upstream = attempt.stream.take().expect("stream present");
+) -> AggregateResult {
     let adapter = attempt.adapter.clone();
-    let mut framer = crate::sse::SseFramer::new();
     let mut events: Vec<StreamEvent> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut status = "success";
@@ -1874,47 +2289,97 @@ async fn drive_aggregate(
     let mut error_message: Option<String> = None;
     let mut committed = false;
 
-    'outer: while let Some(chunk) = upstream.chunk().await.transpose() {
-        match chunk {
-            Ok(bytes) => {
-                for frame in framer.push(&bytes) {
-                    let Some(payload) = crate::sse::extract_data(&frame) else {
-                        continue;
-                    };
-                    if payload.trim() == "[DONE]" {
-                        continue;
-                    }
-                    match adapter.parse_stream_chunk(&payload) {
-                        Ok(evs) => {
-                            for ev in evs {
-                                if let StreamEvent::Usage(u) = &ev {
-                                    usage.merge(u);
-                                }
-                                events.push(ev);
-                            }
-                        }
-                        Err(f) => {
+    if let Some(full_events) = attempt.full_events.take() {
+        for event in full_events {
+            if let StreamEvent::Usage(value) = &event {
+                usage.merge(value);
+            }
+            events.push(event);
+        }
+        committed = true;
+        trace.commit();
+    } else {
+        let upstream = attempt.stream.take().expect("validated SSE stream present");
+        let prefetched = std::mem::take(&mut attempt.prefetched);
+        let replay = futures::stream::iter(prefetched.into_iter().map(Ok::<Bytes, reqwest::Error>));
+        let chunks = replay.chain(upstream.bytes_stream());
+        tokio::pin!(chunks);
+
+        let mut framer = crate::sse::SseFramer::new();
+        let mut terminal_seen = false;
+
+        'outer: while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let frames = match framer.push(&bytes) {
+                        Ok(frames) => frames,
+                        Err(error) => {
                             status = "stream_error";
                             status_code = 502;
-                            error_message = Some(f.message);
+                            error_message = Some(error.to_string());
+                            break;
+                        }
+                    };
+                    for frame in frames {
+                        let Some(payload) = crate::sse::extract_data(&frame) else {
+                            continue;
+                        };
+                        if payload.trim() == "[DONE]" {
+                            terminal_seen = true;
+                            continue;
+                        }
+                        if let Some(failure) = payload_error_failure(&adapter, &payload) {
+                            status = "stream_error";
+                            status_code = 502;
+                            error_message = Some(failure.message);
                             break 'outer;
+                        }
+                        match adapter.parse_stream_chunk(&payload) {
+                            Ok(parsed) => {
+                                if payload_is_terminal(&payload, &parsed) {
+                                    terminal_seen = true;
+                                }
+                                for event in parsed {
+                                    if let StreamEvent::Usage(value) = &event {
+                                        usage.merge(value);
+                                    }
+                                    events.push(event);
+                                }
+                            }
+                            Err(failure) => {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(failure.message);
+                                break 'outer;
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                status = "stream_error";
-                status_code = 502;
-                error_message = Some(classify_reqwest(&e));
-                break;
+                Err(error) => {
+                    status = "stream_error";
+                    status_code = 502;
+                    error_message = Some(classify_reqwest(&error));
+                    break;
+                }
             }
         }
-    }
 
-    // The aggregated response is committed as a whole (no streaming).
-    if status == "success" {
-        committed = true;
-        trace.commit();
+        if status == "success" && framer.pending_bytes() > 0 {
+            status = "stream_error";
+            status_code = 502;
+            error_message = Some("upstream SSE ended with an incomplete frame".into());
+        } else if status == "success" && !terminal_seen {
+            status = "stream_error";
+            status_code = 502;
+            error_message = Some("upstream SSE ended before a terminal event".into());
+        }
+
+        // Aggregated responses do not commit client bytes until the entire
+        // upstream lifecycle is known to be complete.
+        if status == "success" {
+            committed = true;
+            trace.commit();
+        }
     }
 
     finalize_log(
@@ -1937,17 +2402,18 @@ async fn drive_aggregate(
     .await;
 
     if status != "success" {
-        return serde_json::json!({
-            "error": {
-                "message": error_message.unwrap_or_else(|| "upstream stream interrupted".into()),
-                "type": "upstream_error"
-            }
-        });
+        return AggregateResult {
+            body: serde_json::json!({
+                "error": {
+                    "message": error_message.unwrap_or_else(|| "upstream stream interrupted".into()),
+                    "type": "upstream_error"
+                }
+            }),
+            status_code: status_code.clamp(400, 599) as u16,
+        };
     }
 
     let body = frontends::aggregate(format, &model_name, &encoder_ctx.request_id, events, &usage);
-    // Non-streaming responses are fully materialized here, so they can be
-    // logged (redacted, short retention) when the key opts in (FR-6.5).
     if let Some(k) = &key {
         if k.body_logging != 0 {
             let _ = db::insert_body_log(
@@ -1961,7 +2427,10 @@ async fn drive_aggregate(
             .await;
         }
     }
-    body
+    AggregateResult {
+        body,
+        status_code: 200,
+    }
 }
 
 /// Compute cost and enqueue the usage row (never blocks the request path),

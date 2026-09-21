@@ -17,7 +17,7 @@ fn frames_in_chunks(input: &str, size: usize) -> Vec<String> {
     let bytes = input.as_bytes();
     let mut out = Vec::new();
     for chunk in bytes.chunks(size.max(1)) {
-        out.extend(f.push(chunk));
+        out.extend(f.push(chunk).unwrap());
     }
     out
 }
@@ -163,7 +163,7 @@ fn fuzz_bounded_resources() {
         let mut f = SseFramer::new();
         let _ = f.push(&bytes);
         // Buffer must never retain more than the last (incomplete) frame.
-        assert!(f.pending() as usize <= 1);
+        assert!(f.pending_bytes() <= crate::sse::DEFAULT_MAX_FRAME_BYTES);
     }
 
     // 2. Random re-chunking of a valid stream must reassemble deterministically.
@@ -178,7 +178,7 @@ fn fuzz_bounded_resources() {
         while i < bytes.len() {
             let step = (next() % 5 + 1) as usize;
             let end = (i + step).min(bytes.len());
-            frames.extend(f.push(&bytes[i..end]));
+            frames.extend(f.push(&bytes[i..end]).unwrap());
             i = end;
         }
         let adapter = crate::adapters::gemini::GeminiAdapter;

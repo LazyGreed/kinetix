@@ -35,15 +35,23 @@ pub fn is_passthrough(inbound: FrontendFormat, outbound: WireFormat) -> bool {
 /// internally and aggregates when the client asked for a single JSON body. This
 /// is required for OpenAI-compatible upstreams, which only emit the terminal
 /// usage chunk when streaming (FR-1.4 + FR-6.2).
-pub fn rewrite_model(raw: &str, upstream_id: &str, force_stream: bool) -> Option<String> {
+pub fn rewrite_model(
+    raw: &str,
+    upstream_id: &str,
+    force_stream: bool,
+    wire: WireFormat,
+) -> Option<String> {
     let mut v: Value = serde_json::from_str(raw).ok()?;
     let obj = v.as_object_mut()?;
     obj.insert("model".to_string(), Value::String(upstream_id.to_string()));
     if force_stream {
         obj.insert("stream".to_string(), Value::Bool(true));
-        // Ask for the usage chunk where the OpenAI protocol supports it.
-        obj.entry("stream_options".to_string())
-            .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+        // stream_options is OpenAI-specific. Anthropic rejects it, so only add
+        // the usage request on the wire format that defines the field.
+        if wire == WireFormat::Openai {
+            obj.entry("stream_options".to_string())
+                .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+        }
     }
     serde_json::to_string(&v).ok()
 }
@@ -77,7 +85,7 @@ mod tests {
             "vendor_extension": {"keep": [1, 2, 3]}
         })
         .to_string();
-        let out = rewrite_model(&raw, "gemini-3.6-flash", false).unwrap();
+        let out = rewrite_model(&raw, "gemini-3.6-flash", false, WireFormat::Openai).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["model"], "gemini-3.6-flash");
         assert_eq!(v["vendor_extension"]["keep"][2], 3);
@@ -91,9 +99,22 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         })
         .to_string();
-        let out = rewrite_model(&raw, "mimo-v2.5-free", true).unwrap();
+        let out = rewrite_model(&raw, "mimo-v2.5-free", true, WireFormat::Openai).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["stream"], true);
         assert_eq!(v["stream_options"]["include_usage"], true);
+    }
+    #[test]
+    fn anthropic_force_stream_does_not_add_openai_stream_options() {
+        let raw = json!({
+            "model": "claude",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let out = rewrite_model(&raw, "claude-upstream", true, WireFormat::Anthropic).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["stream"], true);
+        assert!(v.get("stream_options").is_none());
     }
 }
