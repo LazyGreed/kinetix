@@ -4850,22 +4850,43 @@ async fn complete_plugin_auth(
         .crypto
         .encrypt(&result.secret_json)
         .map_err(ApiError::internal)?;
-    let label = result
+    let base_label = result
         .account_label
         .as_deref()
         .map(sanitize_account_label)
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| provider.name.clone());
+    let existing_accounts = db::accounts_for_provider(&state.pool, &provider.id)
+        .await
+        .map_err(ApiError::internal)?;
+    let label = if existing_accounts.iter().any(|account| account.label == base_label) {
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{base_label} (#{suffix})");
+            if !existing_accounts.iter().any(|account| account.label == candidate) {
+                break candidate;
+            }
+            suffix += 1;
+        }
+    } else {
+        base_label
+    };
+    let priority = existing_accounts
+        .iter()
+        .map(|account| account.priority)
+        .max()
+        .unwrap_or(0)
+        + 1;
     let account_id = db::insert_account(
         &state.pool,
         &provider.id,
         &label,
         &encrypted,
         "oauth:****",
-        1,
+        priority,
         1,
         None,
-        "unknown",
+        "none",
     )
     .await
     .map_err(ApiError::internal)?;
