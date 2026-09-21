@@ -33,7 +33,11 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     println!("Current version: v{current}");
     println!(
         "{} version:  {target}",
-        if args.tag.is_some() { "Target" } else { "Latest" }
+        if args.tag.is_some() {
+            "Target"
+        } else {
+            "Latest"
+        }
     );
 
     if args.check {
@@ -53,7 +57,9 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
     if args.tag.is_none() && target_version < current && !args.force {
-        println!("Installed version v{current} is newer than latest release {target}; nothing to do.");
+        println!(
+            "Installed version v{current} is newer than latest release {target}; nothing to do."
+        );
         return Ok(());
     }
 
@@ -76,13 +82,10 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     let sums_url = format!("{REPO}/releases/download/{target}/SHA256SUMS");
 
     println!("Downloading {asset}...");
-    let (archive, sums) = tokio::try_join!(
-        download_bytes(&asset_url),
-        download_bytes(&sums_url)
-    )?;
+    let (archive, sums) = tokio::try_join!(download_bytes(&asset_url), download_bytes(&sums_url))?;
     let sums = std::str::from_utf8(&sums).context("SHA256SUMS is not UTF-8")?;
-    let expected = checksum_for(sums, &asset)
-        .ok_or_else(|| anyhow!("SHA256SUMS does not contain {asset}"))?;
+    let expected =
+        checksum_for(sums, &asset).ok_or_else(|| anyhow!("SHA256SUMS does not contain {asset}"))?;
     let actual = hex::encode(Sha256::digest(&archive));
     if !actual.eq_ignore_ascii_case(expected) {
         bail!("checksum mismatch for {asset}: expected {expected}, got {actual}");
@@ -205,11 +208,17 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("download {url}"))?;
     ensure_trusted_url(response.url())?;
     if response.content_length().unwrap_or(0) > MAX_DOWNLOAD_BYTES as u64 {
-        bail!("release asset exceeds {} MiB safety limit", MAX_DOWNLOAD_BYTES / 1024 / 1024);
+        bail!(
+            "release asset exceeds {} MiB safety limit",
+            MAX_DOWNLOAD_BYTES / 1024 / 1024
+        );
     }
     let bytes = response.bytes().await.context("read release asset")?;
     if bytes.len() > MAX_DOWNLOAD_BYTES {
-        bail!("release asset exceeds {} MiB safety limit", MAX_DOWNLOAD_BYTES / 1024 / 1024);
+        bail!(
+            "release asset exceeds {} MiB safety limit",
+            MAX_DOWNLOAD_BYTES / 1024 / 1024
+        );
     }
     Ok(bytes.to_vec())
 }
@@ -274,7 +283,10 @@ fn extract_binary(archive: &Path, destination: &Path) -> Result<()> {
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr);
         let _ = fs::remove_file(destination);
-        bail!("failed to extract kinetix from release archive: {}", message.trim());
+        bail!(
+            "failed to extract kinetix from release archive: {}",
+            message.trim()
+        );
     }
     Ok(())
 }
@@ -294,8 +306,8 @@ fn set_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
     use crate::cli::{Cli, Command as CliCommand};
+    use clap::Parser;
 
     #[test]
     fn parses_update_cli_flags() {
