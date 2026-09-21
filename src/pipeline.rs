@@ -655,7 +655,9 @@ pub async fn run(
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(timeout_failure("upstream timed out before response headers")),
+            Err(_) => Err(timeout_failure(
+                "upstream timed out before response headers",
+            )),
         };
 
         match send_result {
@@ -665,7 +667,9 @@ pub async fn run(
                     let first_event_remaining =
                         phase_deadline.saturating_duration_since(Instant::now());
                     let prepared_result = if first_event_remaining.is_zero() {
-                        Err(timeout_failure("upstream timed out before first valid event"))
+                        Err(timeout_failure(
+                            "upstream timed out before first valid event",
+                        ))
                     } else {
                         match tokio::time::timeout(
                             first_event_remaining,
@@ -756,8 +760,7 @@ pub async fn run(
                 // part of the pre-commit phase and cannot outlive its budget.
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
-                let error_body_remaining =
-                    phase_deadline.saturating_duration_since(Instant::now());
+                let error_body_remaining = phase_deadline.saturating_duration_since(Instant::now());
                 let failure = if error_body_remaining.is_zero() {
                     timeout_failure("upstream timed out while reading error response")
                 } else {
