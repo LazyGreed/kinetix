@@ -82,6 +82,16 @@ impl SseFramer {
                 break;
             };
 
+            if idx > self.max_frame_bytes {
+                let pending_bytes = idx;
+                self.buffer.clear();
+                self.scan_from = 0;
+                return Err(SseFrameError::FrameTooLarge {
+                    pending_bytes,
+                    limit: self.max_frame_bytes,
+                });
+            }
+
             let frame_bytes: Vec<u8> = self.buffer.drain(..idx).collect();
             self.buffer.drain(..delimiter_len);
             self.scan_from = 0;
@@ -288,6 +298,19 @@ mod tests {
         assert_eq!(f.pending_bytes(), 13);
         assert!(f.flush().is_some());
         assert_eq!(f.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn rejects_oversized_completed_frame() {
+        let mut f = SseFramer::with_max_frame_bytes(8);
+        let err = f.push(b"123456789\n\n").unwrap_err();
+        assert!(matches!(
+            err,
+            SseFrameError::FrameTooLarge {
+                pending_bytes: 9,
+                limit: 8
+            }
+        ));
     }
 
     #[test]
