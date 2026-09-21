@@ -662,14 +662,12 @@ mod schema_tests {
             got.pointer("/properties/config/properties/mode/enum"),
             Some(&json!(["fast"]))
         );
-        assert!(
-            got.pointer("/properties/config/additionalProperties")
-                .is_none()
-        );
-        assert!(
-            got.pointer("/properties/config/properties/items/items/additionalProperties")
-                .is_none()
-        );
+        assert!(got
+            .pointer("/properties/config/additionalProperties")
+            .is_none());
+        assert!(got
+            .pointer("/properties/config/properties/items/items/additionalProperties")
+            .is_none());
         assert_eq!(
             got.pointer("/properties/config/properties/items/items/properties/kind/enum"),
             Some(&json!(["x"]))
