@@ -772,8 +772,8 @@ fn default_quota_window(account: &db::AccountRow) -> i64 {
 
 /// Send the upstream request. Returns the raw response or a classified failure.
 ///
-/// Applies outbound security controls before sending: credential host binding
-/// (NFR-3.11) and connect-time DNS re-validation (NFR-3.9).
+/// The shared outbound transport resolves and pins the exact destination used
+/// for connection and explicitly revalidates every redirect hop.
 async fn send_upstream(
     state: &AppState,
     adapter: &Arc<dyn Adapter>,
@@ -789,61 +789,13 @@ async fn send_upstream(
         message: e.message,
         quota_reset_at: None,
     })?;
-
-    // Credential host binding (NFR-3.11): never send the credential elsewhere.
-    if let Ok(parsed) = url::Url::parse(&url) {
-        if let Some(host) = parsed.host_str() {
-            if !ctx.provider.host_authorized(host) {
-                return Err(UpstreamFailure {
-                    kind: FailureKind::ConnectionError,
-                    status: None,
-                    retry_after_secs: None,
-                    message: format!(
-                        "credential host binding: '{host}' is not an authorized host for provider '{}'",
-                        ctx.provider.name
-                    ),
-                    quota_reset_at: None,
-                });
-            }
-            // TLS is mandatory except in the explicit dev mode (NFR-3.12).
-            if parsed.scheme() != "https"
-                && !state.config.allow_insecure_tls
-                && !ctx.provider.insecure_tls()
-            {
-                return Err(UpstreamFailure {
-                    kind: FailureKind::ConnectionError,
-                    status: None,
-                    retry_after_secs: None,
-                    message: format!(
-                        "plain-HTTP upstream '{url}' refused: TLS is mandatory \
-                         (set KINETIX_ALLOW_INSECURE_TLS=true for local development)"
-                    ),
-                    quota_reset_at: None,
-                });
-            }
-            // Connect-time DNS re-check against the SSRF policy (NFR-3.9).
-            if !state.config.allow_private_upstreams && !host.parse::<std::net::IpAddr>().is_ok() {
-                match resolve_and_check(host).await {
-                    // Record the resolved destinations in redacted diagnostics
-                    // (NFR-3.13). These are provider hosts, never secrets.
-                    Ok(ips) => tracing::debug!(
-                        target = %host,
-                        resolved_ips = ?ips,
-                        "outbound DNS resolved"
-                    ),
-                    Err(e) => {
-                        return Err(UpstreamFailure {
-                            kind: FailureKind::ConnectionError,
-                            status: None,
-                            retry_after_secs: None,
-                            message: e,
-                            quota_reset_at: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
+    let url = url::Url::parse(&url).map_err(|e| UpstreamFailure {
+        kind: FailureKind::BadRequest,
+        status: None,
+        retry_after_secs: None,
+        message: format!("invalid upstream URL: {e}"),
+        quota_reset_at: None,
+    })?;
 
     // Passthrough forwards the client's raw body (model field rewritten);
     // translation builds a fresh body from the internal model.
@@ -857,64 +809,32 @@ async fn send_upstream(
         adapter.build_body(ctx, req)
     };
 
-    let client = if ctx.provider.follows_redirects() {
-        &state.http_redirect
-    } else {
-        &state.http
-    };
-
-    let mut builder = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        // Propagate the request id upstream (NFR-4.1).
-        .header("x-request-id", request_id)
-        .timeout(Duration::from_millis(ctx.provider.timeout_ms as u64))
-        .json(&body);
-
-    builder = adapter.apply_auth(ctx, builder);
-    for (k, v) in ctx.provider.extra_headers_map() {
-        builder = builder.header(k, v);
-    }
-
-    match builder.send().await {
-        Ok(resp) => Ok(resp),
-        Err(e) => {
-            let kind = if e.is_timeout() {
-                FailureKind::Timeout
-            } else {
-                FailureKind::ConnectionError
-            };
-            Err(UpstreamFailure {
-                kind,
-                status: None,
-                retry_after_secs: None,
-                message: format!("connection to upstream failed: {}", classify_reqwest(&e)),
-                quota_reset_at: None,
-            })
-        }
-    }
-}
-
-/// Resolve a host and reject blocked ranges (connect-time rebinding guard).
-/// Resolve a host and reject blocked destinations (NFR-3.9), returning the
-/// resolved IPs so the caller can record them in redacted diagnostics
-/// (NFR-3.13).
-async fn resolve_and_check(host: &str) -> Result<Vec<String>, String> {
-    let addrs = tokio::net::lookup_host((host, 443))
-        .await
-        .map_err(|e| format!("DNS resolution for '{host}' failed: {e}"))?;
-    let mut ips = Vec::new();
-    for addr in addrs {
-        if crate::admin::is_blocked_ip(addr.ip()) {
-            return Err(format!(
-                "host '{host}' resolves to a blocked private/metadata address ({})",
-                addr.ip()
-            ));
-        }
-        ips.push(addr.ip().to_string());
-    }
-    Ok(ips)
+    crate::outbound::send_provider_request(
+        &state.outbound_clients,
+        state.config.allow_private_upstreams,
+        state.config.allow_insecure_tls,
+        adapter,
+        ctx,
+        crate::outbound::ProviderRequest {
+            method: reqwest::Method::POST,
+            url,
+            json_body: Some(body),
+            accept_event_stream: true,
+            request_id: Some(request_id.to_string()),
+        },
+    )
+    .await
+    .map_err(|e| UpstreamFailure {
+        kind: if e.timeout {
+            FailureKind::Timeout
+        } else {
+            FailureKind::ConnectionError
+        },
+        status: None,
+        retry_after_secs: None,
+        message: e.message,
+        quota_reset_at: None,
+    })
 }
 
 fn classify_reqwest(e: &reqwest::Error) -> String {
