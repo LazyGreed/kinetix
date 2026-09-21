@@ -648,7 +648,8 @@ pub async fn run(
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(failure_to_error(&failure, target));
                             }
-                            handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
+                            handle_key_failure(state, target, &failure, &mut meta, &mut trace)
+                                .await;
                             last_error = Some(failure_to_error(&failure, target));
                             continue;
                         }
@@ -687,12 +688,10 @@ pub async fn run(
                         adapter: adapter.clone(),
                         passthrough: use_passthrough && prepared.is_sse,
                     };
-                    return Ok(
-                        stream_response(
-                            state, snap, format, meta, req, attempt, started, key, trace,
-                        )
-                        .await,
-                    );
+                    return Ok(stream_response(
+                        state, snap, format, meta, req, attempt, started, key, trace,
+                    )
+                    .await);
                 }
 
                 // Classify and maybe fail over.
@@ -903,7 +902,10 @@ fn payload_is_terminal(payload: &str, events: &[StreamEvent]) -> bool {
     if payload.trim() == "[DONE]" {
         return true;
     }
-    if events.iter().any(|event| matches!(event, StreamEvent::Finish(_))) {
+    if events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::Finish(_)))
+    {
         return true;
     }
     serde_json::from_str::<Value>(payload)
@@ -913,21 +915,14 @@ fn payload_is_terminal(payload: &str, events: &[StreamEvent]) -> bool {
         == Some("message_stop")
 }
 
-fn payload_error_failure(
-    adapter: &Arc<dyn Adapter>,
-    payload: &str,
-) -> Option<UpstreamFailure> {
+fn payload_error_failure(adapter: &Arc<dyn Adapter>, payload: &str) -> Option<UpstreamFailure> {
     let value: Value = serde_json::from_str(payload).ok()?;
-    let looks_error = value.get("error").is_some()
-        || value.get("type").and_then(Value::as_str) == Some("error");
+    let looks_error =
+        value.get("error").is_some() || value.get("type").and_then(Value::as_str) == Some("error");
     if !looks_error {
         return None;
     }
-    Some(adapter.classify_error(
-        502,
-        payload,
-        &reqwest::header::HeaderMap::new(),
-    ))
+    Some(adapter.classify_error(502, payload, &reqwest::header::HeaderMap::new()))
 }
 
 /// Validate a successful HTTP response before the client response is committed.
@@ -943,11 +938,7 @@ async fn prepare_success_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let is_sse = content_type
-        .split(';')
-        .next()
-        .map(str::trim)
-        == Some("text/event-stream");
+    let is_sse = content_type.split(';').next().map(str::trim) == Some("text/event-stream");
 
     if !is_sse {
         if response
@@ -1852,11 +1843,7 @@ async fn drive_stream(
 
     let upstream = attempt.stream.take().expect("validated SSE stream present");
     let prefetched = std::mem::take(&mut attempt.prefetched);
-    let replay = futures::stream::iter(
-        prefetched
-            .into_iter()
-            .map(Ok::<Bytes, reqwest::Error>),
-    );
+    let replay = futures::stream::iter(prefetched.into_iter().map(Ok::<Bytes, reqwest::Error>));
     let chunks = replay.chain(upstream.bytes_stream());
     tokio::pin!(chunks);
 
@@ -2050,11 +2037,7 @@ async fn drive_stream_passthrough(
 
     let upstream = attempt.stream.take().expect("validated SSE stream present");
     let prefetched = std::mem::take(&mut attempt.prefetched);
-    let replay = futures::stream::iter(
-        prefetched
-            .into_iter()
-            .map(Ok::<Bytes, reqwest::Error>),
-    );
+    let replay = futures::stream::iter(prefetched.into_iter().map(Ok::<Bytes, reqwest::Error>));
     let chunks = replay.chain(upstream.bytes_stream());
     tokio::pin!(chunks);
 
