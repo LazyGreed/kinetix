@@ -1244,7 +1244,7 @@ async fn discover_models_native(
             accept_event_stream: false,
             request_id: None,
             total_timeout: Some(std::time::Duration::from_millis(
-                provider.timeout_ms.max(1) as u64,
+                provider.timeout_ms.max(1) as u64
             )),
         },
     )
@@ -1387,7 +1387,7 @@ pub async fn test_provider(
             accept_event_stream: false,
             request_id: None,
             total_timeout: Some(std::time::Duration::from_millis(
-                provider.timeout_ms.max(1) as u64,
+                provider.timeout_ms.max(1) as u64
             )),
         },
     )
