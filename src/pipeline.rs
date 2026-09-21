@@ -2019,9 +2019,9 @@ async fn drive_stream(
     .await;
 }
 
-/// Same-format passthrough streaming (FR-2.7, FR-2.10): forward the upstream's
-/// SSE `data:` payloads verbatim (preserving unknown/provider-specific fields)
-/// while extracting usage metadata for accounting.
+/// Same-format passthrough streaming (FR-2.7, FR-2.10). Raw frames are
+/// preserved, but no client bytes are emitted until a semantic upstream event
+/// has been validated.
 #[allow(clippy::too_many_arguments)]
 async fn drive_stream_passthrough(
     state: AppState,
@@ -2046,13 +2046,25 @@ async fn drive_stream_passthrough(
     let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
-    let mut upstream = attempt.stream.take().expect("stream present");
     let adapter = attempt.adapter.clone();
+
+    let upstream = attempt.stream.take().expect("validated SSE stream present");
+    let prefetched = std::mem::take(&mut attempt.prefetched);
+    let replay = futures::stream::iter(
+        prefetched
+            .into_iter()
+            .map(Ok::<Bytes, reqwest::Error>),
+    );
+    let chunks = replay.chain(upstream.bytes_stream());
+    tokio::pin!(chunks);
+
     let mut framer = crate::sse::SseFramer::new();
+    let mut terminal_seen = false;
+    let mut pending_frames: Vec<String> = Vec::new();
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
+    'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
             status = "client_disconnect";
@@ -2068,9 +2080,7 @@ async fn drive_stream_passthrough(
                     break;
                 }
             }
-            _ = keepalive.tick() => {
-                // Keepalive comment (FR-9.4): keeps Cloudflare's ~100s idle
-                // timeout from dropping a long silent thinking phase.
+            _ = keepalive.tick(), if committed => {
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
                     record_cancel(&state, &meta, started);
                     status = "client_disconnect";
@@ -2078,86 +2088,139 @@ async fn drive_stream_passthrough(
                     break;
                 }
             }
-            chunk = upstream.chunk() => {
+            chunk = chunks.next() => {
                 match chunk {
-                    Ok(Some(bytes)) => {
-                        // Forward each complete frame verbatim (CRLF already
-                        // normalized by the framer); extract usage metadata only.
-                        for frame in framer.push(&bytes) {
-                            if let Some(payload) = crate::sse::extract_data(&frame) {
-                                if payload.trim() != "[DONE]" {
-                                    if let Ok(evs) = adapter.parse_stream_chunk(&payload) {
-                                        for ev in evs {
-                                            if let StreamEvent::Usage(u) = &ev {
-                                                usage.merge(u);
+                    Some(Ok(bytes)) => {
+                        let frames = match framer.push(&bytes) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(error.to_string());
+                                break 'outer;
+                            }
+                        };
+                        for frame in frames {
+                            let payload = crate::sse::extract_data(&frame);
+                            let mut semantic = false;
+                            if let Some(payload) = payload.as_deref() {
+                                if payload.trim() == "[DONE]" {
+                                    terminal_seen = true;
+                                } else {
+                                    if let Some(failure) = payload_error_failure(&adapter, payload) {
+                                        status = "stream_error";
+                                        status_code = 502;
+                                        error_message = Some(failure.message);
+                                        break 'outer;
+                                    }
+                                    match adapter.parse_stream_chunk(payload) {
+                                        Ok(events) => {
+                                            semantic = events.iter().any(is_semantic_event);
+                                            if payload_is_terminal(payload, &events) {
+                                                terminal_seen = true;
                                             }
-                                            match &ev {
-                                                StreamEvent::ThinkingDelta { .. } if !saw_reasoning => {
-                                                    saw_reasoning = true;
-                                                    state.flight.record(
-                                                        &meta.request_id,
-                                                        started.elapsed().as_millis() as u64,
-                                                        "reasoning_event",
-                                                        "first thinking delta",
-                                                    );
+                                            for event in events {
+                                                if let StreamEvent::Usage(value) = &event {
+                                                    usage.merge(value);
                                                 }
-                                                StreamEvent::ToolCallStart { .. } if !saw_tool => {
-                                                    saw_tool = true;
-                                                    state.flight.record(
-                                                        &meta.request_id,
-                                                        started.elapsed().as_millis() as u64,
-                                                        "tool_call_event",
-                                                        "first tool call",
-                                                    );
+                                                match event {
+                                                    StreamEvent::ThinkingDelta { .. } if !saw_reasoning => {
+                                                        saw_reasoning = true;
+                                                        state.flight.record(
+                                                            &meta.request_id,
+                                                            started.elapsed().as_millis() as u64,
+                                                            "reasoning_event",
+                                                            "first thinking delta",
+                                                        );
+                                                    }
+                                                    StreamEvent::ToolCallStart { .. } if !saw_tool => {
+                                                        saw_tool = true;
+                                                        state.flight.record(
+                                                            &meta.request_id,
+                                                            started.elapsed().as_millis() as u64,
+                                                            "tool_call_event",
+                                                            "first tool call",
+                                                        );
+                                                    }
+                                                    _ => {}
                                                 }
-                                                _ => {}
                                             }
+                                        }
+                                        Err(failure) => {
+                                            status = "stream_error";
+                                            status_code = 502;
+                                            error_message = Some(failure.message);
+                                            break 'outer;
                                         }
                                     }
                                 }
                             }
-                            if ttft_ms.is_none() {
+
+                            if !committed {
+                                pending_frames.push(frame);
+                                if !semantic {
+                                    continue;
+                                }
+                                committed = true;
+                                trace.commit();
+                                state.live.mark_committed(&meta.request_id);
                                 ttft_ms = Some(started.elapsed().as_millis() as i64);
                                 state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
                                 state.live.mark_streaming(&meta.request_id);
                                 state.flight.record(
                                     &meta.request_id,
                                     started.elapsed().as_millis() as u64,
-                                    "upstream_first_frame",
-                                    "first upstream frame",
+                                    "commit",
+                                    "first validated passthrough event",
                                 );
-                            }
-                            if !committed {
-                                committed = true;
-                                trace.commit();
-                                state.live.mark_committed(&meta.request_id);
-                            }
-                            let out = Bytes::from(format!("{frame}\n\n"));
-                            if tx.send(Ok(out)).await.is_err() {
+                                for buffered in pending_frames.drain(..) {
+                                    if tx
+                                        .send(Ok(Bytes::from(format!("{buffered}\n\n"))))
+                                        .await
+                                        .is_err()
+                                    {
+                                        record_cancel(&state, &meta, started);
+                                        status = "client_disconnect";
+                                        status_code = 499;
+                                        break 'outer;
+                                    }
+                                }
+                            } else if tx
+                                .send(Ok(Bytes::from(format!("{frame}\n\n"))))
+                                .await
+                                .is_err()
+                            {
                                 record_cancel(&state, &meta, started);
                                 status = "client_disconnect";
                                 status_code = 499;
-                                return finalize_log(
-                                    &state, &snap, &mut meta, &req, &attempt, &model_display,
-                                    started, ttft_ms, status, status_code, usage,
-                                    error_message, key, trace, committed,
-                                ).await;
+                                break 'outer;
                             }
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
+                    Some(Err(error)) => {
                         status = "stream_error";
                         status_code = 502;
-                        error_message = Some(classify_reqwest(&e));
-                        if committed {
-                            state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
-                        }
+                        error_message = Some(classify_reqwest(&error));
                         break;
                     }
+                    None => break,
                 }
             }
         }
+    }
+
+    if status == "success" && framer.pending_bytes() > 0 {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended with an incomplete frame".into());
+    } else if status == "success" && !terminal_seen {
+        status = "stream_error";
+        status_code = 502;
+        error_message = Some("upstream SSE ended before a terminal event".into());
+    }
+
+    if status == "stream_error" && committed {
+        state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
     }
 
     let _ = format;
