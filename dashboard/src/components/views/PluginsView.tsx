@@ -106,6 +106,14 @@ export const PluginsView: React.FC = () => {
   const [catalogQuery, setCatalogQuery] = useState('');
   const [catalogCapabilityFilter, setCatalogCapabilityFilter] = useState<string>('all');
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
+  const [manualAuth, setManualAuth] = useState<{
+    authorizeUrl: string;
+    callbackUrl: string;
+    providerId: string;
+    state: string;
+    redirectUri: string;
+    showFallback: boolean;
+  } | null>(null);
 
   const loadDetail = useCallback(async (id: string) => {
     const [plugin, grants, settingState] = await Promise.all([
@@ -524,7 +532,20 @@ export const PluginsView: React.FC = () => {
     try {
       const provider = await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId);
       const started = await Kinetix.startPluginAuth(pluginId, flowName, provider.id);
-      window.location.assign(started.authorize_url);
+      if (started.manual_callback_supported) {
+        setManualAuth({
+          authorizeUrl: started.authorize_url,
+          callbackUrl: '',
+          providerId: provider.id,
+          state: started.state,
+          redirectUri: started.redirect_uri,
+          showFallback: false,
+        });
+        window.open(started.authorize_url, '_blank', 'noopener,noreferrer');
+        setBusy(null);
+      } else {
+        window.location.assign(started.authorize_url);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(null);
@@ -556,9 +577,91 @@ export const PluginsView: React.FC = () => {
     setNotice(null);
     try {
       const started = await Kinetix.startPluginAuth(pluginId, flowName, providerId);
-      window.location.assign(started.authorize_url);
+      if (started.manual_callback_supported) {
+        setManualAuth({
+          authorizeUrl: started.authorize_url,
+          callbackUrl: '',
+          providerId,
+          state: started.state,
+          redirectUri: started.redirect_uri,
+          showFallback: false,
+        });
+        window.open(started.authorize_url, '_blank', 'noopener,noreferrer');
+        setBusy(null);
+      } else {
+        window.location.assign(started.authorize_url);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setBusy(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!manualAuth) return;
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const status = await Kinetix.pluginAuthStatus(manualAuth.state);
+        if (cancelled || status.result === 'pending') return;
+        if (status.result === 'success') {
+          const providerId = status.provider_id ?? manualAuth.providerId;
+          setManualAuth(null);
+          setNotice('Account connected successfully.');
+          await refresh(selectedId);
+          if (providerId) {
+            void discoverProviderModels(providerId);
+          }
+          return;
+        }
+        setManualAuth(null);
+        setError(
+          status.result === 'cancelled'
+            ? 'Account authorization was cancelled.'
+            : status.result === 'binding_changed'
+              ? 'Provider binding changed during authorization.'
+              : 'Account authorization failed during token exchange.',
+        );
+      } catch {
+        // Briefly pending while the callback moves from the one-time session
+        // store into the completion-status ledger.
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [manualAuth?.state, manualAuth?.providerId, discoverProviderModels, refresh, selectedId]);
+
+  const completeManualAuth = async () => {
+    if (!manualAuth?.callbackUrl.trim()) return;
+    setBusy('auth:manual');
+    setError(null);
+    try {
+      const result = await Kinetix.completePluginAuth(manualAuth.callbackUrl.trim());
+      if (!result.ok || result.result !== 'success') {
+        throw new Error(
+          result.result === 'cancelled'
+            ? 'Account authorization was cancelled.'
+            : result.result === 'binding_changed'
+              ? 'Provider binding changed during authorization.'
+              : 'Account authorization failed during token exchange.',
+        );
+      }
+      const providerId = result.provider_id ?? manualAuth.providerId;
+      setManualAuth(null);
+      setNotice('Account connected successfully through the manual OAuth fallback.');
+      await refresh(selectedId);
+      if (providerId) {
+        void discoverProviderModels(providerId);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
       setBusy(null);
     }
   };
@@ -604,6 +707,81 @@ export const PluginsView: React.FC = () => {
           </SketchButton>
         </div>
       </div>
+
+      {manualAuth && (
+        <WobblyCard decoration="tape" className="p-5">
+          <h3 className="text-xl font-heading font-bold flex items-center gap-2">
+            <LogIn className="w-5 h-5 text-[var(--pen-blue)]" />
+            Waiting for OAuth authorization
+          </h3>
+          <p className="mt-2 text-sm font-body text-[var(--ink)]/80">
+            Complete authorization in the tab that was opened. If this browser can reach Kinetix&apos;s loopback
+            listener, the account will connect automatically. This page checks the authorization status continuously.
+          </p>
+          <div className="mt-3 flex gap-2 flex-wrap">
+            <SketchButton
+              variant="secondary"
+              onClick={() => window.open(manualAuth.authorizeUrl, '_blank', 'noopener,noreferrer')}
+              disabled={busy !== null}
+            >
+              Reopen authorization
+            </SketchButton>
+            <SketchButton
+              variant="secondary"
+              onClick={() =>
+                setManualAuth((current) =>
+                  current ? { ...current, showFallback: !current.showFallback } : current,
+                )
+              }
+              disabled={busy !== null}
+            >
+              {manualAuth.showFallback ? 'Hide manual fallback' : 'Loopback did not load?'}
+            </SketchButton>
+            <SketchButton
+              variant="secondary"
+              onClick={() => setManualAuth(null)}
+              disabled={busy !== null}
+            >
+              Cancel
+            </SketchButton>
+          </div>
+
+          {manualAuth.showFallback && (
+            <div className="mt-4">
+              <p className="text-sm font-body text-[var(--ink)]/80">
+                If Kinetix is running on another machine, the loopback callback may fail to load. Copy the complete
+                callback URL from the browser address bar and paste it here. Kinetix validates it before consuming
+                the one-time authorization state.
+              </p>
+              <div className="mt-2 text-xs font-mono text-[var(--ink)]/60 break-all">
+                Expected callback: {manualAuth.redirectUri}
+              </div>
+              <label className="block mt-3 text-sm font-heading font-bold">Callback URL</label>
+              <input
+                type="url"
+                value={manualAuth.callbackUrl}
+                onChange={(e) =>
+                  setManualAuth((current) =>
+                    current ? { ...current, callbackUrl: e.target.value } : current,
+                  )
+                }
+                placeholder={`${manualAuth.redirectUri}?code=...&state=...`}
+                className="mt-1 w-full px-3 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] sketch-shadow-sm font-mono text-sm focus:outline-none focus:border-[var(--pen-blue)]"
+                style={{ borderRadius: '12px 16px 12px 16px / 16px 12px 16px 12px' }}
+              />
+              <SketchButton
+                variant="primary"
+                className="mt-3 gap-2"
+                disabled={busy !== null || !manualAuth.callbackUrl.trim()}
+                onClick={() => void completeManualAuth()}
+              >
+                <LogIn className="w-4 h-4" />
+                {busy === 'auth:manual' ? 'Completing…' : 'Complete authorization'}
+              </SketchButton>
+            </div>
+          )}
+        </WobblyCard>
+      )}
 
       {error && (
         <div className="p-3 bg-[var(--tint-red)] border-2 border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)] flex gap-2 items-start">
