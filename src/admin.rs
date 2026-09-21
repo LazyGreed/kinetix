@@ -4859,11 +4859,17 @@ async fn complete_plugin_auth(
     let existing_accounts = db::accounts_for_provider(&state.pool, &provider.id)
         .await
         .map_err(ApiError::internal)?;
-    let label = if existing_accounts.iter().any(|account| account.label == base_label) {
+    let label = if existing_accounts
+        .iter()
+        .any(|account| account.label == base_label)
+    {
         let mut suffix = 2usize;
         loop {
             let candidate = format!("{base_label} (#{suffix})");
-            if !existing_accounts.iter().any(|account| account.label == candidate) {
+            if !existing_accounts
+                .iter()
+                .any(|account| account.label == candidate)
+            {
                 break candidate;
             }
             suffix += 1;
