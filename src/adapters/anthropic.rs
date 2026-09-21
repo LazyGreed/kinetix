@@ -126,6 +126,28 @@ impl Default for AnthropicAdapter {
     }
 }
 
+/// Anthropic may omit Retry-After on 429s but provides RFC3339 reset
+/// timestamps. Use the earliest future reset as the client/cooldown hint.
+fn anthropic_reset_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    const RESET_HEADERS: [&str; 4] = [
+        "anthropic-ratelimit-requests-reset",
+        "anthropic-ratelimit-tokens-reset",
+        "anthropic-ratelimit-input-tokens-reset",
+        "anthropic-ratelimit-output-tokens-reset",
+    ];
+
+    let now = chrono::Utc::now();
+    RESET_HEADERS
+        .iter()
+        .filter_map(|name| headers.get(*name))
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| chrono::DateTime::parse_from_rfc3339(v.trim()).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .filter(|dt| *dt > now)
+        .map(|dt| (dt - now).num_seconds().max(1) as u64)
+        .min()
+}
+
 #[async_trait]
 impl Adapter for AnthropicAdapter {
     fn wire_format(&self) -> &'static str {
@@ -298,7 +320,8 @@ impl Adapter for AnthropicAdapter {
         let retry_after_secs = headers
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok());
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or_else(|| anthropic_reset_delay(headers));
 
         let kind = match status {
             400 | 404 | 422 => FailureKind::BadRequest,
@@ -531,6 +554,15 @@ impl Adapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_reset_headers_supply_retry_delay() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let reset = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        headers.insert("anthropic-ratelimit-requests-reset", reset.parse().unwrap());
+        let delay = anthropic_reset_delay(&headers).unwrap();
+        assert!((1..=60).contains(&delay));
+    }
     use crate::db::{ModelRow, ProviderRow};
     use crate::types::Message;
 

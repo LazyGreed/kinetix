@@ -259,7 +259,10 @@ fn insert_rec(obj: &mut serde_json::Map<String, Value>, path: &[&str], value: Va
     }
 }
 
-/// Gemini rejects some JSON-schema keywords; strip the common offenders.
+/// Normalize JSON Schema to the subset accepted by Gemini.
+///
+/// Walk every object/array: schema-bearing nodes can appear under arbitrary
+/// property names, not only under the well-known composition keywords.
 fn sanitize_schema(schema: &Value) -> Value {
     match schema {
         Value::Object(map) => {
@@ -267,11 +270,13 @@ fn sanitize_schema(schema: &Value) -> Value {
             for (k, v) in map {
                 match k.as_str() {
                     "additionalProperties" | "$schema" | "definitions" | "$defs" | "strict" => {}
-                    "properties" | "items" | "anyOf" | "allOf" | "oneOf" => {
-                        out.insert(k.clone(), sanitize_schema(v));
+                    // Gemini does not accept JSON Schema `const`; a singleton
+                    // enum preserves the same constraint.
+                    "const" => {
+                        out.insert("enum".to_string(), json!([sanitize_schema(v)]));
                     }
                     _ => {
-                        out.insert(k.clone(), v.clone());
+                        out.insert(k.clone(), sanitize_schema(v));
                     }
                 }
             }
@@ -620,4 +625,52 @@ pub fn sampling_defaults() -> SamplingParams {
 
 pub fn message_has_tool_result(m: &Message) -> bool {
     m.parts.iter().any(|p| matches!(p, Part::ToolResult { .. }))
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_schema_recurses_and_preserves_const_semantics() {
+        let input = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "mode": { "const": "fast" },
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": { "kind": { "const": "x" } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let got = sanitize_schema(&input);
+        assert!(got.get("$schema").is_none());
+        assert!(got.get("additionalProperties").is_none());
+        assert_eq!(
+            got.pointer("/properties/config/properties/mode/enum"),
+            Some(&json!(["fast"]))
+        );
+        assert!(got
+            .pointer("/properties/config/additionalProperties")
+            .is_none());
+        assert!(got
+            .pointer("/properties/config/properties/items/items/additionalProperties")
+            .is_none());
+        assert_eq!(
+            got.pointer("/properties/config/properties/items/items/properties/kind/enum"),
+            Some(&json!(["x"]))
+        );
+    }
 }
