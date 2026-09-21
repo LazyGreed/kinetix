@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2, Pencil } from 'lucide-react';
+import { Users, Plus, ShieldCheck, Clock, AlertTriangle, RefreshCw, KeyRound, Sparkles, Trash2, Search, X, Pencil } from 'lucide-react';
 import { Account, Provider } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens, DESIGN_TOKENS } from '../../lib/designSystem';
@@ -21,6 +21,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
   onDeleteAccount,
 }) => {
   const [showAddModal, setShowAddModal] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const [confirmDeleteAccountId, setConfirmDeleteAccountId] = useState<string | null>(null);
   const [providerFilter, setProviderFilter] = useState('all');
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -89,10 +90,17 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
     });
   };
 
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const filteredAccounts = accounts.filter((acc) => {
+    if (!normalizedSearch) return true;
+    return [acc.id, acc.label, acc.providerName, acc.keyMasked, acc.status]
+      .some((value) => String(value ?? '').toLowerCase().includes(normalizedSearch));
+  });
+
   const visibleProviders = providers.filter((provider) =>
     providerFilter === 'all' || provider.id === providerFilter,
   );
-  const orphanAccounts = accounts.filter(
+  const orphanAccounts = filteredAccounts.filter(
     (account) => !providers.some((provider) => provider.id === account.providerId),
   );
 
@@ -130,15 +138,38 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
           </p>
         </div>
 
-        <SketchButton
-          variant="primary"
-          size="md"
-          onClick={() => setShowAddModal(true)}
-          className="gap-2 font-heading font-bold"
-        >
-          <Plus className="w-5 h-5" />
-          Add Upstream Credential
-        </SketchButton>
+        <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
+          <div className="relative min-w-0 sm:w-72">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--ink)]/50" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search accounts…"
+              className="w-full pl-9 pr-9 py-2 bg-[var(--surface)] border-2 border-[var(--ink)] font-mono text-sm focus:outline-none focus:border-[var(--pen-blue)]"
+              style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-[var(--ink)]/60 hover:text-[var(--marker-red)] cursor-pointer"
+                title="Clear search"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+          <SketchButton
+            variant="primary"
+            size="md"
+            onClick={() => setShowAddModal(true)}
+            className="gap-2 font-heading font-bold whitespace-nowrap"
+          >
+            <Plus className="w-5 h-5" />
+            Add Upstream Credential
+          </SketchButton>
+        </div>
       </div>
 
       {providers.length > 1 && (
@@ -184,10 +215,21 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
             Add First Upstream Credential
           </SketchButton>
         </WobblyCard>
+      ) : normalizedSearch && filteredAccounts.length === 0 ? (
+        <WobblyCard decoration="tack" className="p-8 text-center bg-[var(--surface)]">
+          <Search className="w-10 h-10 text-[var(--ink)]/35 mx-auto mb-2" />
+          <p className="font-heading font-bold text-lg">No accounts match “{searchQuery}”.</p>
+          <button
+            onClick={() => setSearchQuery('')}
+            className="mt-2 text-sm font-heading font-bold text-[var(--pen-blue)] hover:underline cursor-pointer"
+          >
+            Clear search
+          </button>
+        </WobblyCard>
       ) : (
         <div className="space-y-8">
           {visibleProviders.map((provider) => {
-            const poolAccounts = accounts.filter((acc) => acc.providerId === provider.id);
+            const poolAccounts = filteredAccounts.filter((acc) => acc.providerId === provider.id);
             const healthy = poolAccounts.filter((acc) => acc.status === 'healthy').length;
             const cooldown = poolAccounts.filter((acc) => acc.status === 'cooldown').length;
             const exhausted = poolAccounts.filter((acc) => acc.status === 'exhausted').length;
