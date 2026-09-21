@@ -565,5 +565,17 @@ mod plugin_auth_tests {
         assert!(sessions
             .take_loopback_callback(&wrong_redirect.state)
             .is_none());
+
+        let antigravity_remote_redirect = sessions.create(
+            "dev.kinetix.antigravity-oauth",
+            "antigravity",
+            "prov_1",
+            "plugin:dev.kinetix.antigravity-oauth/antigravity-oauth",
+            "http://example.test:20128/admin/api/plugins/auth/callback",
+            "session-token-1",
+        );
+        assert!(sessions
+            .take_loopback_callback(&antigravity_remote_redirect.state)
+            .is_none());
     }
 }
