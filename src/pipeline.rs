@@ -620,17 +620,50 @@ pub async fn run(
         {
             Ok(resp) => {
                 if resp.status().is_success() {
+                    let upstream_request_id = extract_upstream_request_id(&resp);
+                    let prepared = match prepare_success_response(resp, &adapter).await {
+                        Ok(prepared) => prepared,
+                        Err(failure) => {
+                            state.flight.record(
+                                &meta.request_id,
+                                started.elapsed().as_millis() as u64,
+                                "upstream_precommit_invalid",
+                                failure.message.clone(),
+                            );
+                            if !failure.kind.is_key_level() || !allow_fallback {
+                                trace.step(
+                                    "attempt",
+                                    Some(target.account.label.clone()),
+                                    format!("HTTP 2xx invalid before commit: {}", failure.message),
+                                );
+                                trace.finish("failed");
+                                state.live.finish(
+                                    &meta.request_id,
+                                    "failed",
+                                    started.elapsed().as_millis() as u64,
+                                    None,
+                                    None,
+                                );
+                                let _ = db::insert_route_trace(&state.pool, &trace).await;
+                                return Err(failure_to_error(&failure, target));
+                            }
+                            handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
+                            last_error = Some(failure_to_error(&failure, target));
+                            continue;
+                        }
+                    };
+
                     meta.fallback_hops = (attempts_done - 1) as i64;
                     meta.retry_count = (attempts_done - 1) as i64;
                     if attempts_done > 1 {
                         state.record_fallback();
                     }
                     meta.fallback_path
-                        .push(format!("{}:200", target.account.label));
+                        .push(format!("{}:validated", target.account.label));
                     trace.step(
                         "attempt",
                         Some(target.account.label.clone()),
-                        format!("HTTP 200 (attempt {attempts_done})"),
+                        format!("HTTP 2xx validated (attempt {attempts_done})"),
                     );
                     trace.final_target = Some(format!(
                         "{} @ {}",
@@ -639,22 +672,26 @@ pub async fn run(
                     state.flight.record(
                         &meta.request_id,
                         started.elapsed().as_millis() as u64,
-                        "upstream_headers",
-                        "200",
+                        "upstream_validated",
+                        if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // A successful attempt clears the circuit-breaker counter.
+                    // Only validated responses clear the circuit-breaker counter.
                     let _ = pool::clear_circuit(&state.pool, &target.account.id).await;
-                    let upstream_request_id = extract_upstream_request_id(&resp);
                     let attempt = Attempt {
                         target: target.clone(),
                         upstream_request_id,
-                        stream: Some(resp),
+                        stream: prepared.stream,
+                        prefetched: prepared.prefetched,
+                        full_events: prepared.full_events,
                         adapter: adapter.clone(),
-                        passthrough: use_passthrough,
+                        passthrough: use_passthrough && prepared.is_sse,
                     };
-                    return Ok(stream_response(
-                        state, snap, format, meta, req, attempt, started, key, trace,
-                    ));
+                    return Ok(
+                        stream_response(
+                            state, snap, format, meta, req, attempt, started, key, trace,
+                        )
+                        .await,
+                    );
                 }
 
                 // Classify and maybe fail over.
