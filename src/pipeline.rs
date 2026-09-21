@@ -2404,7 +2404,19 @@ async fn drive_aggregate(
         let mut framer = crate::sse::SseFramer::new();
         let mut terminal_seen = false;
 
-        'outer: while let Some(chunk) = chunks.next().await {
+        'outer: loop {
+            let next = match tokio::time::timeout(attempt.idle_timeout, chunks.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    status = "stream_error";
+                    status_code = 504;
+                    error_message = Some("upstream stream idle timeout".into());
+                    break;
+                }
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     let frames = match framer.push(&bytes) {
