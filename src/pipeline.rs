@@ -228,6 +228,7 @@ pub async fn run(
                     account,
                     model: model.clone(),
                     provider: provider.clone(),
+                    route_target_id: None,
                     priority: 1,
                     weight: 1,
                     predicate: TargetPredicate::default(),
@@ -1050,26 +1051,20 @@ fn select_accounts(
         .filter(|a| a.provider_id == provider_id)
         .cloned()
         .collect();
-    let mut available: Vec<db::AccountRow> = accounts
+    let available: Vec<db::AccountRow> = accounts
         .iter()
         .filter(|a| matches!(pool::effective_status(a), pool::AccountStatus::Healthy))
         .cloned()
         .collect();
 
+    // Keep unavailable rows only when the whole pool is unavailable so the
+    // attempt loop can report the actual account state. Half-open probing is
+    // circuit-only in pool::should_probe().
     if available.is_empty() {
-        // Fall back to the whole pool so the caller can report a proper error.
-        return Ok(accounts);
+        return Ok(pool::order_accounts(accounts, preferred));
     }
 
-    if let Some(pref) = preferred {
-        available.sort_by_key(|a| if a.id == pref { 0 } else { 1 });
-    } else {
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        available.shuffle(&mut rng);
-        available.sort_by_key(|a| a.priority);
-    }
-    Ok(available)
+    Ok(pool::order_accounts(available, preferred))
 }
 
 /// Gather plugin routing facts for a request (§6.4).
@@ -1194,53 +1189,98 @@ async fn gather_plugin_facts(
     facts
 }
 
-/// Order route targets according to the route strategy (FR-12.5).
+/// Order sibling accounts for one logical route target. Account priority is
+/// primary; weight biases the first choice within equal-priority tiers while
+/// retaining every sibling for fallback.
+fn order_route_account_candidates(targets: Vec<ResolvedTarget>) -> Vec<ResolvedTarget> {
+    let accounts = pool::order_accounts(targets.iter().map(|t| t.account.clone()).collect(), None);
+    let mut by_account: std::collections::HashMap<String, ResolvedTarget> = targets
+        .into_iter()
+        .map(|target| (target.account.id.clone(), target))
+        .collect();
+
+    accounts
+        .into_iter()
+        .filter_map(|account| by_account.remove(&account.id))
+        .collect()
+}
+
+/// Order logical route targets according to the route strategy (FR-12.5), then
+/// flatten each target's account pool. A provider with N accounts therefore
+/// does not receive N times the configured route weight or round-robin share.
 async fn order_route_targets(
     state: &AppState,
     route: &db::RouteRow,
-    mut targets: Vec<ResolvedTarget>,
+    targets: Vec<ResolvedTarget>,
 ) -> Vec<ResolvedTarget> {
+    let mut groups: Vec<Vec<ResolvedTarget>> = Vec::new();
+    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for target in targets {
+        let key = target
+            .route_target_id
+            .clone()
+            .unwrap_or_else(|| format!("account:{}", target.account.id));
+        if let Some(idx) = positions.get(&key).copied() {
+            groups[idx].push(target);
+        } else {
+            positions.insert(key, groups.len());
+            groups.push(vec![target]);
+        }
+    }
+
+    for group in &mut groups {
+        *group = order_route_account_candidates(std::mem::take(group));
+    }
+
     match route.strategy.as_str() {
         "round-robin" => {
             let counter = state.rr_counter(&route.id);
             let n = counter.fetch_add(1, Ordering::Relaxed) as usize;
-            if !targets.is_empty() {
-                let offset = n % targets.len();
-                targets.rotate_left(offset);
+            if !groups.is_empty() {
+                let offset = n % groups.len();
+                groups.rotate_left(offset);
             }
         }
         "weighted" => {
             use rand::Rng;
-            let total: i64 = targets.iter().map(|t| t.weight.max(1)).sum();
+            let total: i64 = groups
+                .iter()
+                .filter_map(|g| g.first())
+                .map(|t| t.weight.max(1))
+                .sum();
             if total > 0 {
                 let mut pick = rand::thread_rng().gen_range(0..total);
                 let mut idx = 0;
-                for (i, t) in targets.iter().enumerate() {
-                    pick -= t.weight.max(1);
+                for (i, group) in groups.iter().enumerate() {
+                    let weight = group.first().map(|t| t.weight.max(1)).unwrap_or(1);
+                    pick -= weight;
                     if pick < 0 {
                         idx = i;
                         break;
                     }
                 }
-                targets.rotate_left(idx);
+                groups.rotate_left(idx);
             }
         }
         "least-used" => {
-            // Order by lifetime request count ascending (priority tiebreak).
             let (_, by_account) = db::lifetime_totals(&state.pool).await.unwrap_or_default();
-            targets.sort_by_key(|t| {
-                (
-                    by_account.get(&t.account.id).map(|(n, _)| *n).unwrap_or(0),
-                    t.priority,
-                )
+            groups.sort_by_key(|group| {
+                let requests = group
+                    .iter()
+                    .map(|t| by_account.get(&t.account.id).map(|(n, _)| *n).unwrap_or(0))
+                    .min()
+                    .unwrap_or(0);
+                let priority = group.first().map(|t| t.priority).unwrap_or(i64::MAX);
+                (requests, priority)
             });
         }
         _ => {
-            // priority (default): lowest priority number first, keep insertion order.
-            targets.sort_by_key(|t| t.priority);
+            groups.sort_by_key(|group| group.first().map(|t| t.priority).unwrap_or(i64::MAX));
         }
     }
-    targets
+
+    groups.into_iter().flatten().collect()
 }
 
 /// Apply a route's continuity/portability policy when falling back across
@@ -2250,6 +2290,7 @@ pub async fn dry_run(
                         account,
                         model: model.clone(),
                         provider: provider.clone(),
+                        route_target_id: None,
                         priority: 1,
                         weight: 1,
                         predicate: TargetPredicate::default(),
@@ -2292,7 +2333,9 @@ pub async fn dry_run(
         };
         let elig = predicate::eligibility(&t.predicate, &request_facts, &tgt_facts);
         let status = pool::effective_status(&t.account);
-        let healthy = matches!(status, pool::AccountStatus::Healthy);
+        let half_open_probe =
+            matches!(status, pool::AccountStatus::CircuitOpen) && pool::should_probe(&t.account);
+        let account_eligible = matches!(status, pool::AccountStatus::Healthy) || half_open_probe;
         let caps_ok = t.model.caps().satisfies(&needs) || !t.provider.strict();
         let ctx_ok = t
             .model
@@ -2303,7 +2346,7 @@ pub async fn dry_run(
             || descriptor.allowed_providers.contains(&t.provider.id);
         let quota_ok = !descriptor.soft_quota_reached;
         let would_select =
-            elig.eligible && healthy && caps_ok && ctx_ok && provider_allowed && quota_ok;
+            elig.eligible && account_eligible && caps_ok && ctx_ok && provider_allowed && quota_ok;
         if would_select && selected.is_none() {
             selected = Some(format!("{} @ {}", t.model.display_name, t.account.label));
         }
@@ -2313,7 +2356,7 @@ pub async fn dry_run(
         if !elig.eligible {
             reasons.push("predicate");
         }
-        if !healthy {
+        if !account_eligible {
             reasons.push("account_state");
         }
         if !caps_ok {
@@ -2337,6 +2380,8 @@ pub async fn dry_run(
             "account": t.account.label,
             "account_id": t.account.id,
             "account_status": status.as_str(),
+            "half_open_probe": half_open_probe,
+            "route_target_id": t.route_target_id.as_deref(),
             "priority": t.priority,
             "weight": t.weight,
             "predicate_result": elig.result.as_str(),
