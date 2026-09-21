@@ -645,8 +645,25 @@ export const PluginsView: React.FC = () => {
       </div>
 
       {manualAuth && (
-        <WobblyCard decoration="tape" className="p-5">
-          <h3 className="text-xl font-heading font-bold flex items-center gap-2">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/45 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="oauth-waiting-title"
+        >
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+            <WobblyCard decoration="tape" className="p-5 bg-[var(--paper)] relative">
+              <button
+                type="button"
+                onClick={() => setManualAuth(null)}
+                disabled={busy !== null}
+                className="absolute top-3 right-3 w-8 h-8 flex items-center justify-center border-2 border-[var(--ink)] bg-[var(--surface)] hover:bg-[var(--tint-red)] font-heading font-bold cursor-pointer disabled:opacity-50"
+                aria-label="Cancel OAuth authorization"
+                title="Cancel"
+              >
+                ✕
+              </button>
+          <h3 id="oauth-waiting-title" className="text-xl font-heading font-bold flex items-center gap-2 pr-10">
             <LogIn className="w-5 h-5 text-[var(--pen-blue)]" />
             Waiting for OAuth authorization
           </h3>
@@ -716,7 +733,9 @@ export const PluginsView: React.FC = () => {
               </SketchButton>
             </div>
           )}
-        </WobblyCard>
+            </WobblyCard>
+          </div>
+        </div>
       )}
 
       {error && (
