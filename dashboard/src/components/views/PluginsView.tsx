@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   Box,
   CheckCircle2,
-  Cpu,
   KeyRound,
   LogIn,
   Network,
@@ -17,7 +16,6 @@ import {
   Upload,
 } from 'lucide-react';
 import {
-  DiscoveredModel,
   Kinetix,
   PluginCatalogEntry,
   PluginCatalogPreview,
@@ -89,9 +87,6 @@ export const PluginsView: React.FC = () => {
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string | boolean>>({});
   const [rollbackPreview, setRollbackPreview] = useState<PluginRollbackPreview | null>(null);
   const [catalogPreview, setCatalogPreview] = useState<PluginCatalogPreview | null>(null);
-  const [discoveryProviderId, setDiscoveryProviderId] = useState<string | null>(null);
-  const [discoveredModels, setDiscoveredModels] = useState<DiscoveredModel[]>([]);
-  const [discoveringModels, setDiscoveringModels] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -171,53 +166,6 @@ export const PluginsView: React.FC = () => {
     }
   }, [loadDetail, selectedId]);
 
-  const discoverProviderModels = useCallback(async (providerId: string) => {
-    setDiscoveryProviderId(providerId);
-    setDiscoveringModels(true);
-    setError(null);
-    try {
-      const models = await Kinetix.discover(providerId);
-      setDiscoveredModels(models);
-      if (models.length === 0) {
-        setNotice('Account connected. The upstream model catalog returned no models.');
-      }
-    } catch (err) {
-      setDiscoveredModels([]);
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setDiscoveringModels(false);
-    }
-  }, []);
-
-  const importDiscoveredModel = async (providerId: string, model: DiscoveredModel) => {
-    setBusy(`model:${model.id}`);
-    setError(null);
-    try {
-      await Kinetix.createModel(providerId, {
-        upstream_id: model.id,
-        display_name: model.display_name ?? model.id,
-        enabled: true,
-        context_window: model.context_window ?? null,
-        max_output_tokens: model.max_output_tokens ?? null,
-        capabilities: {},
-        prices: {},
-        parameters: {},
-        thinking_map: {},
-        extra_request: {},
-      });
-      setDiscoveredModels((current) =>
-        current.map((item) =>
-          item.id === model.id ? { ...item, already_imported: true } : item,
-        ),
-      );
-      setNotice(`Imported model ${model.display_name ?? model.id}.`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  };
-
   const handleRefreshCatalog = async () => {
     setRefreshingCatalog(true);
     setError(null);
@@ -256,7 +204,6 @@ export const PluginsView: React.FC = () => {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const authResult = params.get('plugin_auth');
-    const authProviderId = params.get('plugin_auth_provider');
     if (authResult) {
       const messages: Record<string, string> = {
         success: 'Account connected successfully through the plugin authorization flow.',
@@ -267,10 +214,7 @@ export const PluginsView: React.FC = () => {
       };
       const message = messages[authResult] ?? 'Account authorization returned an unknown result.';
       if (authResult === 'success') {
-        setNotice(message);
-        if (authProviderId) {
-          void discoverProviderModels(authProviderId);
-        }
+        setNotice('Account connected successfully. Discover and configure models in Providers & Models.');
       } else {
         setError(message);
       }
@@ -606,13 +550,9 @@ export const PluginsView: React.FC = () => {
         const status = await Kinetix.pluginAuthStatus(manualAuth.state);
         if (cancelled || status.result === 'pending') return;
         if (status.result === 'success') {
-          const providerId = status.provider_id ?? manualAuth.providerId;
           setManualAuth(null);
-          setNotice('Account connected successfully.');
+          setNotice('Account connected successfully. Discover and configure models in Providers & Models.');
           await refresh(selectedId);
-          if (providerId) {
-            void discoverProviderModels(providerId);
-          }
           return;
         }
         setManualAuth(null);
@@ -635,7 +575,7 @@ export const PluginsView: React.FC = () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [manualAuth?.state, manualAuth?.providerId, discoverProviderModels, refresh, selectedId]);
+  }, [manualAuth?.state, manualAuth?.providerId, refresh, selectedId]);
 
   const completeManualAuth = async () => {
     if (!manualAuth?.callbackUrl.trim()) return;
@@ -652,13 +592,9 @@ export const PluginsView: React.FC = () => {
               : 'Account authorization failed during token exchange.',
         );
       }
-      const providerId = result.provider_id ?? manualAuth.providerId;
       setManualAuth(null);
-      setNotice('Account connected successfully through the manual OAuth fallback.');
+      setNotice('Account connected successfully through the manual OAuth fallback. Discover and configure models in Providers & Models.');
       await refresh(selectedId);
-      if (providerId) {
-        void discoverProviderModels(providerId);
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -796,70 +732,6 @@ export const PluginsView: React.FC = () => {
         </div>
       )}
 
-      {discoveryProviderId && (
-        <WobblyCard decoration="tape" className="p-5">
-          <div className="flex flex-col md:flex-row md:items-start gap-4">
-            <div className="flex-1">
-              <h3 className="text-xl font-heading font-bold flex items-center gap-2">
-                <Cpu className="w-5 h-5 text-[var(--pen-blue)]" />
-                Connected account models
-              </h3>
-              <p className="text-sm font-body text-[var(--ink)]/70">
-                Discovery uses the provider&apos;s scoped account through the plugin host. Importing
-                a model creates Kinetix configuration; unknown metadata stays unknown.
-              </p>
-            </div>
-            <SketchButton
-              variant="secondary"
-              disabled={busy !== null || discoveringModels}
-              onClick={() => void discoverProviderModels(discoveryProviderId)}
-            >
-              <RefreshCw className={`w-4 h-4 ${discoveringModels ? 'animate-spin' : ''}`} />
-              {discoveringModels ? 'Discovering…' : 'Discover again'}
-            </SketchButton>
-          </div>
-
-          {!discoveringModels && discoveredModels.length > 0 && (
-            <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-3">
-              {discoveredModels.map((model) => (
-                <div
-                  key={model.id}
-                  className="p-3 border-2 border-[var(--ink)]/20 bg-[var(--surface)]"
-                >
-                  <div className="font-heading font-bold">
-                    {model.display_name ?? model.id}
-                  </div>
-                  <code className="text-xs text-[var(--ink)]/55 break-all">{model.id}</code>
-                  <div className="mt-2 text-xs font-mono text-[var(--ink)]/60">
-                    {model.context_window
-                      ? `${model.context_window.toLocaleString()} context`
-                      : 'context unknown'}
-                    {' · '}
-                    {model.max_output_tokens
-                      ? `${model.max_output_tokens.toLocaleString()} max output`
-                      : 'max output unknown'}
-                  </div>
-                  <div className="mt-3">
-                    {model.already_imported ? (
-                      <SketchBadge variant="green">Imported</SketchBadge>
-                    ) : (
-                      <SketchButton
-                        variant="primary"
-                        disabled={busy !== null}
-                        onClick={() =>
-                          void importDiscoveredModel(discoveryProviderId, model)
-                        }
-                      >
-                        {busy === `model:${model.id}` ? 'Importing…' : 'Import model'}
-                      </SketchButton>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </WobblyCard>
-      )}
 
       {showInstall && (
         <WobblyCard decoration="tape" className="p-5">
