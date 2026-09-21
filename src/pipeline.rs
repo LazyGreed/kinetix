@@ -2299,9 +2299,7 @@ async fn drive_aggregate(
     model_name: String,
     mut trace: RouteTrace,
 ) -> AggregateResult {
-    let mut upstream = attempt.stream.take();
     let adapter = attempt.adapter.clone();
-    let mut framer = crate::sse::SseFramer::new();
     let mut events: Vec<StreamEvent> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut status = "success";
@@ -2309,47 +2307,101 @@ async fn drive_aggregate(
     let mut error_message: Option<String> = None;
     let mut committed = false;
 
-    'outer: while let Some(chunk) = upstream.chunk().await.transpose() {
-        match chunk {
-            Ok(bytes) => {
-                for frame in framer.push(&bytes) {
-                    let Some(payload) = crate::sse::extract_data(&frame) else {
-                        continue;
-                    };
-                    if payload.trim() == "[DONE]" {
-                        continue;
-                    }
-                    match adapter.parse_stream_chunk(&payload) {
-                        Ok(evs) => {
-                            for ev in evs {
-                                if let StreamEvent::Usage(u) = &ev {
-                                    usage.merge(u);
-                                }
-                                events.push(ev);
-                            }
-                        }
-                        Err(f) => {
+    if let Some(full_events) = attempt.full_events.take() {
+        for event in full_events {
+            if let StreamEvent::Usage(value) = &event {
+                usage.merge(value);
+            }
+            events.push(event);
+        }
+        committed = true;
+        trace.commit();
+    } else {
+        let upstream = attempt.stream.take().expect("validated SSE stream present");
+        let prefetched = std::mem::take(&mut attempt.prefetched);
+        let replay = futures::stream::iter(
+            prefetched
+                .into_iter()
+                .map(Ok::<Bytes, reqwest::Error>),
+        );
+        let chunks = replay.chain(upstream.bytes_stream());
+        tokio::pin!(chunks);
+
+        let mut framer = crate::sse::SseFramer::new();
+        let mut terminal_seen = false;
+
+        'outer: while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let frames = match framer.push(&bytes) {
+                        Ok(frames) => frames,
+                        Err(error) => {
                             status = "stream_error";
                             status_code = 502;
-                            error_message = Some(f.message);
+                            error_message = Some(error.to_string());
+                            break;
+                        }
+                    };
+                    for frame in frames {
+                        let Some(payload) = crate::sse::extract_data(&frame) else {
+                            continue;
+                        };
+                        if payload.trim() == "[DONE]" {
+                            terminal_seen = true;
+                            continue;
+                        }
+                        if let Some(failure) = payload_error_failure(&adapter, &payload) {
+                            status = "stream_error";
+                            status_code = 502;
+                            error_message = Some(failure.message);
                             break 'outer;
+                        }
+                        match adapter.parse_stream_chunk(&payload) {
+                            Ok(parsed) => {
+                                if payload_is_terminal(&payload, &parsed) {
+                                    terminal_seen = true;
+                                }
+                                for event in parsed {
+                                    if let StreamEvent::Usage(value) = &event {
+                                        usage.merge(value);
+                                    }
+                                    events.push(event);
+                                }
+                            }
+                            Err(failure) => {
+                                status = "stream_error";
+                                status_code = 502;
+                                error_message = Some(failure.message);
+                                break 'outer;
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                status = "stream_error";
-                status_code = 502;
-                error_message = Some(classify_reqwest(&e));
-                break;
+                Err(error) => {
+                    status = "stream_error";
+                    status_code = 502;
+                    error_message = Some(classify_reqwest(&error));
+                    break;
+                }
             }
         }
-    }
 
-    // The aggregated response is committed as a whole (no streaming).
-    if status == "success" {
-        committed = true;
-        trace.commit();
+        if status == "success" && framer.pending_bytes() > 0 {
+            status = "stream_error";
+            status_code = 502;
+            error_message = Some("upstream SSE ended with an incomplete frame".into());
+        } else if status == "success" && !terminal_seen {
+            status = "stream_error";
+            status_code = 502;
+            error_message = Some("upstream SSE ended before a terminal event".into());
+        }
+
+        // Aggregated responses do not commit client bytes until the entire
+        // upstream lifecycle is known to be complete.
+        if status == "success" {
+            committed = true;
+            trace.commit();
+        }
     }
 
     finalize_log(
@@ -2384,8 +2436,6 @@ async fn drive_aggregate(
     }
 
     let body = frontends::aggregate(format, &model_name, &encoder_ctx.request_id, events, &usage);
-    // Non-streaming responses are fully materialized here, so they can be
-    // logged (redacted, short retention) when the key opts in (FR-6.5).
     if let Some(k) = &key {
         if k.body_logging != 0 {
             let _ = db::insert_body_log(
