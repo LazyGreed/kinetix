@@ -36,7 +36,20 @@ pub struct PluginAuthSession {
     /// Opaque admin session token that initiated the flow. The browser callback
     /// must present the same session, so a leaked `state` alone cannot complete
     /// account enrollment.
+    pub(crate) initiator: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginAuthStatus {
+    pub result: String,
+    pub provider_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CompletedPluginAuth {
     initiator: String,
+    status: PluginAuthStatus,
     expires_at: Instant,
 }
 
@@ -48,12 +61,14 @@ pub struct PluginAuthStart {
 
 pub struct PluginAuthSessions {
     inner: Mutex<HashMap<String, PluginAuthSession>>,
+    completed: Mutex<HashMap<String, CompletedPluginAuth>>,
 }
 
 impl PluginAuthSessions {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            completed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -101,6 +116,58 @@ impl PluginAuthSessions {
             state,
             pkce_challenge,
         }
+    }
+
+    pub fn peek(&self, state: &str, initiator: &str) -> Option<PluginAuthSession> {
+        let now = Instant::now();
+        let mut map = self.inner.lock();
+        map.retain(|_, session| session.expires_at > now);
+        let session = map.get(state)?.clone();
+        if !crate::crypto::constant_time_eq(&session.initiator, initiator) {
+            return None;
+        }
+        Some(session)
+    }
+
+    pub fn status(&self, state: &str, initiator: &str) -> Option<PluginAuthStatus> {
+        if self.peek(state, initiator).is_some() {
+            return Some(PluginAuthStatus {
+                result: "pending".into(),
+                provider_id: None,
+            });
+        }
+
+        let now = Instant::now();
+        let mut completed = self.completed.lock();
+        completed.retain(|_, entry| entry.expires_at > now);
+        let entry = completed.get(state)?;
+        if !crate::crypto::constant_time_eq(&entry.initiator, initiator) {
+            return None;
+        }
+        Some(entry.status.clone())
+    }
+
+    pub fn record_completion(
+        &self,
+        state: &str,
+        initiator: &str,
+        result: &str,
+        provider_id: Option<String>,
+    ) {
+        let now = Instant::now();
+        let mut completed = self.completed.lock();
+        completed.retain(|_, entry| entry.expires_at > now);
+        completed.insert(
+            state.to_string(),
+            CompletedPluginAuth {
+                initiator: initiator.to_string(),
+                status: PluginAuthStatus {
+                    result: result.to_string(),
+                    provider_id,
+                },
+                expires_at: now + PLUGIN_AUTH_TTL,
+            },
+        );
     }
 
     /// Consume a state token exactly once. The presented `initiator` must match
@@ -155,7 +222,7 @@ impl PluginAuthSessions {
             }
             "dev.kinetix.antigravity-oauth" => {
                 matches!(host, Some("localhost" | "127.0.0.1" | "::1"))
-                    && redirect.path() == "/admin/api/plugins/auth/callback"
+                    && redirect.path() == "/callback"
             }
             _ => false,
         };
@@ -526,7 +593,7 @@ mod plugin_auth_tests {
             "antigravity",
             "prov_1",
             "plugin:dev.kinetix.antigravity-oauth/antigravity-oauth",
-            "http://127.0.0.1:20128/admin/api/plugins/auth/callback",
+            "http://127.0.0.1:20128/callback",
             "session-token-from-localhost",
         );
 
@@ -534,10 +601,7 @@ mod plugin_auth_tests {
             .take_loopback_callback(&pending.state)
             .expect("Antigravity loopback callback should consume its one-time state");
         assert_eq!(session.plugin_id, "dev.kinetix.antigravity-oauth");
-        assert_eq!(
-            session.redirect_uri,
-            "http://127.0.0.1:20128/admin/api/plugins/auth/callback"
-        );
+        assert_eq!(session.redirect_uri, "http://127.0.0.1:20128/callback");
         assert!(sessions.take_loopback_callback(&pending.state).is_none());
     }
 
