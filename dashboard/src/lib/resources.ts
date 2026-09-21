@@ -277,6 +277,16 @@ export const Kinetix = {
   changePassword: (current_password: string, new_password: string) =>
     api.post<{ ok: boolean; note: string }>('/admin/api/password', { current_password, new_password }),
 
+  publicBaseUrl: () =>
+    api.get<{ public_base_url: string; source: 'dashboard' | 'environment'; environment_default: string }>(
+      '/admin/api/settings/public-base-url',
+    ),
+  updatePublicBaseUrl: (public_base_url: string) =>
+    api.put<{ ok: boolean; public_base_url: string; source: 'dashboard' }>(
+      '/admin/api/settings/public-base-url',
+      { public_base_url },
+    ),
+
   // --- usage exports -------------------------------------------------------
   async exports(): Promise<{ dir: string; retention_days: number; files: ExportFile[]; days: UsageDay[] }> {
     return api.get('/admin/api/exports');
@@ -433,9 +443,24 @@ export const Kinetix = {
       `/admin/api/plugins/${encodeURIComponent(pluginId)}/integrations/${encodeURIComponent(integrationId)}/provider`,
     ),
   startPluginAuth: (plugin_id: string, flow_name: string, provider_id: string) =>
-    api.post<{ authorize_url: string; state: string; expires_in_secs: number }>(
+    api.post<{
+      authorize_url: string;
+      redirect_uri: string;
+      state: string;
+      expires_in_secs: number;
+      manual_callback_supported: boolean;
+    }>(
       '/admin/api/plugins/auth/start',
       { plugin_id, flow_name, provider_id },
+    ),
+  completePluginAuth: (callback_url: string) =>
+    api.post<{ ok: boolean; result: string; provider_id?: string | null }>(
+      '/admin/api/plugins/auth/complete',
+      { callback_url },
+    ),
+  pluginAuthStatus: (state: string) =>
+    api.get<{ result: string; provider_id?: string | null }>(
+      `/admin/api/plugins/auth/status?state=${encodeURIComponent(state)}`,
     ),
   approvePluginPermissions: (id: string) =>
     api.post<{ ok: boolean; id: string; approved: PluginPermissionGrant[] }>(
