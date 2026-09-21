@@ -1603,7 +1603,6 @@ async fn stream_response(
         };
         let mut body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let watched = async_stream::stream! {
-            use tokio_stream::StreamExt as _;
             let _guard = guard;
             while let Some(v) = body_stream.next().await {
                 yield v;
