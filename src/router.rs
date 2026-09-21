@@ -43,6 +43,10 @@ pub fn build(state: AppState) -> Router {
         .route("/logout", post(admin::logout))
         .route("/me", get(admin::me))
         .route("/password", post(admin::change_password))
+        .route(
+            "/settings/public-base-url",
+            get(admin::get_public_base_url).put(admin::update_public_base_url),
+        )
         .route("/overview", get(admin::overview))
         .route("/test-stream", post(admin::test_stream))
         // keys
@@ -142,6 +146,11 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/plugins/install", post(admin::install_plugin))
         .route("/plugins/auth/start", post(admin::start_plugin_auth))
+        .route(
+            "/plugins/auth/complete",
+            post(admin::complete_plugin_auth_manual),
+        )
+        .route("/plugins/auth/status", get(admin::plugin_auth_status))
         .route("/plugins/auth/callback", get(admin::plugin_auth_callback))
         .route(
             "/plugins/{id}/integrations/{integration}/provider",
