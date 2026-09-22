@@ -147,6 +147,40 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- OpenAI-compatible SSE -------------------------------------------
     def _openai(self, model, stream, want_tools=False, tool_fragments=0, req=None):
+        if model == "syn-truncated-openai":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            def raw_frame(obj):
+                self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+                self.wfile.flush()
+                mark_write()
+
+            raw_frame({
+                "id": "upstream-openai-truncated",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }],
+            })
+            raw_frame({
+                "id": "upstream-openai-truncated",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "partial"},
+                    "finish_reason": None,
+                }],
+            })
+            return
+
         if not stream:
             body = json.dumps(
                 {
@@ -154,7 +188,18 @@ class Handler(BaseHTTPRequestHandler):
                     "object": "chat.completion",
                     "model": model,
                     "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": WORD * 4}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    f"target:{model}"
+                                    if model in ("syn-openai-a", "syn-openai-b")
+                                    else WORD * 4
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
                     ],
                     "usage": {"prompt_tokens": 100, "completion_tokens": TOKENS, "total_tokens": 100 + TOKENS},
                 }
@@ -212,9 +257,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
+            stream_word = (
+                f"target:{model}"
+                if model in ("syn-openai-a", "syn-openai-b")
+                else WORD
+            )
             for _ in range(TOKENS):
                 frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
-                       "choices": [{"index": 0, "delta": {"content": WORD}, "finish_reason": None}]})
+                       "choices": [{"index": 0, "delta": {"content": stream_word}, "finish_reason": None}]})
                 if DELAY_MS:
                     time.sleep(DELAY_MS / 1000.0)
             frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
@@ -285,7 +335,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if not stream:
-            content = [{"type": "text", "text": WORD * 4}]
+            text = (
+                f"target:{model}"
+                if model in ("syn-anthropic-a", "syn-anthropic-b")
+                else WORD * 4
+            )
+            content = [{"type": "text", "text": text}]
             self._json(200, {
                 "id": "msg_syn_1",
                 "type": "message",
@@ -353,10 +408,15 @@ class Handler(BaseHTTPRequestHandler):
                     "index": 0,
                     "content_block": {"type": "text", "text": ""},
                 })
+                text = (
+                    f"target:{model}"
+                    if model in ("syn-anthropic-a", "syn-anthropic-b")
+                    else WORD
+                )
                 event("content_block_delta", {
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": {"type": "text_delta", "text": WORD},
+                    "delta": {"type": "text_delta", "text": text},
                 })
                 event("content_block_stop", {"type": "content_block_stop", "index": 0})
                 event("message_delta", {
