@@ -119,9 +119,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     })
 }
 
-fn validate_supported_subset(
-    obj: &serde_json::Map<String, Value>,
-) -> Result<(), ProxyError> {
+fn validate_supported_subset(obj: &serde_json::Map<String, Value>) -> Result<(), ProxyError> {
     const SUPPORTED: [&str; 23] = [
         "model",
         "input",
@@ -157,7 +155,9 @@ fn validate_supported_subset(
     }
 
     if obj.get("stream").is_some_and(|value| !value.is_boolean()) {
-        return Err(ProxyError::bad_request("Responses API 'stream' must be boolean"));
+        return Err(ProxyError::bad_request(
+            "Responses API 'stream' must be boolean",
+        ));
     }
     for key in ["store", "background"] {
         if obj.get(key).is_some_and(|value| !value.is_boolean()) {
@@ -227,9 +227,9 @@ fn validate_supported_subset(
     }
 
     if let Some(text) = obj.get("text") {
-        let text = text.as_object().ok_or_else(|| {
-            ProxyError::bad_request("Responses API 'text' must be an object")
-        })?;
+        let text = text
+            .as_object()
+            .ok_or_else(|| ProxyError::bad_request("Responses API 'text' must be an object"))?;
         for key in text.keys() {
             if key != "format" {
                 return Err(ProxyError::unsupported(format!(
@@ -248,10 +248,7 @@ fn validate_supported_subset(
                     )));
                 }
             }
-            let kind = format
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("text");
+            let kind = format.get("type").and_then(Value::as_str).unwrap_or("text");
             if kind != "text" {
                 return Err(ProxyError::unsupported(
                     "Responses API structured text.format is unsupported on translated upstreams",
@@ -323,7 +320,9 @@ fn validate_supported_subset(
                         .get("name")
                         .and_then(Value::as_str)
                         .is_some_and(|name| !name.is_empty())
-                    && value.keys().all(|key| matches!(key.as_str(), "type" | "name")) => {}
+                    && value
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "type" | "name")) => {}
             Value::Null => {}
             _ => {
                 return Err(ProxyError::unsupported(
@@ -390,7 +389,11 @@ fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String
                 continue;
             }
             if tool.get("function").is_some() {
-                for key in tool.as_object().into_iter().flat_map(|object| object.keys()) {
+                for key in tool
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|object| object.keys())
+                {
                     if !matches!(key.as_str(), "type" | "function") {
                         issues.push(format!(
                             "tools[{tool_index}].{key} has unsupported function-tool semantics"
@@ -404,7 +407,11 @@ fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String
                     "tools[{tool_index}].strict=true cannot be enforced on translated upstreams"
                 ));
             }
-            for key in function.as_object().into_iter().flat_map(|object| object.keys()) {
+            for key in function
+                .as_object()
+                .into_iter()
+                .flat_map(|object| object.keys())
+            {
                 if !matches!(
                     key.as_str(),
                     "type" | "name" | "description" | "parameters" | "strict" | "function"
@@ -791,14 +798,8 @@ impl ResponsesEncoder {
                 "output": [],
                 "usage": null
             });
-            out.push(self.frame(
-                "response.created",
-                json!({ "response": resp_obj.clone() }),
-            ));
-            out.push(self.frame(
-                "response.in_progress",
-                json!({ "response": resp_obj }),
-            ));
+            out.push(self.frame("response.created", json!({ "response": resp_obj.clone() })));
+            out.push(self.frame("response.in_progress", json!({ "response": resp_obj })));
         }
     }
 
