@@ -239,8 +239,18 @@ pub fn aggregate(
             });
             // Unknown means unknown (FR-6.2/6.8): only emit detail fields the
             // upstream actually reported, never a coerced zero.
-            if let Some(c) = usage.cached {
-                usage_obj["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": c });
+            let mut prompt_details = serde_json::Map::new();
+            if let Some(cached) = usage.cached {
+                prompt_details.insert("cached_tokens".into(), serde_json::json!(cached));
+            }
+            if let Some(cache_write) = usage.cache_write {
+                prompt_details.insert(
+                    "cache_write_tokens".into(),
+                    serde_json::json!(cache_write),
+                );
+            }
+            if !prompt_details.is_empty() {
+                usage_obj["prompt_tokens_details"] = Value::Object(prompt_details);
             }
             if let Some(t) = usage.thinking {
                 usage_obj["completion_tokens_details"] =
@@ -319,6 +329,9 @@ pub fn aggregate(
             });
             if let Some(c) = usage.cached {
                 usage_obj["cache_read_input_tokens"] = serde_json::json!(c);
+            }
+            if let Some(c) = usage.cache_write {
+                usage_obj["cache_creation_input_tokens"] = serde_json::json!(c);
             }
             serde_json::json!({
                 "id": format!("msg_{}", request_id.replace(['-','_'], "")),
