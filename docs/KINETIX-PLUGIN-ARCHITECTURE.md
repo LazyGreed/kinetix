@@ -1465,8 +1465,14 @@ aspiration. It is a living list: update it as later phases land.
   outbound streaming HTTP send and SSE framing, so the adapter world imports **no
   network capability at all**. The host-side `PluginAdapter` (`src/plugins/adapter.rs`)
   implements the core `Adapter` trait and bridges the synchronous trait onto the
-  async guest via `block_in_place`. Canonical events and failure evidence cross
-  the boundary as tagged JSON. This **supersedes** the `host-http-stream`
+  async guest via `block_in_place`. Canonical requests cross the boundary as
+  versioned `kinetix.plugin.request` JSON (`schema_version = 1`) including full
+  tool-choice mode/name, thinking level, sampling controls, penalties, usage
+  preference, and extension fields. Adapter auth/body transforms are fallible:
+  malformed output or guest faults become typed attempt failures before network
+  dispatch, so route fallback policy can act on the failure kind and Kinetix
+  never sends an unauthenticated or `null` degraded request. Canonical events
+  and failure evidence cross the boundary as tagged JSON. This **supersedes** the `host-http-stream`
   design in §7.1: because core owns transport, an adapter needs no streaming
   host capability and the buffered `host-http` import is refused to adapter
   stores. A provider bound with `wire_plugin` resolves to its plugin adapter at
