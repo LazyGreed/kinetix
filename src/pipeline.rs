@@ -3422,6 +3422,7 @@ async fn finalize_log(
         input_tokens: usage.input.map(|v| v as i64),
         output_tokens: usage.output.map(|v| v as i64),
         cached_tokens: usage.cached.map(|v| v as i64),
+        cache_write_tokens: usage.cache_write.map(|v| v as i64),
         thinking_tokens: usage.thinking.map(|v| v as i64),
         cost_usd: cost,
         cost_known: cost_known as i64,
