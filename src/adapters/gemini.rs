@@ -32,11 +32,15 @@ impl GeminiAdapter {
         for p in parts {
             match p {
                 Part::Text(t) => out.push(json!({ "text": t })),
-                Part::Thinking { text, .. } => {
-                    // Preserve thinking as a thought part so multi-turn history
-                    // stays valid for the same provider (FR-12.10).
-                    if !text.is_empty() {
-                        out.push(json!({ "text": text, "thought": true }));
+                Part::Thinking { text, signature } => {
+                    // Preserve Gemini reasoning state when the target can carry
+                    // it. Signature-only parts are valid continuation state.
+                    if !text.is_empty() || signature.is_some() {
+                        let mut part = json!({ "text": text, "thought": true });
+                        if let Some(sig) = signature {
+                            part["thoughtSignature"] = json!(sig);
+                        }
+                        out.push(part);
                     }
                 }
                 Part::Image(img) => match img {
