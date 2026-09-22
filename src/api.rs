@@ -284,3 +284,50 @@ pub fn error_response(format: FrontendFormat, request_id: &str, err: ProxyError)
         .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| Response::new(Body::from("internal error")))
 }
+
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn claude_code_session_header_drives_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            "session-claude-code-1".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_session(&headers).as_deref(),
+            Some("session-claude-code-1")
+        );
+    }
+
+    #[test]
+    fn only_safe_anthropic_protocol_headers_are_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert(
+            "anthropic-beta",
+            "prompt-caching-2024-07-31".parse().unwrap(),
+        );
+        headers.insert(
+            "x-claude-code-session-id",
+            "session-secret-ish-context".parse().unwrap(),
+        );
+        headers.insert("authorization", "Bearer client-secret".parse().unwrap());
+
+        let forwarded = extract_protocol_headers(FrontendFormat::Anthropic, &headers);
+        assert_eq!(
+            forwarded,
+            vec![
+                ("anthropic-version".into(), "2023-06-01".into()),
+                (
+                    "anthropic-beta".into(),
+                    "prompt-caching-2024-07-31".into()
+                ),
+            ]
+        );
+        assert!(extract_protocol_headers(FrontendFormat::OpenAi, &headers).is_empty());
+    }
+}
