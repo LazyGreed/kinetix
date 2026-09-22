@@ -95,7 +95,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     // Responses input is always translated through Kinetix's canonical model;
     // there is no native Responses passthrough. Unknown top-level semantics are
     // rejected by validate_supported_subset instead of being carried as extras.
-    let mut extra = serde_json::Map::new();
+    let extra = serde_json::Map::new();
     let identity_issues = crate::frontends::resolve_tool_result_names(&mut out_messages);
     if let Some(issue) = identity_issues.first() {
         return Err(ProxyError::unsupported(format!(
@@ -156,6 +156,37 @@ fn validate_supported_subset(
         }
     }
 
+    if obj.get("stream").is_some_and(|value| !value.is_boolean()) {
+        return Err(ProxyError::bad_request("Responses API 'stream' must be boolean"));
+    }
+    for key in ["store", "background"] {
+        if obj.get(key).is_some_and(|value| !value.is_boolean()) {
+            return Err(ProxyError::bad_request(format!(
+                "Responses API '{key}' must be boolean"
+            )));
+        }
+    }
+    for key in [
+        "temperature",
+        "top_p",
+        "top_k",
+        "presence_penalty",
+        "frequency_penalty",
+    ] {
+        if obj.get(key).is_some_and(|value| !value.is_number()) {
+            return Err(ProxyError::bad_request(format!(
+                "Responses API '{key}' must be numeric"
+            )));
+        }
+    }
+    for key in ["max_output_tokens", "max_tokens"] {
+        if obj.get(key).is_some_and(|value| value.as_u64().is_none()) {
+            return Err(ProxyError::bad_request(format!(
+                "Responses API '{key}' must be a non-negative integer"
+            )));
+        }
+    }
+
     if obj.get("store").and_then(Value::as_bool) == Some(true) {
         return Err(ProxyError::unsupported(
             "Responses API 'store: true' is unsupported; Kinetix does not persist response objects",
@@ -176,14 +207,15 @@ fn validate_supported_subset(
             "Responses API response metadata storage is unsupported",
         ));
     }
-    if obj
-        .get("include")
-        .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty())
-    {
-        return Err(ProxyError::unsupported(
-            "Responses API 'include' expansions are unsupported",
-        ));
+    if let Some(include) = obj.get("include") {
+        let items = include
+            .as_array()
+            .ok_or_else(|| ProxyError::bad_request("Responses API 'include' must be an array"))?;
+        if !items.is_empty() {
+            return Err(ProxyError::unsupported(
+                "Responses API 'include' expansions are unsupported",
+            ));
+        }
     }
 
     if let Some(truncation) = obj.get("truncation").and_then(Value::as_str) {
@@ -206,6 +238,16 @@ fn validate_supported_subset(
             }
         }
         if let Some(format) = text.get("format") {
+            let format = format.as_object().ok_or_else(|| {
+                ProxyError::bad_request("Responses API 'text.format' must be an object")
+            })?;
+            for key in format.keys() {
+                if key != "type" {
+                    return Err(ProxyError::unsupported(format!(
+                        "Responses API text.format.{key} is unsupported"
+                    )));
+                }
+            }
             let kind = format
                 .get("type")
                 .and_then(Value::as_str)
@@ -250,6 +292,26 @@ fn validate_supported_subset(
                 )));
             }
         }
+        if let Some(effort) = reasoning.get("effort") {
+            let effort = effort.as_str().ok_or_else(|| {
+                ProxyError::bad_request("Responses API reasoning.effort must be a string")
+            })?;
+            if map_reasoning_effort(effort).is_none() {
+                return Err(ProxyError::unsupported(format!(
+                    "Responses API reasoning effort '{effort}' is unsupported"
+                )));
+            }
+        }
+    }
+    if let Some(effort) = obj.get("reasoning_effort") {
+        let effort = effort.as_str().ok_or_else(|| {
+            ProxyError::bad_request("Responses API reasoning_effort must be a string")
+        })?;
+        if map_reasoning_effort(effort).is_none() {
+            return Err(ProxyError::unsupported(format!(
+                "Responses API reasoning effort '{effort}' is unsupported"
+            )));
+        }
     }
 
     if let Some(choice) = obj.get("tool_choice") {
@@ -257,7 +319,11 @@ fn validate_supported_subset(
             Value::String(value) if matches!(value.as_str(), "auto" | "none" | "required") => {}
             Value::Object(value)
                 if value.get("type").and_then(Value::as_str) == Some("function")
-                    && value.get("name").and_then(Value::as_str).is_some() => {}
+                    && value
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                    && value.keys().all(|key| matches!(key.as_str(), "type" | "name")) => {}
             Value::Null => {}
             _ => {
                 return Err(ProxyError::unsupported(
@@ -322,6 +388,15 @@ fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String
                     "tools[{tool_index}] type '{kind}' has no canonical cross-format representation"
                 ));
                 continue;
+            }
+            if tool.get("function").is_some() {
+                for key in tool.as_object().into_iter().flat_map(|object| object.keys()) {
+                    if !matches!(key.as_str(), "type" | "function") {
+                        issues.push(format!(
+                            "tools[{tool_index}].{key} has unsupported function-tool semantics"
+                        ));
+                    }
+                }
             }
             let function = tool.get("function").unwrap_or(tool);
             if function.get("strict").and_then(Value::as_bool) == Some(true) {
