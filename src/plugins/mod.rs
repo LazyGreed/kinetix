@@ -13,6 +13,7 @@ pub mod manager;
 pub mod manifest;
 pub mod package;
 pub mod runtime;
+pub mod response_contract;
 pub mod store;
 pub mod types;
 

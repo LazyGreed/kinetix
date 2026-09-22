@@ -34,7 +34,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 - **Plugin Host (`src/plugins/`, `wit/`)**:
   - WebAssembly Component Model runtime powered by `wasmtime` 48.
   - WIT contract defined in `wit/kinetix-plugin.wit` with host capabilities (HTTP egress, logging, key-value storage, credential refreshing).
-  - Provider adapters receive the versioned `kinetix.plugin.request` canonical JSON contract; auth/body transform failures are typed and fail closed before any upstream request is sent.
+  - Provider adapters receive the versioned `kinetix.plugin.request` canonical JSON contract and emit `kinetix.plugin.response` v1 envelopes; response events are strictly validated at the host boundary, while auth/body transform failures fail closed before any upstream request is sent.
   - The guest SDK, first-party plugins, catalog source, and packaging tooling live in `PrightCord/kinetix-plugins`.
   - Kinetix vendors official catalog/trust snapshots under `src/plugins/` for offline discovery, and supports dynamic remote synchronization with disk caching (`catalog.cache.json`) and verified CLI / dashboard marketplace installation.
 - **CLI & Daemon Runner (`src/main.rs`, `src/cli.rs`, `src/server.rs`)**:

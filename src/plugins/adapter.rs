@@ -21,8 +21,7 @@ use crate::adapters::{Adapter, DiscoveredModel, UpstreamContext};
 use crate::plugins::manager::PluginManager;
 use crate::plugins::runtime::PluginFault;
 use crate::types::{
-    FailureKind, FinishReason, ImageData, InternalRequest, Part, ProxyError, StreamEvent,
-    TokenUsage, UpstreamFailure,
+    FailureKind, ImageData, InternalRequest, Part, ProxyError, StreamEvent, UpstreamFailure,
 };
 
 /// A plugin-backed adapter bound to one `plugin:<id>/<capability>` reference.
@@ -357,139 +356,8 @@ fn headers_to_json(headers: &reqwest::header::HeaderMap) -> String {
     serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Encode canonical stream events as a JSON array tagged by `type`.
-pub fn events_to_json(events: &[StreamEvent]) -> String {
-    let arr: Vec<Value> = events.iter().map(event_to_value).collect();
-    serde_json::to_string(&Value::Array(arr)).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn event_to_value(ev: &StreamEvent) -> Value {
-    match ev {
-        StreamEvent::Start {
-            upstream_request_id,
-        } => json!({ "type": "start", "upstream_request_id": upstream_request_id }),
-        StreamEvent::ThinkingDelta { text, signature } => {
-            json!({ "type": "thinking_delta", "text": text, "signature": signature })
-        }
-        StreamEvent::TextDelta(t) => json!({ "type": "text_delta", "text": t }),
-        StreamEvent::ToolCallStart {
-            index,
-            id,
-            name,
-            signature,
-        } => json!({
-            "type": "tool_call_start", "index": index, "id": id,
-            "name": name, "signature": signature
-        }),
-        StreamEvent::ToolCallArgsDelta { index, args } => {
-            json!({ "type": "tool_call_args_delta", "index": index, "args": args })
-        }
-        StreamEvent::Usage(u) => json!({
-            "type": "usage", "input": u.input, "output": u.output,
-            "cached": u.cached, "cache_write": u.cache_write, "thinking": u.thinking
-        }),
-        StreamEvent::Finish(r) => json!({ "type": "finish", "reason": r.as_str() }),
-    }
-}
-
-/// Decode a canonical stream-event JSON array from the guest.
-pub fn json_to_events(s: &str) -> Result<Vec<StreamEvent>, UpstreamFailure> {
-    let value: Value = serde_json::from_str(s).map_err(|e| UpstreamFailure {
-        kind: FailureKind::ServerError,
-        status: None,
-        retry_after_secs: None,
-        message: format!("plugin adapter returned invalid event JSON: {e}"),
-        quota_reset_at: None,
-    })?;
-    let arr = value.as_array().ok_or_else(|| UpstreamFailure {
-        kind: FailureKind::ServerError,
-        status: None,
-        retry_after_secs: None,
-        message: "plugin adapter event payload was not an array".to_string(),
-        quota_reset_at: None,
-    })?;
-    let mut out = Vec::with_capacity(arr.len());
-    for v in arr {
-        out.push(value_to_event(v)?);
-    }
-    Ok(out)
-}
-
-fn value_to_event(v: &Value) -> Result<StreamEvent, UpstreamFailure> {
-    let bad = |m: &str| UpstreamFailure {
-        kind: FailureKind::ServerError,
-        status: None,
-        retry_after_secs: None,
-        message: format!("plugin adapter event: {m}"),
-        quota_reset_at: None,
-    };
-    let ty = v
-        .get("type")
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| bad("missing type"))?;
-    Ok(match ty {
-        "start" => StreamEvent::Start {
-            upstream_request_id: v
-                .get("upstream_request_id")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string()),
-        },
-        "thinking_delta" => StreamEvent::ThinkingDelta {
-            text: v
-                .get("text")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-            signature: v
-                .get("signature")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string()),
-        },
-        "text_delta" => StreamEvent::TextDelta(
-            v.get("text")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-        ),
-        "tool_call_start" => StreamEvent::ToolCallStart {
-            index: v.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-            id: v.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            name: v
-                .get("name")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-            signature: v
-                .get("signature")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string()),
-        },
-        "tool_call_args_delta" => StreamEvent::ToolCallArgsDelta {
-            index: v.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-            args: v
-                .get("args")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        "usage" => StreamEvent::Usage(TokenUsage {
-            input: v.get("input").and_then(|x| x.as_u64()),
-            output: v.get("output").and_then(|x| x.as_u64()),
-            cached: v.get("cached").and_then(|x| x.as_u64()),
-            cache_write: v.get("cache_write").and_then(|x| x.as_u64()),
-            thinking: v.get("thinking").and_then(|x| x.as_u64()),
-        }),
-        "finish" => StreamEvent::Finish(match v.get("reason").and_then(|x| x.as_str()) {
-            Some("stop") => FinishReason::Stop,
-            Some("length") => FinishReason::Length,
-            Some("tool_calls") => FinishReason::ToolCalls,
-            Some("content_filter") => FinishReason::ContentFilter,
-            Some(other) => FinishReason::Other(other.to_string()),
-            None => FinishReason::Stop,
-        }),
-        other => return Err(bad(&format!("unknown event type '{other}'"))),
-    })
-}
+/// Encode/decode the versioned canonical plugin response contract.
+pub use crate::plugins::response_contract::{events_to_json, json_to_events};
 
 /// Encode classified failure evidence for the guest.
 pub fn failure_to_json(f: &UpstreamFailure) -> String {
@@ -574,7 +442,7 @@ fn _assert_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TokenUsage;
+    use crate::types::{FinishReason, TokenUsage};
 
     #[test]
     fn stream_events_round_trip() {
