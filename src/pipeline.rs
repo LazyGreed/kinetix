@@ -3457,6 +3457,7 @@ async fn finalize_log(
             "input_tokens": usage.input,
             "output_tokens": usage.output,
             "cached_tokens": usage.cached,
+            "cache_write_tokens": usage.cache_write,
             "thinking_tokens": usage.thinking,
             "cost_usd": cost,
             "latency_ms": started.elapsed().as_millis() as i64,
