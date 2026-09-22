@@ -650,6 +650,7 @@ mod tests {
         let ctx = UpstreamContext {
             provider: &p,
             model: &m,
+            account_id: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
 
@@ -665,6 +666,7 @@ mod tests {
         let ctx = UpstreamContext {
             provider: &p,
             model: &m,
+            account_id: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
@@ -686,6 +688,7 @@ mod tests {
         let ctx = UpstreamContext {
             provider: &p,
             model: &m,
+            account_id: None,
             credential: "some-opaque-or-exchanged-credential".into(),
         };
 
@@ -707,6 +710,7 @@ mod tests {
         let ctx = UpstreamContext {
             provider: &p,
             model: &m,
+            account_id: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
@@ -732,6 +736,7 @@ mod tests {
         let ctx = UpstreamContext {
             provider: &p,
             model: &m,
+            account_id: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
@@ -761,6 +766,7 @@ mod tests {
         let ctx = UpstreamContext {
             provider: &p,
             model: &m,
+            account_id: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
