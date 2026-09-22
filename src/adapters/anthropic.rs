@@ -631,6 +631,7 @@ mod tests {
             tool_choice_name: None,
             params: crate::types::SamplingParams::default(),
             stream: true,
+            include_usage: false,
             thinking: None,
             extra: Default::default(),
             raw_body: None,
