@@ -673,7 +673,6 @@ mod param_default_tests {
     }
 }
 
-
 #[cfg(test)]
 mod error_scope_tests {
     use super::*;
