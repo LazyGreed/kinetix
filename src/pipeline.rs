@@ -3901,6 +3901,27 @@ mod route_policy_tests {
     }
 
     #[test]
+    fn token_count_estimate_includes_tool_schema() {
+        let base = request();
+        let base_count = estimated_input_tokens(&base);
+
+        let mut with_tool = base;
+        with_tool.tools.push(crate::types::ToolDef {
+            name: "read_file".into(),
+            description: Some("Read a file from disk".into()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                },
+                "required": ["path"]
+            }),
+        });
+
+        assert!(estimated_input_tokens(&with_tool) > base_count);
+    }
+
+    #[test]
     fn tool_stream_indexes_are_canonical_across_chunk_local_resets() {
         let mut state = ToolStreamState::new("req_test");
         let first = state.normalize(vec![
