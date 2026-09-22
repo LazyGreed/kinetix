@@ -136,6 +136,10 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         .and_then(map_reasoning_effort);
 
     let stream = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let include_usage = obj
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // Fields we don't model: keep only genuinely unknown ones for optional forwarding.
     let mut extra = serde_json::Map::new();
@@ -172,6 +176,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         tool_choice_name,
         params,
         stream,
+        include_usage,
         thinking,
         extra,
         raw_body: None,
