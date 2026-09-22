@@ -21,16 +21,16 @@ pub fn compute_cost(prices: &Prices, usage: &TokenUsage) -> Option<f64> {
         return None;
     }
     let input = usage.input.unwrap_or(0) as f64;
-    let cached = usage.cached.unwrap_or(0) as f64;
-    let cache_write = usage.cache_write.unwrap_or(0) as f64;
     let output = usage.output.unwrap_or(0) as f64;
-    let thinking = usage.thinking.unwrap_or(0) as f64;
 
-    // Canonical input/output are inclusive totals. Breakdown dimensions must be
-    // subtracted before their provider-specific rates are applied so no token
-    // is charged twice.
-    let regular_input = (input - cached - cache_write).max(0.0);
-    let regular_output = (output - thinking).max(0.0);
+    // Canonical input/output are inclusive totals. Partition reported
+    // breakdowns within those totals so malformed overlapping detail counters
+    // can never charge more tokens than the provider-reported total.
+    let cached = (usage.cached.unwrap_or(0) as f64).min(input);
+    let cache_write = (usage.cache_write.unwrap_or(0) as f64).min(input - cached);
+    let regular_input = input - cached - cache_write;
+    let thinking = (usage.thinking.unwrap_or(0) as f64).min(output);
+    let regular_output = output - thinking;
 
     let input_price = prices.input_per_1m.unwrap_or(0.0);
     let cached_price = prices.cached_per_1m.unwrap_or(input_price);
@@ -82,6 +82,28 @@ mod tests {
         // 700k*1 + 200k*0.1 + 100k*1.25 + 750k*2 + 250k*3 = 3.095
         let cost = compute_cost(&p, &u).unwrap();
         assert!((cost - 3.095).abs() < 1e-9, "got {cost}");
+    }
+
+    #[test]
+    fn overlapping_breakdowns_never_exceed_inclusive_totals() {
+        let p = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            cached_per_1m: Some(0.5),
+            cache_write_per_1m: Some(3.0),
+            thinking_per_1m: Some(4.0),
+        };
+        let u = TokenUsage {
+            input: Some(100),
+            output: Some(50),
+            cached: Some(80),
+            cache_write: Some(80),
+            thinking: Some(100),
+        };
+        // 80 cache-read + 20 cache-write = exactly 100 input tokens.
+        // Thinking is clamped to the 50-token inclusive output total.
+        let expected = (80.0 * 0.5 + 20.0 * 3.0 + 50.0 * 4.0) / 1_000_000.0;
+        assert!((compute_cost(&p, &u).unwrap() - expected).abs() < 1e-12);
     }
 
     #[test]
