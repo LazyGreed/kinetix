@@ -168,16 +168,13 @@ pub async fn seed_if_empty(
         .await?;
         for t in &c.targets {
             let account_id = match t.account.as_deref() {
-                Some(label) => Some(
-                    account_ids
-                        .get(label)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "route '{}' target references unknown account '{}'",
-                            c.name,
-                            label
-                        ))?,
-                ),
+                Some(label) => Some(account_ids.get(label).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "route '{}' target references unknown account '{}'",
+                        c.name,
+                        label
+                    )
+                })?),
                 None => None,
             };
             let model_id = model_ids.get(&t.model).cloned();
