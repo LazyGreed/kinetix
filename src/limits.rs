@@ -9,13 +9,8 @@ use crate::types::ProxyError;
 
 pub struct KeyLimits;
 
-/// Check all per-key limits. Returns a `ProxyError` when a limit is hit.
-pub async fn enforce(
-    pool: &Pool,
-    key: &VirtualKeyRow,
-    requested_model: &str,
-) -> Result<(), ProxyError> {
-    // Status.
+/// Validate immutable per-key policy before admission.
+pub fn validate(key: &VirtualKeyRow, requested_model: &str) -> Result<(), ProxyError> {
     match key.status.as_str() {
         "revoked" => {
             return Err(ProxyError::unauthorized(
@@ -31,7 +26,6 @@ pub async fn enforce(
         _ => {}
     }
 
-    // Expiry.
     if let Some(exp) = key.expires_at.as_deref().and_then(db::parse_dt) {
         if exp <= Utc::now() {
             return Err(ProxyError::unauthorized(format!(
@@ -41,7 +35,6 @@ pub async fn enforce(
         }
     }
 
-    // Allowed models.
     if !key.permits_model(requested_model) {
         return Err(ProxyError::new(
             crate::types::ErrorKind::Forbidden,
@@ -49,78 +42,32 @@ pub async fn enforce(
         ));
     }
 
-    // RPM / TPM over the last 60 seconds. These accounting reads are the only
-    // DB access on the request path. A control-plane outage must not fail an
-    // otherwise serviceable request (NFR-2.6/2.7), so on a DB error we log and
-    // FAIL OPEN (serve) rather than reject — status/expiry/allowed-model checks
-    // above are already in-memory from the key row, and RPM/TPM/budget are the
-    // only limits that would be temporarily unenforced.
-    let since = (Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
-    let (count, tokens) = match db::key_usage_since(pool, &key.id, &since).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "usage counter unavailable; serving without RPM/TPM enforcement (control-plane degraded)");
-            return Ok(());
-        }
-    };
-
-    if let Some(rpm) = key.rpm_limit {
-        if rpm > 0 && count >= rpm {
-            return Err(ProxyError::rate_limited(
-                format!("rate limit exceeded: {rpm} requests per minute"),
-                Some(60),
-            ));
-        }
-    }
-    if let Some(tpm) = key.tpm_limit {
-        if tpm > 0 && tokens >= tpm as i64 {
-            return Err(ProxyError::rate_limited(
-                format!("token rate limit exceeded: {tpm} tokens per minute"),
-                Some(60),
-            ));
-        }
-    }
-
-    // Daily budget.
-    if let Some(daily) = key.daily_budget {
-        if daily > 0.0 {
-            let spent = match db::key_spend_since(pool, &key.id, &window_start("daily", None)).await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "spend unavailable; serving without daily-budget enforcement (control-plane degraded)");
-                    return Ok(());
-                }
-            };
-            if spent >= daily {
-                return Err(ProxyError::budget_exceeded(format!(
-                    "daily budget exceeded (${spent:.2} of ${daily:.2}); resets at 00:00 UTC"
-                )));
-            }
-        }
-    }
-
-    // Monthly budget.
-    if let Some(monthly) = key.monthly_budget {
-        if monthly > 0.0 {
-            let spent = match db::key_spend_since(pool, &key.id, &window_start("monthly", None))
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "spend unavailable; serving without monthly-budget enforcement (control-plane degraded)");
-                    return Ok(());
-                }
-            };
-            if spent >= monthly {
-                return Err(ProxyError::budget_exceeded(format!(
-                    "monthly budget exceeded (${spent:.2} of ${monthly:.2}); resets on the 1st"
-                )));
-            }
-        }
-    }
-
     Ok(())
+}
+
+/// Atomically reserve RPM/TPM/budget capacity for an inference request.
+pub async fn reserve(
+    controller: &crate::admission::AdmissionController,
+    pool: &Pool,
+    snapshot: &crate::registry::Snapshot,
+    key: &VirtualKeyRow,
+    req: &crate::types::InternalRequest,
+) -> Result<crate::admission::AdmissionReservation, ProxyError> {
+    validate(key, &req.requested_model)?;
+    controller.reserve(pool, snapshot, key, req).await
+}
+
+/// Check current admission state without consuming capacity. Used by read-like
+/// endpoints such as token counting that should honor an already-exhausted key
+/// but should not themselves create inference usage.
+pub async fn check_current(
+    controller: &crate::admission::AdmissionController,
+    pool: &Pool,
+    key: &VirtualKeyRow,
+    requested_model: &str,
+) -> Result<(), ProxyError> {
+    validate(key, requested_model)?;
+    controller.check_current(pool, key).await
 }
 
 /// Current spend for a key within the daily/monthly windows (for the dashboard).
