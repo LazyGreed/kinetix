@@ -1394,7 +1394,8 @@ fn extract_upstream_request_id(resp: &reqwest::Response) -> Option<String> {
         .map(String::from)
 }
 
-/// React to a key-level failure: cooldown / exhaustion / disable / circuit.
+/// Record the state consequence of a classified upstream failure. Target-local
+/// and request-local failures are traced but never mutate account health.
 async fn handle_key_failure(
     state: &AppState,
     target: &ResolvedTarget,
@@ -1450,21 +1451,32 @@ async fn handle_key_failure(
                 Some(&failure.message),
             )
             .await;
-            let d = format!("{label}:5xx(cooldown 10s)");
+            let d = format!("{label}:transient(cooldown 10s)");
+            meta.fallback_path.push(d.clone());
+            d
+        }
+        FailureKind::TargetError => {
+            let d = format!("{label}:target_error");
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::BadRequest => format!("{label}:bad_request"),
     };
-    // Circuit breaker (FR-4.7).
-    let n = pool::record_failure(
-        &state.pool,
-        account_id,
-        CIRCUIT_THRESHOLD,
-        CIRCUIT_OPEN_SECS,
-    )
-    .await
-    .unwrap_or(0);
+
+    let n = if failure.kind.affects_account() {
+        // Circuit breaker (FR-4.7) tracks failures attributable to the selected
+        // account/upstream path, never model-local permission/not-found errors.
+        pool::record_failure(
+            &state.pool,
+            account_id,
+            CIRCUIT_THRESHOLD,
+            CIRCUIT_OPEN_SECS,
+        )
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
     trace.step("attempt", Some(label), detail);
     if n >= CIRCUIT_THRESHOLD {
         trace.step(
@@ -1473,8 +1485,10 @@ async fn handle_key_failure(
             format!("circuit opened for account after {n} consecutive failures"),
         );
     }
-    // Refresh the registry snapshot so later requests see the new status.
-    let _ = state.registry.reload(&state.pool).await;
+    if failure.kind.affects_account() {
+        // Refresh the registry snapshot so later requests see the new status.
+        let _ = state.registry.reload(&state.pool).await;
+    }
 }
 
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
@@ -1487,6 +1501,11 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             "upstream authentication failed for provider '{}'",
             target.provider.name
         )),
+        FailureKind::TargetError => match failure.status {
+            Some(403) => ProxyError::new(crate::types::ErrorKind::Forbidden, failure.message.clone()),
+            Some(404) => ProxyError::not_found(failure.message.clone()),
+            _ => ProxyError::upstream(failure.message.clone()),
+        },
         FailureKind::Timeout => ProxyError::upstream("upstream request timed out".to_string()),
         FailureKind::ConnectionError | FailureKind::ServerError => {
             ProxyError::upstream(failure.message.clone())
