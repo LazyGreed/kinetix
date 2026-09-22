@@ -31,6 +31,7 @@ fn extract_session(headers: &HeaderMap) -> Option<String> {
     // it is a stable per-conversation identifier, not a guessed one.
     for name in [
         "x-kinetix-session",
+        "x-claude-code-session-id",
         "x-session-id",
         // Pi's `sessionAffinityFormat: "openai"` uses the underscore spelling.
         "session_id",
@@ -45,6 +46,26 @@ fn extract_session(headers: &HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_protocol_headers(
+    format: FrontendFormat,
+    headers: &HeaderMap,
+) -> Vec<(String, String)> {
+    if format != FrontendFormat::Anthropic {
+        return Vec::new();
+    }
+    ["anthropic-version", "anthropic-beta"]
+        .into_iter()
+        .filter_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// Shared entry for both inbound frontends.
@@ -99,6 +120,7 @@ async fn handle(
 
     // 4. Run the pipeline.
     let session = extract_session(&headers);
+    let protocol_headers = extract_protocol_headers(format, &headers);
     match pipeline::run(
         &state,
         format,
@@ -107,6 +129,7 @@ async fn handle(
         request_id.clone(),
         true,
         session,
+        protocol_headers,
     )
     .await
     {
@@ -236,14 +259,23 @@ pub async fn healthz(State(state): State<AppState>) -> Response {
 pub fn error_response(format: FrontendFormat, request_id: &str, err: ProxyError) -> Response {
     let status =
         StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let body = frontends::models::error_body(format, &err);
+    let body = err
+        .body_override
+        .clone()
+        .unwrap_or_else(|| frontends::models::error_body(format, &err));
 
     let mut builder = Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .header("x-request-id", request_id);
+    let has_retry_after = err
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("retry-after"));
     if let Some(retry) = err.retry_after_secs {
-        builder = builder.header("retry-after", retry.to_string());
+        if !has_retry_after {
+            builder = builder.header("retry-after", retry.to_string());
+        }
     }
     for (k, v) in &err.headers {
         builder = builder.header(k, v);
