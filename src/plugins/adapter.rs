@@ -648,8 +648,12 @@ mod tests {
     }
 
     #[test]
-    fn request_json_carries_core_facts_only() {
-        use crate::types::{InternalRequest, Message, Part, Role};
+    fn request_json_exposes_versioned_canonical_contract() {
+        use crate::types::{
+            InternalRequest, Message, Part, Role, SamplingParams, ThinkingLevel, ToolChoice,
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("provider_hint".into(), json!("value"));
         let req = InternalRequest {
             requested_model: "gemini-3".into(),
             system: vec!["sys".into()],
@@ -658,18 +662,62 @@ mod tests {
                 parts: vec![Part::Text("hello".into())],
             }],
             tools: Vec::new(),
-            tool_choice: None,
-            tool_choice_name: None,
-            params: Default::default(),
+            tool_choice: Some(ToolChoice::Specific),
+            tool_choice_name: Some("read".into()),
+            params: SamplingParams {
+                temperature: Some(0.2),
+                top_p: Some(0.9),
+                top_k: Some(20.0),
+                max_tokens: Some(512),
+                stop: vec!["END".into()],
+                seed: Some(7),
+                presence_penalty: Some(0.3),
+                frequency_penalty: Some(0.4),
+            },
             stream: true,
-            include_usage: false,
-            thinking: None,
-            extra: Default::default(),
+            include_usage: true,
+            thinking: Some(ThinkingLevel::High),
+            extra,
             raw_body: None,
         };
         let v: Value = serde_json::from_str(&request_to_json(&req)).unwrap();
+        assert_eq!(v["schema"], "kinetix.plugin.request");
+        assert_eq!(v["schema_version"], 1);
         assert_eq!(v["requested_model"], "gemini-3");
         assert_eq!(v["messages"][0]["role"], "user");
         assert_eq!(v["messages"][0]["parts"][0]["type"], "text");
+        assert_eq!(v["tool_choice"]["mode"], "specific");
+        assert_eq!(v["tool_choice"]["name"], "read");
+        assert_eq!(v["thinking"]["level"], "high");
+        assert_eq!(v["presence_penalty"], 0.3);
+        assert_eq!(v["frequency_penalty"], 0.4);
+        assert_eq!(v["include_usage"], true);
+        assert_eq!(v["extra"]["provider_hint"], "value");
+    }
+
+    #[test]
+    fn plugin_faults_preserve_fallback_classification() {
+        let retryable = PluginAdapter::plugin_failure(
+            "build_body",
+            PluginFault::PluginError {
+                code: "server_error".into(),
+                message: "temporary".into(),
+                retryable: true,
+            },
+        );
+        assert_eq!(retryable.kind, FailureKind::ServerError);
+
+        let request_error = PluginAdapter::plugin_failure(
+            "build_body",
+            PluginFault::PluginError {
+                code: "bad_request".into(),
+                message: "bad input".into(),
+                retryable: false,
+            },
+        );
+        assert_eq!(request_error.kind, FailureKind::BadRequest);
+
+        let timeout = PluginAdapter::plugin_failure("apply_auth", PluginFault::Timeout);
+        assert_eq!(timeout.kind, FailureKind::Timeout);
     }
 }
