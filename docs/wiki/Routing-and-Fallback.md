@@ -118,10 +118,11 @@ signatures) cannot travel. The Route's `portability_policy` decides:
 
 ## Prompt-cache affinity (FR-7.3/7.5)
 
-When a Route has `cache_affinity` and the request carries an explicit session
-header, Kinetix remembers the last successful target for that session and prefers
-it if still eligible, improving upstream prompt-cache hits. Session identity is
-taken **only** from an explicit header — never guessed:
+When a Route has `cache_affinity` or `sticky_routing` and the request carries
+an explicit session header, Kinetix remembers the last successful target for that
+session and prefers it while still eligible. `cache_affinity` is intended for
+prompt-cache locality; `sticky_routing` is the general session-affinity switch.
+Session identity is taken **only** from an explicit header — never guessed:
 
 ```
 X-Kinetix-Session | X-Session-Id | X-Conversation-Id | X-Session-Affinity | Session-Id
