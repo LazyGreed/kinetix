@@ -129,7 +129,7 @@ export interface Route {
     onTimeout: boolean;
   };
   targets: RouteTarget[];
-  continuityPolicy: 'strip' | 'convert' | 'error';
+  continuityPolicy: 'strip' | 'error';
   portabilityPolicy: 'reject' | 'strip_with_warning';
   cacheAffinity: boolean;
   stickyRouting: boolean;
