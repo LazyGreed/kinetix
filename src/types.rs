@@ -390,9 +390,14 @@ pub enum FailureKind {
     RateLimit,
     /// Key-level: quota exhausted. Mark exhausted until reset + retry another target.
     QuotaExhausted,
-    /// Key-level: invalid/forbidden credential. Disable + retry another target.
+    /// Credential-global: invalid/revoked credential. Disable this account.
     AuthError,
-    /// Key-level: upstream 5xx or connection failure. Retry another target.
+    /// Provider/model-local: entitlement, model/project/region permission, or
+    /// missing model/resource. Retry another logical target, but never poison
+    /// the credential/account.
+    TargetError,
+    /// Transient upstream failure. Retry another target without treating it as
+    /// a credential defect.
     ServerError,
     ConnectionError,
     Timeout,
@@ -401,8 +406,27 @@ pub enum FailureKind {
 }
 
 impl FailureKind {
-    pub fn is_key_level(&self) -> bool {
+    /// Whether another candidate may be attempted before client commit.
+    pub fn is_retryable(&self) -> bool {
         !matches!(self, FailureKind::BadRequest)
+    }
+
+    /// Whether the failure is scoped to the selected account/credential.
+    pub fn affects_account(&self) -> bool {
+        matches!(
+            self,
+            FailureKind::RateLimit
+                | FailureKind::QuotaExhausted
+                | FailureKind::AuthError
+                | FailureKind::ServerError
+                | FailureKind::ConnectionError
+                | FailureKind::Timeout
+        )
+    }
+
+    /// Backwards-compatible helper used by older tests/callers.
+    pub fn is_key_level(&self) -> bool {
+        self.affects_account()
     }
 }
 
