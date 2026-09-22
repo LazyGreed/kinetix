@@ -137,7 +137,8 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
 
     let stream = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let include_usage = obj
-        .pointer("/stream_options/include_usage")
+        .get("stream_options")
+        .and_then(|value| value.get("include_usage"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
