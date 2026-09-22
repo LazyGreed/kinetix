@@ -531,6 +531,9 @@ fn openai_events(v: &Value) -> Vec<StreamEvent> {
                 cached: usage
                     .pointer("/prompt_tokens_details/cached_tokens")
                     .and_then(|v| v.as_u64()),
+                cache_write: usage
+                    .pointer("/prompt_tokens_details/cache_write_tokens")
+                    .and_then(|v| v.as_u64()),
                 thinking: usage
                     .pointer("/completion_tokens_details/reasoning_tokens")
                     .and_then(|v| v.as_u64()),
@@ -542,6 +545,34 @@ fn openai_events(v: &Value) -> Vec<StreamEvent> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn usage_keeps_reasoning_as_output_breakdown() {
+        let events = parse_openai_json(&serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 80,
+                "prompt_tokens_details": {
+                    "cached_tokens": 40,
+                    "cache_write_tokens": 10
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 30
+                }
+            }
+        }));
+        let usage = events.into_iter().find_map(|event| match event {
+            StreamEvent::Usage(usage) => Some(usage),
+            _ => None,
+        }).expect("usage event");
+        assert_eq!(usage.input, Some(100));
+        assert_eq!(usage.output, Some(80));
+        assert_eq!(usage.cached, Some(40));
+        assert_eq!(usage.cache_write, Some(10));
+        assert_eq!(usage.thinking, Some(30));
+    }
+
     use super::*;
     use crate::db::{ModelRow, ProviderRow};
     use crate::types::AuthScheme;
