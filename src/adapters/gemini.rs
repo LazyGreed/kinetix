@@ -1009,6 +1009,7 @@ mod schema_tests {
         let ctx = UpstreamContext {
             provider: &provider,
             model: &model,
+            account_id: None,
             credential: "k".into(),
         };
         let req = InternalRequest {
