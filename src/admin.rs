@@ -2034,7 +2034,6 @@ pub async fn list_routes(State(state): State<AppState>, _auth: AdminAuth) -> Api
             "description": c.description,
             "strategy": c.strategy,
             "fallback_triggers": serde_json::from_str::<Value>(&c.fallback_triggers).unwrap_or(json!({})),
-            "continuity_policy": c.continuity_policy,
             "portability_policy": c.portability_policy,
             "sticky_routing": c.sticky_routing != 0,
             "cache_affinity": c.cache_affinity != 0,
@@ -2055,8 +2054,6 @@ pub struct RouteBody {
     pub strategy: String,
     #[serde(default)]
     pub fallback_triggers: Value,
-    #[serde(default = "strip_policy")]
-    pub continuity_policy: String,
     /// FR-2.11: reject | strip_with_warning.
     #[serde(default = "portability_default")]
     pub portability_policy: String,
@@ -2073,9 +2070,6 @@ pub struct RouteBody {
 fn priority_strategy() -> String {
     "priority".into()
 }
-fn strip_policy() -> String {
-    "strip".into()
-}
 fn portability_default() -> String {
     "strip_with_warning".into()
 }
@@ -2086,11 +2080,6 @@ fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
         "priority" | "round-robin" | "weighted" | "least-used"
     ) {
         return Err(ApiError::bad("invalid route strategy"));
-    }
-    if !matches!(body.continuity_policy.as_str(), "strip" | "error") {
-        return Err(ApiError::bad(
-            "continuity_policy must be 'strip' or 'error'",
-        ));
     }
     if !matches!(
         body.portability_policy.as_str(),
@@ -2157,7 +2146,6 @@ pub async fn create_route(
             } else {
                 body.fallback_triggers.clone()
             },
-            continuity_policy: &body.continuity_policy,
             portability_policy: &body.portability_policy,
             sticky_routing: body.sticky_routing,
             cache_affinity: body.cache_affinity,
@@ -2198,7 +2186,6 @@ pub async fn update_route(
         &body.description,
         &body.strategy,
         body.fallback_triggers.clone(),
-        &body.continuity_policy,
         &body.portability_policy,
         body.sticky_routing,
         body.cache_affinity,
