@@ -214,14 +214,17 @@ def _target_marker(data, candidates):
     return None
 
 
-def _openai_sticky_request(headers):
+def _openai_sticky_request(headers, prompt_cache_key=None):
+    payload = {
+        "model": "syn-sticky-openai",
+        "stream": False,
+        "messages": [{"role": "user", "content": "sticky affinity"}],
+    }
+    if prompt_cache_key:
+        payload["prompt_cache_key"] = prompt_cache_key
     req = urllib.request.Request(
         f"{BASE_URL}/v1/chat/completions",
-        data=json.dumps({
-            "model": "syn-sticky-openai",
-            "stream": False,
-            "messages": [{"role": "user", "content": "sticky affinity"}],
-        }).encode(),
+        data=json.dumps(payload).encode(),
         headers={
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
@@ -241,8 +244,8 @@ def test_pi_session_affinity(_upstream_model):
         "X-Client-Request-Id": session_id,
         "X-Session-Affinity": session_id,
     }
-    first = _openai_sticky_request(headers)
-    second = _openai_sticky_request(headers)
+    first = _openai_sticky_request(headers, session_id)
+    second = _openai_sticky_request(headers, session_id)
     candidates = ("syn-openai-a", "syn-openai-b")
     first_target = _target_marker(first, candidates)
     second_target = _target_marker(second, candidates)
@@ -389,7 +392,8 @@ def test_responses_session_affinity(_upstream_model):
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
         "User-Agent": "codex-cli/0.125.0",
-        "X-Kinetix-Session": session_id,
+        "session_id": session_id,
+        "X-Client-Request-Id": session_id,
     }
 
     def request():
@@ -399,6 +403,7 @@ def test_responses_session_affinity(_upstream_model):
                 "model": "syn-sticky-openai",
                 "stream": False,
                 "input": "sticky affinity",
+                "prompt_cache_key": session_id,
             }).encode(),
             headers=headers,
         )
