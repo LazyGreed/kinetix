@@ -123,7 +123,12 @@ impl GeminiAdapter {
             }
         };
 
-        put_number("temperature", "temperature", req.params.temperature, &mut cfg);
+        put_number(
+            "temperature",
+            "temperature",
+            req.params.temperature,
+            &mut cfg,
+        );
         put_number("top_p", "topP", req.params.top_p, &mut cfg);
         put_number("top_k", "topK", req.params.top_k, &mut cfg);
 
@@ -303,9 +308,12 @@ fn resolve_local_refs(schema: &Value) -> Value {
                         .collect(),
                 )
             }
-            Value::Array(values) => {
-                Value::Array(values.iter().map(|value| resolve(value, root, stack)).collect())
-            }
+            Value::Array(values) => Value::Array(
+                values
+                    .iter()
+                    .map(|value| resolve(value, root, stack))
+                    .collect(),
+            ),
             other => other.clone(),
         }
     }
@@ -321,9 +329,7 @@ fn merge_all_of(branches: &[Value]) -> Value {
         };
         for (key, value) in map {
             match (out.get_mut(key), value) {
-                (Some(Value::Object(existing)), Value::Object(incoming))
-                    if key == "properties" =>
-                {
+                (Some(Value::Object(existing)), Value::Object(incoming)) if key == "properties" => {
                     for (property, schema) in incoming {
                         existing.insert(property.clone(), schema.clone());
                     }
@@ -427,8 +433,7 @@ fn sanitize_schema(schema: &Value) -> Value {
                         }
                         "allOf" => {
                             if let Some(branches) = value.as_array() {
-                                let sanitized: Vec<Value> =
-                                    branches.iter().map(sanitize).collect();
+                                let sanitized: Vec<Value> = branches.iter().map(sanitize).collect();
                                 let merged = merge_all_of(&sanitized);
                                 if let Some(merged_obj) = merged.as_object() {
                                     for (merged_key, merged_value) in merged_obj {
@@ -953,8 +958,14 @@ mod schema_tests {
             }
         });
         let got = sanitize_schema(&input);
-        assert_eq!(got.pointer("/properties/value/type"), Some(&json!("string")));
-        assert_eq!(got.pointer("/properties/value/nullable"), Some(&json!(true)));
+        assert_eq!(
+            got.pointer("/properties/value/type"),
+            Some(&json!("string"))
+        );
+        assert_eq!(
+            got.pointer("/properties/value/nullable"),
+            Some(&json!(true))
+        );
         assert!(got.pointer("/properties/choice/oneOf").is_none());
         assert_eq!(
             got.pointer("/properties/choice/anyOf/1/type"),
@@ -969,7 +980,10 @@ mod schema_tests {
             "type": "array",
             "prefixItems": [{"type":"string"}, {"type":"integer"}]
         }));
-        assert_eq!(prefix.pointer("/items/anyOf/1/type"), Some(&json!("integer")));
+        assert_eq!(
+            prefix.pointer("/items/anyOf/1/type"),
+            Some(&json!("integer"))
+        );
         assert!(prefix.get("prefixItems").is_none());
     }
 
