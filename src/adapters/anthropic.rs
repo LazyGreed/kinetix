@@ -192,6 +192,14 @@ impl Adapter for AnthropicAdapter {
         Ok(format!("{base}/messages"))
     }
 
+    fn count_tokens_url(
+        &self,
+        ctx: &UpstreamContext<'_>,
+    ) -> Result<Option<String>, ProxyError> {
+        let base = ctx.provider.base_url.trim_end_matches('/');
+        Ok(Some(format!("{base}/messages/count_tokens")))
+    }
+
     fn apply_auth(
         &self,
         ctx: &UpstreamContext<'_>,
