@@ -11,6 +11,7 @@
 //! embedded in the modules.
 
 pub mod adapters;
+pub mod admission;
 pub mod admin;
 pub mod alerts;
 pub mod alloc;
