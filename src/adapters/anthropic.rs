@@ -196,10 +196,7 @@ impl Adapter for AnthropicAdapter {
         true
     }
 
-    fn count_tokens_url(
-        &self,
-        ctx: &UpstreamContext<'_>,
-    ) -> Result<Option<String>, ProxyError> {
+    fn count_tokens_url(&self, ctx: &UpstreamContext<'_>) -> Result<Option<String>, ProxyError> {
         let base = ctx.provider.base_url.trim_end_matches('/');
         Ok(Some(format!("{base}/messages/count_tokens")))
     }
