@@ -48,10 +48,7 @@ fn extract_session(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn extract_protocol_headers(
-    format: FrontendFormat,
-    headers: &HeaderMap,
-) -> Vec<(String, String)> {
+fn extract_protocol_headers(format: FrontendFormat, headers: &HeaderMap) -> Vec<(String, String)> {
     if format != FrontendFormat::Anthropic {
         return Vec::new();
     }
@@ -285,7 +282,6 @@ pub fn error_response(format: FrontendFormat, request_id: &str, err: ProxyError)
         .unwrap_or_else(|_| Response::new(Body::from("internal error")))
 }
 
-
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
@@ -322,10 +318,7 @@ mod protocol_tests {
             forwarded,
             vec![
                 ("anthropic-version".into(), "2023-06-01".into()),
-                (
-                    "anthropic-beta".into(),
-                    "prompt-caching-2024-07-31".into()
-                ),
+                ("anthropic-beta".into(), "prompt-caching-2024-07-31".into()),
             ]
         );
         assert!(extract_protocol_headers(FrontendFormat::OpenAi, &headers).is_empty());
