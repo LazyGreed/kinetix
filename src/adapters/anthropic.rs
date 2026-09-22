@@ -192,6 +192,10 @@ impl Adapter for AnthropicAdapter {
         Ok(format!("{base}/messages"))
     }
 
+    fn supports_count_tokens(&self) -> bool {
+        true
+    }
+
     fn count_tokens_url(
         &self,
         ctx: &UpstreamContext<'_>,
