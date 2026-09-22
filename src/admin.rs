@@ -326,6 +326,7 @@ pub async fn test_stream(
         request_id.clone(),
         true,
         None,
+        Vec::new(),
     )
     .await
     {
@@ -1258,6 +1259,7 @@ async fn discover_models_native(
             json_body: None,
             accept_event_stream: false,
             request_id: None,
+            headers: Vec::new(),
             total_timeout: Some(std::time::Duration::from_millis(
                 provider.timeout_ms.max(1) as u64
             )),
