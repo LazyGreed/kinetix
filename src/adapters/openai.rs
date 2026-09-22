@@ -188,11 +188,7 @@ fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Va
     insert_dotted_rec(obj, &parts, value);
 }
 
-fn insert_dotted_rec(
-    obj: &mut serde_json::Map<String, Value>,
-    path: &[&str],
-    value: Value,
-) {
+fn insert_dotted_rec(obj: &mut serde_json::Map<String, Value>, path: &[&str], value: Value) {
     if path.is_empty() {
         return;
     }
