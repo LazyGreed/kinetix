@@ -2194,8 +2194,7 @@ impl ToolStreamState {
                             Some(id)
                         }
                         None => {
-                            let generated =
-                                format!("call_{}_{}", self.request_id, canonical);
+                            let generated = format!("call_{}_{}", self.request_id, canonical);
                             self.ids.insert(generated.clone(), canonical);
                             Some(generated)
                         }
@@ -2209,11 +2208,7 @@ impl ToolStreamState {
                     }
                 }
                 StreamEvent::ToolCallArgsDelta { index, args } => {
-                    let canonical = self
-                        .upstream_indexes
-                        .get(&index)
-                        .copied()
-                        .unwrap_or(index);
+                    let canonical = self.upstream_indexes.get(&index).copied().unwrap_or(index);
                     StreamEvent::ToolCallArgsDelta {
                         index: canonical,
                         args,
@@ -3463,7 +3458,6 @@ mod route_policy_tests {
             opaque_state_plugin: String::new(),
         }
     }
-
 
     fn account() -> db::AccountRow {
         db::AccountRow {
