@@ -779,7 +779,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod error_scope_tests {
     use super::*;
