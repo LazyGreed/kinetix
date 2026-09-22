@@ -510,9 +510,9 @@ impl Adapter for GeminiAdapter {
         &self,
         ctx: &UpstreamContext<'_>,
         req: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
-        match ctx.provider.auth() {
+        Ok(match ctx.provider.auth() {
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
                 let name = ctx
@@ -530,10 +530,14 @@ impl Adapter for GeminiAdapter {
                     .unwrap_or_else(|| "key".to_string());
                 req.query(&[(param, &ctx.credential)])
             }
-        }
+        })
     }
 
-    fn build_body(&self, ctx: &UpstreamContext<'_>, req: &InternalRequest) -> Value {
+    fn build_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+    ) -> Result<Value, UpstreamFailure> {
         let mut body = serde_json::Map::new();
 
         // System instruction.
@@ -563,7 +567,7 @@ impl Adapter for GeminiAdapter {
         let extra = ctx.model.extra_request_value();
         merge_extra(&mut body, &extra);
 
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 
     fn classify_error(

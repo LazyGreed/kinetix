@@ -226,9 +226,9 @@ impl Adapter for OpenAiAdapter {
         &self,
         ctx: &UpstreamContext<'_>,
         req: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
-        match ctx.provider.auth() {
+        Ok(match ctx.provider.auth() {
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
                 let name = ctx
@@ -250,10 +250,14 @@ impl Adapter for OpenAiAdapter {
                     .unwrap_or_else(|| "key".to_string());
                 req.query(&[(param, &ctx.credential)])
             }
-        }
+        })
     }
 
-    fn build_body(&self, ctx: &UpstreamContext<'_>, req: &InternalRequest) -> Value {
+    fn build_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+    ) -> Result<Value, UpstreamFailure> {
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), json!(ctx.model.upstream_id));
         body.insert("messages".to_string(), json!(Self::build_messages(req)));
@@ -340,7 +344,7 @@ impl Adapter for OpenAiAdapter {
             }
         }
 
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 
     fn classify_error(
@@ -617,7 +621,7 @@ mod tests {
         req.extra
             .insert("prompt_cache_key".into(), serde_json::json!("conv-123"));
         let adapter = OpenAiAdapter;
-        let body = adapter.build_body(&ctx, &req);
+        let body = adapter.build_body(&ctx, &req).unwrap();
         assert_eq!(
             body.get("prompt_cache_key").and_then(|v| v.as_str()),
             Some("conv-123"),
@@ -648,7 +652,7 @@ mod tests {
         req.params.top_k = Some(42.0);
         req.thinking = Some(crate::types::ThinkingLevel::High);
 
-        let body = OpenAiAdapter.build_body(&ctx, &req);
+        let body = OpenAiAdapter.build_body(&ctx, &req).unwrap();
         assert_eq!(body["top_k"], 42.0);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["stream_options"]["include_usage"], true);
@@ -738,7 +742,9 @@ mod param_default_tests {
             credential: "k".into(),
         };
         let adapter = OpenAiAdapter;
-        let body = adapter.build_body(&ctx, &req_without_temperature());
+        let body = adapter
+            .build_body(&ctx, &req_without_temperature())
+            .unwrap();
         assert_eq!(
             body.get("temperature").and_then(|v| v.as_f64()),
             Some(0.3),
@@ -758,7 +764,7 @@ mod param_default_tests {
         let mut req = req_without_temperature();
         req.params.temperature = Some(0.9);
         let adapter = OpenAiAdapter;
-        let body = adapter.build_body(&ctx, &req);
+        let body = adapter.build_body(&ctx, &req).unwrap();
         assert_eq!(body.get("temperature").and_then(|v| v.as_f64()), Some(0.9));
     }
 }

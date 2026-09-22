@@ -163,14 +163,14 @@ impl Adapter for AnthropicAdapter {
         &self,
         ctx: &UpstreamContext<'_>,
         mut req: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
         if ctx.credential.starts_with("sk-ant-oat")
             || ctx.provider.credential_plugin.contains("claude-code")
         {
             req = req.header("user-agent", "claude-cli/1.18.31 (external, cli)");
         }
-        match ctx.provider.auth() {
+        Ok(match ctx.provider.auth() {
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
                 let name = ctx
@@ -188,10 +188,14 @@ impl Adapter for AnthropicAdapter {
                     .unwrap_or_else(|| "key".to_string());
                 req.query(&[(param, &ctx.credential)])
             }
-        }
+        })
     }
 
-    fn build_body(&self, ctx: &UpstreamContext<'_>, req: &InternalRequest) -> Value {
+    fn build_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+    ) -> Result<Value, UpstreamFailure> {
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), json!(ctx.model.upstream_id));
         body.insert("stream".to_string(), json!(true));
@@ -295,7 +299,7 @@ impl Adapter for AnthropicAdapter {
             }
         }
 
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 
     fn classify_error(
@@ -649,7 +653,7 @@ mod tests {
             credential: "sk-ant-api03-regular-key".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         assert!(body.get("system").is_none());
     }
 
@@ -664,7 +668,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -685,7 +689,7 @@ mod tests {
             credential: "some-opaque-or-exchanged-credential".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -706,7 +710,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -731,7 +735,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -760,7 +764,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
