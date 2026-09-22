@@ -44,10 +44,7 @@ pub trait Adapter: Send + Sync {
 
     /// Optional exact token-count endpoint for this wire adapter. Returning
     /// `None` means Kinetix must use its documented local estimate.
-    fn count_tokens_url(
-        &self,
-        _ctx: &UpstreamContext<'_>,
-    ) -> Result<Option<String>, ProxyError> {
+    fn count_tokens_url(&self, _ctx: &UpstreamContext<'_>) -> Result<Option<String>, ProxyError> {
         Ok(None)
     }
 
