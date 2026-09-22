@@ -79,6 +79,7 @@ export function mapModel(j: any): ModelConfig {
     inputPer1M: num(p.input_per_1m),
     outputPer1M: num(p.output_per_1m),
     cachedPer1M: num(p.cached_per_1m),
+    cacheWritePer1M: num(p.cache_write_per_1m),
     thinkingPer1M: num(p.thinking_per_1m),
   };
   const thinkingMap = j.thinking_map || {};
@@ -218,6 +219,7 @@ export function mapRequest(j: any): RequestLog {
     inputTokens: num(j.input_tokens),
     outputTokens: num(j.output_tokens),
     cachedTokens: num(j.cached_tokens),
+    cacheWriteTokens: num(j.cache_write_tokens),
     thinkingTokens: num(j.thinking_tokens),
     costUsd: num(j.cost_usd),
     cacheStatus: (j.cache_status as RequestLog['cacheStatus']) || 'bypass',
