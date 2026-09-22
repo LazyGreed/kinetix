@@ -95,7 +95,8 @@ mod tests {
             "vendor_extension": {"keep": [1, 2, 3]}
         })
         .to_string();
-        let out = rewrite_model(&raw, "gemini-3.6-flash", false, false, WireFormat::Openai).unwrap();
+        let out =
+            rewrite_model(&raw, "gemini-3.6-flash", false, false, WireFormat::Openai).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["model"], "gemini-3.6-flash");
         assert_eq!(v["vendor_extension"]["keep"][2], 3);
@@ -137,7 +138,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         })
         .to_string();
-        let out = rewrite_model(&raw, "claude-upstream", true, true, WireFormat::Anthropic).unwrap();
+        let out =
+            rewrite_model(&raw, "claude-upstream", true, true, WireFormat::Anthropic).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["stream"], true);
         assert!(v.get("stream_options").is_none());
