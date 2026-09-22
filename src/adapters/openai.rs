@@ -742,7 +742,9 @@ mod param_default_tests {
             credential: "k".into(),
         };
         let adapter = OpenAiAdapter;
-        let body = adapter.build_body(&ctx, &req_without_temperature()).unwrap();
+        let body = adapter
+            .build_body(&ctx, &req_without_temperature())
+            .unwrap();
         assert_eq!(
             body.get("temperature").and_then(|v| v.as_f64()),
             Some(0.3),
