@@ -502,7 +502,7 @@ pub fn estimate_request(
     let mut max_cost = 0.0f64;
     let mut cost_known = true;
     for model in models {
-        let output = output_reservation(req, model);
+        let output = output_reservation(req, &model);
         tokens = tokens.max(input.saturating_add(output));
         match conservative_cost(&model.prices(), input, output) {
             Some(cost) => max_cost = max_cost.max(cost),
