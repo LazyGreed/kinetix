@@ -563,10 +563,13 @@ mod tests {
                 }
             }
         }));
-        let usage = events.into_iter().find_map(|event| match event {
-            StreamEvent::Usage(usage) => Some(usage),
-            _ => None,
-        }).expect("usage event");
+        let usage = events
+            .into_iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("usage event");
         assert_eq!(usage.input, Some(100));
         assert_eq!(usage.output, Some(80));
         assert_eq!(usage.cached, Some(40));
