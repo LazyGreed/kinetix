@@ -185,6 +185,28 @@ fn anthropic_non_streaming_aggregate_is_stable() {
 }
 
 #[test]
+fn anthropic_aggregate_maps_inclusive_input_back_to_native_cache_fields() {
+    let body = frontends::aggregate(
+        FrontendFormat::Anthropic,
+        "test-model",
+        "req_fixture",
+        vec![StreamEvent::Finish(FinishReason::Stop)],
+        &TokenUsage {
+            input: Some(200),
+            output: Some(25),
+            cached: Some(70),
+            cache_write: Some(30),
+            thinking: None,
+        },
+    );
+
+    assert_eq!(body["usage"]["input_tokens"], 100);
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 70);
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 30);
+    assert_eq!(body["usage"]["output_tokens"], 25);
+}
+
+#[test]
 fn openai_error_frame_marks_the_stream_as_failed() {
     // FR-4.6/NFR-2.9: a post-commit failure must not look like a clean finish.
     let mut enc = frontends::Encoder::new(FrontendFormat::OpenAi, ctx());
