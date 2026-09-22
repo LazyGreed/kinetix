@@ -894,10 +894,30 @@ def test_anthropic_broken_stream(model, capability):
         data=json.dumps(payload).encode(),
         headers=_claude_headers("claude-broken-session"),
     )
-    with urlopen(req, timeout=15) as resp:
-        events = read_sse_events(resp)
-    passed = any(name == "error" for name, _ in events)
-    record_result("Claude Code", model, capability, passed, f"events={len(events)}", int((time.time()-t0)*1000))
+    try:
+        with urlopen(req, timeout=15) as resp:
+            events = read_sse_events(resp)
+        passed = capability == "truncated_stream" and any(
+            name == "error" for name, _ in events
+        )
+        detail = f"events={len(events)}"
+    except RuntimeError as error:
+        message = str(error)
+        passed = (
+            capability == "malformed_stream"
+            and "HTTP 502" in message
+            and '"type":"error"' in message
+            and '"type":"api_error"' in message
+        )
+        detail = message
+    record_result(
+        "Claude Code",
+        model,
+        capability,
+        passed,
+        detail,
+        int((time.time()-t0)*1000),
+    )
 
 
 # ---------------------------------------------------------------------------
