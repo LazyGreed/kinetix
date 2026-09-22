@@ -153,6 +153,60 @@ impl OpenAiAdapter {
             Some(ToolChoice::Auto) | None => None,
         }
     }
+
+    fn apply_thinking_map(
+        body: &mut serde_json::Map<String, Value>,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+    ) {
+        let Some(level) = req.thinking else {
+            return;
+        };
+        let key = match level {
+            crate::types::ThinkingLevel::Off => "off",
+            crate::types::ThinkingLevel::Low => "low",
+            crate::types::ThinkingLevel::Medium => "medium",
+            crate::types::ThinkingLevel::High => "high",
+        };
+        let mapping = ctx.model.thinking();
+        let Some(value) = mapping.levels.get(key) else {
+            return;
+        };
+
+        if let Some(object) = value.as_object() {
+            for (path, value) in object {
+                insert_dotted(body, path, value.clone());
+            }
+        } else if let Some(field) = mapping.budget_field.as_deref() {
+            insert_dotted(body, field, value.clone());
+        }
+    }
+}
+
+fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
+    let parts: Vec<&str> = path.split('.').collect();
+    insert_dotted_rec(obj, &parts, value);
+}
+
+fn insert_dotted_rec(
+    obj: &mut serde_json::Map<String, Value>,
+    path: &[&str],
+    value: Value,
+) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() == 1 {
+        obj.insert(path[0].to_string(), value);
+        return;
+    }
+    let entry = obj.entry(path[0].to_string()).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    if let Some(map) = entry.as_object_mut() {
+        insert_dotted_rec(map, &path[1..], value);
+    }
 }
 
 impl Default for OpenAiAdapter {
@@ -208,6 +262,13 @@ impl Adapter for OpenAiAdapter {
         body.insert("model".to_string(), json!(ctx.model.upstream_id));
         body.insert("messages".to_string(), json!(Self::build_messages(req)));
         body.insert("stream".to_string(), json!(true));
+        // Kinetix always asks OpenAI-compatible streaming upstreams for usage
+        // so accounting remains correct. Client visibility is controlled
+        // separately by the frontend encoder/passthrough filter.
+        body.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
 
         let params = ctx.model.params();
         let mut insert = |key: &str, v: Option<f64>| {
@@ -240,6 +301,7 @@ impl Adapter for OpenAiAdapter {
         };
         insert("temperature", req.params.temperature);
         insert("top_p", req.params.top_p);
+        insert("top_k", req.params.top_k);
         if let Some(mt) = req.params.max_tokens {
             let mut v = mt as i64;
             if let Some(max) = ctx.model.max_output_tokens {
@@ -272,6 +334,7 @@ impl Adapter for OpenAiAdapter {
         if let Some(tc) = Self::build_tool_choice(req) {
             body.insert("tool_choice".to_string(), tc);
         }
+        Self::apply_thinking_map(&mut body, ctx, req);
 
         // Merge admin extra fields (FR-10.8).
         let extra = ctx.model.extra_request_value();
