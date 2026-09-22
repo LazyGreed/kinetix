@@ -473,6 +473,7 @@ pub async fn run(
     let mut last_error: Option<ProxyError> = None;
     let mut all_accounts: Vec<db::AccountRow> = Vec::new();
     let mut attempts_done = 0usize;
+    let mut previous_provider_id: Option<String> = None;
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
@@ -575,8 +576,14 @@ pub async fn run(
         // continuity transforms must never leak into a later fallback target.
         let mut target_req = req.clone();
 
-        // Continuity / portability policy on cross-provider fallback (FR-2.11).
-        if attempts_done > 0 {
+        // Continuity / portability applies only when this attempt crosses
+        // provider boundaries. Switching credentials inside one provider pool
+        // must not strip conversation state.
+        let cross_provider = previous_provider_id
+            .as_deref()
+            .map(|id| id != target.provider.id)
+            .unwrap_or(false);
+        if cross_provider {
             if let Some(route) = &route {
                 apply_continuity(&mut target_req, route, target, &mut trace)?;
             }
@@ -633,6 +640,7 @@ pub async fn run(
             tokio::time::sleep(Duration::from_millis(exp.min(BACKOFF_CAP_MS))).await;
         }
         attempts_done += 1;
+        previous_provider_id = Some(target.provider.id.clone());
         state.live.set_fallback_hops(
             &meta.request_id,
             (attempts_done - 1) as u32,
@@ -1818,14 +1826,20 @@ fn apply_continuity(
         return Ok(());
     }
 
-    if route.portability() == "reject" {
+    if route.continuity_policy == "error" || route.portability() == "reject" {
         return Err(ProxyError::unsupported(format!(
-            "route '{}' uses portability policy 'reject': the conversation carries provider-specific state that target '{}' cannot accept",
+            "route '{}' forbids cross-provider fallback with non-portable conversation state for target '{}'",
+            route.name, target.model.display_name
+        )));
+    }
+    if route.continuity_policy == "convert" {
+        return Err(ProxyError::unsupported(format!(
+            "route '{}' requested continuity conversion, but opaque reasoning/tool signatures cannot be converted safely for target '{}'",
             route.name, target.model.display_name
         )));
     }
 
-    // strip_with_warning
+    // continuity=strip / portability=strip_with_warning
     for msg in &mut req.messages {
         msg.parts
             .retain(|p| !matches!(p, crate::types::Part::Thinking { .. }));
