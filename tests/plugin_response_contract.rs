@@ -122,7 +122,6 @@ fn additive_unknown_fields_are_accepted() {
     ));
 }
 
-
 #[test]
 fn schema_u64_bounds_match_runtime_validator() {
     let schema: Value = serde_json::from_str(RESPONSE_SCHEMA_JSON).expect("valid response schema");
