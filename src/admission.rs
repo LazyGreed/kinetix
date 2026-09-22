@@ -79,10 +79,13 @@ impl AdmissionReservation {
             _ => None,
         };
         let actual_cost = actual_tokens.and(actual_cost);
-        self.entry
-            .ledger
-            .lock()
-            .reconcile(self.id, actual_tokens, actual_cost, Utc::now(), Instant::now());
+        self.entry.ledger.lock().reconcile(
+            self.id,
+            actual_tokens,
+            actual_cost,
+            Utc::now(),
+            Instant::now(),
+        );
         self.settled = true;
     }
 }
@@ -171,11 +174,7 @@ impl AdmissionController {
         self.reserve_initialized(entry, key, estimate)
     }
 
-    pub async fn check_current(
-        &self,
-        pool: &Pool,
-        key: &VirtualKeyRow,
-    ) -> Result<(), ProxyError> {
+    pub async fn check_current(&self, pool: &Pool, key: &VirtualKeyRow) -> Result<(), ProxyError> {
         let entry = self.entry(&key.id);
         self.ensure_initialized(pool, &key.id, &entry).await;
         entry
@@ -190,7 +189,10 @@ impl AdmissionController {
         key: &VirtualKeyRow,
         estimate: AdmissionEstimate,
     ) -> Result<AdmissionReservation, ProxyError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let id = self
+            .next_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         entry
             .ledger
             .lock()
@@ -228,11 +230,7 @@ impl KeyLedger {
         }
     }
 
-    fn current(
-        &mut self,
-        now_wall: chrono::DateTime<Utc>,
-        now: Instant,
-    ) -> (u64, u64, f64, f64) {
+    fn current(&mut self, now_wall: chrono::DateTime<Utc>, now: Instant) -> (u64, u64, f64, f64) {
         self.roll_periods(now_wall);
         self.prune(now);
         let day = now_wall.date_naive();
@@ -482,8 +480,7 @@ pub fn estimate_request(
         }
         Resolved::Route { targets, .. } => {
             for target in &targets {
-                if !allowed_providers.is_empty()
-                    && !allowed_providers.contains(&target.provider.id)
+                if !allowed_providers.is_empty() && !allowed_providers.contains(&target.provider.id)
                 {
                     continue;
                 }
