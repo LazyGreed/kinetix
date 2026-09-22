@@ -62,6 +62,7 @@ Supported request semantics:
   aliases/controls already represented by the canonical model;
 - `reasoning.effort` as an input control when the selected model has an
   explicit thinking mapping;
+- `prompt_cache_key` as a portable OpenAI prompt-cache hint;
 - streaming and non-streaming output for text and custom function calls.
 
 Streaming emits the supported semantic lifecycle events:
