@@ -867,8 +867,12 @@ pub async fn run(
                     match tokio::time::timeout(error_body_remaining, resp.text()).await {
                         Ok(Ok(body)) => {
                             let native = adapter.classify_error(status, &body, &headers);
-                            let failure =
-                                apply_provider_failure_rules(&target.provider, status, &body, native);
+                            let failure = apply_provider_failure_rules(
+                                &target.provider,
+                                status,
+                                &body,
+                                native,
+                            );
                             upstream_error_body = Some(body);
                             failure
                         }
@@ -1626,9 +1630,7 @@ fn safe_anthropic_error_body(body: &str) -> Option<Value> {
     Some(out)
 }
 
-fn anthropic_error_headers(
-    headers: &reqwest::header::HeaderMap,
-) -> Vec<(String, String)> {
+fn anthropic_error_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|(name, value)| {
