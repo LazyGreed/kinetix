@@ -857,13 +857,6 @@ pub async fn create_provider(
     Json(body): Json<ProviderBody>,
 ) -> ApiResult {
     validate_outbound_url(&state, &body.base_url)?;
-    let existing = db::get_provider(&state.pool, &id)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("provider not found"))?;
-    let rate_limit_rules = body.rate_limit_rules.clone().unwrap_or_else(|| {
-        serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
-    });
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -948,6 +941,13 @@ pub async fn update_provider(
     Json(body): Json<ProviderBody>,
 ) -> ApiResult {
     validate_outbound_url(&state, &body.base_url)?;
+    let existing = db::get_provider(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let rate_limit_rules = body.rate_limit_rules.clone().unwrap_or_else(|| {
+        serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
+    });
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -3440,6 +3440,7 @@ pub async fn import_config(
                 timeout_ms,
                 capability_mode,
                 models_path,
+                rate_limit_rules,
                 follow_redirects,
                 credential_hosts,
                 allow_insecure_tls,
