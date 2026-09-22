@@ -720,11 +720,18 @@ pub async fn run(
                                 "upstream_precommit_invalid",
                                 failure.message.clone(),
                             );
-                            if !failure.kind.is_key_level() || !allow_fallback {
+                            handle_key_failure(state, target, &failure, &mut meta, &mut trace)
+                                .await;
+                            let can_fallback = allow_fallback
+                                && route_allows_fallback(route.as_ref(), failure.kind);
+                            if !can_fallback {
                                 trace.step(
                                     "attempt",
                                     Some(target.account.label.clone()),
-                                    format!("HTTP 2xx invalid before commit: {}", failure.message),
+                                    format!(
+                                        "HTTP 2xx invalid before commit; fallback disabled for {:?}",
+                                        failure.kind
+                                    ),
                                 );
                                 trace.finish("failed");
                                 state.live.finish(
@@ -737,8 +744,9 @@ pub async fn run(
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(failure_to_error(&failure, target));
                             }
-                            handle_key_failure(state, target, &failure, &mut meta, &mut trace)
-                                .await;
+                            if failure.kind == FailureKind::TargetError {
+                                skip_logical_target = target.route_target_id.clone();
+                            }
                             last_error = Some(failure_to_error(&failure, target));
                             continue;
                         }
@@ -793,7 +801,10 @@ pub async fn run(
                     timeout_failure("upstream timed out while reading error response")
                 } else {
                     match tokio::time::timeout(error_body_remaining, resp.text()).await {
-                        Ok(Ok(body)) => adapter.classify_error(status, &body, &headers),
+                        Ok(Ok(body)) => {
+                            let native = adapter.classify_error(status, &body, &headers);
+                            apply_provider_failure_rules(&target.provider, status, &body, native)
+                        }
                         Ok(Err(error)) => UpstreamFailure {
                             kind: if error.is_timeout() {
                                 FailureKind::Timeout
@@ -817,11 +828,17 @@ pub async fn run(
                     format!("HTTP {status} {:?}", failure.kind),
                 );
 
-                if !failure.kind.is_key_level() || !allow_fallback {
+                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                let can_fallback =
+                    allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                if !can_fallback {
                     trace.step(
                         "attempt",
                         Some(target.account.label.clone()),
-                        format!("HTTP {status} (not retryable)"),
+                        format!(
+                            "HTTP {status}; fallback disabled for {:?}",
+                            failure.kind
+                        ),
                     );
                     trace.finish("failed");
                     state.live.finish(
@@ -834,8 +851,9 @@ pub async fn run(
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(failure_to_error(&failure, &target));
                 }
-
-                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                if failure.kind == FailureKind::TargetError {
+                    skip_logical_target = target.route_target_id.clone();
+                }
                 last_error = Some(failure_to_error(&failure, &target));
                 continue;
             }
@@ -846,7 +864,15 @@ pub async fn run(
                     "upstream_connect_failed",
                     format!("{:?}", failure.kind),
                 );
-                if !allow_fallback {
+                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                let can_fallback =
+                    allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                if !can_fallback {
+                    trace.step(
+                        "attempt",
+                        Some(target.account.label.clone()),
+                        format!("fallback disabled for {:?}", failure.kind),
+                    );
                     trace.finish("failed");
                     state.live.finish(
                         &meta.request_id,
@@ -858,7 +884,6 @@ pub async fn run(
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(failure_to_error(&failure, &target));
                 }
-                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
                 last_error = Some(failure_to_error(&failure, &target));
                 continue;
             }
