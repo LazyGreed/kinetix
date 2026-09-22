@@ -404,8 +404,16 @@ fn sanitize_schema(schema: &Value) -> Value {
                         | "definitions"
                         | "$defs"
                         | "$ref"
-                        | "strict"
-                        | "prefixItems" => {}
+                        | "strict" => {}
+                        "prefixItems" => {
+                            if let Some(branches) = value.as_array() {
+                                out.entry("items".to_string()).or_insert_with(|| {
+                                    json!({
+                                        "anyOf": branches.iter().map(sanitize).collect::<Vec<_>>()
+                                    })
+                                });
+                            }
+                        }
                         "const" => {
                             out.insert("enum".to_string(), json!([sanitize(value)]));
                         }
@@ -956,6 +964,13 @@ mod schema_tests {
             got.pointer("/properties/tuple/items/anyOf/0/type"),
             Some(&json!("string"))
         );
+
+        let prefix = sanitize_schema(&json!({
+            "type": "array",
+            "prefixItems": [{"type":"string"}, {"type":"integer"}]
+        }));
+        assert_eq!(prefix.pointer("/items/anyOf/1/type"), Some(&json!("integer")));
+        assert!(prefix.get("prefixItems").is_none());
     }
 
     #[test]
