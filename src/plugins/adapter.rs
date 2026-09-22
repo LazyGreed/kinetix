@@ -587,6 +587,7 @@ mod tests {
             tool_choice_name: None,
             params: Default::default(),
             stream: true,
+            include_usage: false,
             thinking: None,
             extra: Default::default(),
             raw_body: None,
