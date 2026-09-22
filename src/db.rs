@@ -1434,12 +1434,7 @@ pub async fn key_usage_entries_since(
 
     Ok(rows
         .into_iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("ts"),
-                row.get::<i64, _>("tokens"),
-            )
-        })
+        .map(|row| (row.get::<String, _>("ts"), row.get::<i64, _>("tokens")))
         .collect())
 }
 
