@@ -2080,6 +2080,50 @@ fn portability_default() -> String {
     "strip_with_warning".into()
 }
 
+fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
+    if !matches!(
+        body.strategy.as_str(),
+        "priority" | "round-robin" | "weighted" | "least-used"
+    ) {
+        return Err(ApiError::bad("invalid route strategy"));
+    }
+    if !matches!(body.continuity_policy.as_str(), "strip" | "error") {
+        return Err(ApiError::bad(
+            "continuity_policy must be 'strip' or 'error'",
+        ));
+    }
+    if !matches!(
+        body.portability_policy.as_str(),
+        "reject" | "strip_with_warning"
+    ) {
+        return Err(ApiError::bad(
+            "portability_policy must be 'reject' or 'strip_with_warning'",
+        ));
+    }
+    if !body.fallback_triggers.is_null() {
+        let Some(triggers) = body.fallback_triggers.as_object() else {
+            return Err(ApiError::bad("fallback_triggers must be a JSON object"));
+        };
+        for key in ["on429", "onQuota", "on5xx", "onTimeout"] {
+            if let Some(value) = triggers.get(key) {
+                if !value.is_boolean() {
+                    return Err(ApiError::bad(format!(
+                        "fallback_triggers.{key} must be boolean"
+                    )));
+                }
+            }
+        }
+    }
+    for target in &body.targets {
+        if !target.param_overrides.is_null() && !target.param_overrides.is_object() {
+            return Err(ApiError::bad(
+                "route target param_overrides must be a JSON object",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct RouteTargetBody {
     pub account_id: Option<String>,
@@ -2101,6 +2145,7 @@ pub async fn create_route(
     _auth: AdminAuth,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
+    validate_route_body(&body)?;
     let id = db::insert_route(
         &state.pool,
         &db::NewRoute {
@@ -2146,6 +2191,7 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
+    validate_route_body(&body)?;
     db::update_route(
         &state.pool,
         &id,
