@@ -714,6 +714,7 @@ fn provider_json(p: &db::ProviderRow) -> Value {
         "timeout_ms": p.timeout_ms,
         "capability_mode": p.capability_mode,
         "models_path": p.models_path,
+        "rate_limit_rules": serde_json::from_str::<Value>(&p.rate_limit_rules).unwrap_or(json!({})),
         "enabled": p.enabled != 0,
         "follow_redirects": p.follow_redirects != 0,
         "credential_hosts": p.credential_hosts,
@@ -741,6 +742,10 @@ pub struct ProviderBody {
     #[serde(default = "default_permissive")]
     pub capability_mode: String,
     pub models_path: Option<String>,
+    /// Optional provider-specific failure classification overrides. Rules are
+    /// matched against status/code/message before fallback state is updated.
+    #[serde(default)]
+    pub rate_limit_rules: Option<Value>,
     /// NFR-3.10: redirects are never followed unless explicitly enabled.
     #[serde(default)]
     pub follow_redirects: bool,
@@ -852,6 +857,13 @@ pub async fn create_provider(
     Json(body): Json<ProviderBody>,
 ) -> ApiResult {
     validate_outbound_url(&state, &body.base_url)?;
+    let existing = db::get_provider(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let rate_limit_rules = body.rate_limit_rules.clone().unwrap_or_else(|| {
+        serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
+    });
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -879,7 +891,7 @@ pub async fn create_provider(
             timeout_ms: body.timeout_ms,
             capability_mode: &body.capability_mode,
             models_path: body.models_path.as_deref(),
-            rate_limit_rules: json!({}),
+            rate_limit_rules: body.rate_limit_rules.clone().unwrap_or_else(|| json!({})),
             follow_redirects: body.follow_redirects,
             credential_hosts: &body.credential_hosts,
             allow_insecure_tls: body.allow_insecure_tls,
@@ -962,6 +974,7 @@ pub async fn update_provider(
         body.timeout_ms,
         &body.capability_mode,
         body.models_path.as_deref(),
+        rate_limit_rules,
         body.follow_redirects,
         &body.credential_hosts,
         body.allow_insecure_tls,
