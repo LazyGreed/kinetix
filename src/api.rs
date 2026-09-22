@@ -111,7 +111,7 @@ async fn handle(
     if let Err(e) = limits::enforce_ip(&key, limits::client_ip(&headers)) {
         return error_response(format, &request_id, e);
     }
-    if let Err(e) = limits::enforce(&state.pool, &key, &req.requested_model).await {
+    if let Err(e) = limits::validate(&key, &req.requested_model) {
         return error_response(format, &request_id, e);
     }
 
@@ -236,7 +236,9 @@ pub async fn count_message_tokens(
     if let Err(error) = limits::enforce_ip(&key, limits::client_ip(&headers)) {
         return error_response(FrontendFormat::Anthropic, &request_id, error);
     }
-    if let Err(error) = limits::enforce(&state.pool, &key, &req.requested_model).await {
+    if let Err(error) =
+        limits::check_current(&state.admission, &state.pool, &key, &req.requested_model).await
+    {
         return error_response(FrontendFormat::Anthropic, &request_id, error);
     }
 
