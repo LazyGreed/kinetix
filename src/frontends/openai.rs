@@ -228,6 +228,14 @@ fn nested_translation_issues(
                 text_only,
                 &mut issues,
             );
+
+            for field in ["audio", "function_call", "refusal", "reasoning_details"] {
+                if message.get(field).is_some_and(|value| !value.is_null()) {
+                    issues.push(format!(
+                        "messages[{message_index}].{field} has no canonical cross-format representation"
+                    ));
+                }
+            }
         }
     }
 
