@@ -672,3 +672,28 @@ mod param_default_tests {
         assert_eq!(body.get("temperature").and_then(|v| v.as_f64()), Some(0.9));
     }
 }
+
+
+#[cfg(test)]
+mod error_scope_tests {
+    use super::*;
+    use crate::adapters::Adapter;
+
+    #[test]
+    fn forbidden_model_scope_does_not_poison_openai_credential() {
+        let adapter = OpenAiAdapter::new();
+        let forbidden = adapter.classify_error(
+            403,
+            r#"{"error":{"message":"model access denied","code":"model_not_allowed"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(forbidden.kind, FailureKind::TargetError);
+
+        let unauthorized = adapter.classify_error(
+            401,
+            r#"{"error":{"message":"invalid api key","code":"invalid_api_key"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(unauthorized.kind, FailureKind::AuthError);
+    }
+}
