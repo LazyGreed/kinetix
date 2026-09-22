@@ -1373,6 +1373,7 @@ pub async fn test_provider(
             ..Default::default()
         },
         stream: false,
+        include_usage: false,
         thinking: None,
         extra: Default::default(),
         raw_body: None,
