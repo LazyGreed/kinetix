@@ -320,7 +320,9 @@ fn responses_prompt_cache_key_is_preserved_as_portable_extension() {
         }"#,
     );
     assert_eq!(
-        req.extra.get("prompt_cache_key").and_then(|value| value.as_str()),
+        req.extra
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str()),
         Some("session-123")
     );
 
