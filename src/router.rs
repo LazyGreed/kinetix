@@ -27,6 +27,8 @@ pub fn build(state: AppState) -> Router {
             axum::http::header::AUTHORIZATION,
             axum::http::HeaderName::from_static("x-api-key"),
             axum::http::HeaderName::from_static("anthropic-version"),
+            axum::http::HeaderName::from_static("anthropic-beta"),
+            axum::http::HeaderName::from_static("x-claude-code-session-id"),
             axum::http::HeaderName::from_static("x-kinetix-admin-token"),
         ]);
 
@@ -36,6 +38,7 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/chat/completions", post(api::chat_completions))
         .route("/v1/responses", post(api::responses))
         .route("/v1/messages", post(api::messages))
+        .route("/v1/messages/count_tokens", post(api::count_message_tokens))
         .route("/v1/models", get(api::list_models));
 
     let admin_api = Router::new()

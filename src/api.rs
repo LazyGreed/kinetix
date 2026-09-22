@@ -185,6 +185,79 @@ pub async fn messages(State(state): State<AppState>, headers: HeaderMap, body: S
     handle(state, FrontendFormat::Anthropic, headers, json, body).await
 }
 
+pub async fn count_message_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let request_id = new_request_id();
+
+    if let Err(retry) = state.ip_limiter.check(limits::client_ip(&headers)) {
+        return error_response(
+            FrontendFormat::Anthropic,
+            &request_id,
+            ProxyError::rate_limited("too many requests from this client", Some(retry)),
+        );
+    }
+
+    let presented = match extract_virtual_key(&headers) {
+        Some(key) => key,
+        None => {
+            return error_response(
+                FrontendFormat::Anthropic,
+                &request_id,
+                ProxyError::unauthorized(
+                    "missing API key. Provide it via 'Authorization: Bearer sk-kinetix-...' or 'x-api-key'.",
+                ),
+            )
+        }
+    };
+    let key = match authenticate_virtual_key(&state, &presented).await {
+        Ok(key) => key,
+        Err(error) => return error_response(FrontendFormat::Anthropic, &request_id, error),
+    };
+
+    let json: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return error_response(
+                FrontendFormat::Anthropic,
+                &request_id,
+                ProxyError::bad_request(format!("invalid JSON body: {error}")),
+            )
+        }
+    };
+    let mut req = match frontends::decode(FrontendFormat::Anthropic, json) {
+        Ok(req) => req,
+        Err(error) => return error_response(FrontendFormat::Anthropic, &request_id, error),
+    };
+    req.raw_body = Some(body);
+
+    if let Err(error) = limits::enforce_ip(&key, limits::client_ip(&headers)) {
+        return error_response(FrontendFormat::Anthropic, &request_id, error);
+    }
+    if let Err(error) = limits::enforce(&state.pool, &key, &req.requested_model).await {
+        return error_response(FrontendFormat::Anthropic, &request_id, error);
+    }
+
+    let protocol_headers = extract_protocol_headers(FrontendFormat::Anthropic, &headers);
+    match pipeline::count_tokens(&state, &key, &req, &request_id, &protocol_headers).await {
+        Ok(result) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("x-request-id", &request_id)
+            .header(
+                "x-kinetix-token-count",
+                if result.exact { "exact" } else { "estimated" },
+            )
+            .body(Body::from(
+                serde_json::json!({ "input_tokens": result.input_tokens }).to_string(),
+            ))
+            .unwrap_or_else(|_| Response::new(Body::from("internal error"))),
+        Err(error) => error_response(FrontendFormat::Anthropic, &request_id, error),
+    }
+}
+
 /// `GET /v1/models`. The response shape is chosen by the client's auth style so
 /// both OpenAI and Anthropic clients can discover models (FR-1.2, FR-10.10).
 pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {

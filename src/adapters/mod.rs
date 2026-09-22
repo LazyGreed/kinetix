@@ -37,6 +37,17 @@ pub trait Adapter: Send + Sync {
     /// Build the outbound URL for a model call.
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError>;
 
+    /// Whether this adapter provides an exact upstream token-count API.
+    fn supports_count_tokens(&self) -> bool {
+        false
+    }
+
+    /// Optional exact token-count endpoint for this wire adapter. Returning
+    /// `None` means Kinetix must use its documented local estimate.
+    fn count_tokens_url(&self, _ctx: &UpstreamContext<'_>) -> Result<Option<String>, ProxyError> {
+        Ok(None)
+    }
+
     /// Apply authentication to a request builder (header or query param).
     fn apply_auth(
         &self,

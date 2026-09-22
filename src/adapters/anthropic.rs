@@ -192,6 +192,15 @@ impl Adapter for AnthropicAdapter {
         Ok(format!("{base}/messages"))
     }
 
+    fn supports_count_tokens(&self) -> bool {
+        true
+    }
+
+    fn count_tokens_url(&self, ctx: &UpstreamContext<'_>) -> Result<Option<String>, ProxyError> {
+        let base = ctx.provider.base_url.trim_end_matches('/');
+        Ok(Some(format!("{base}/messages/count_tokens")))
+    }
+
     fn apply_auth(
         &self,
         ctx: &UpstreamContext<'_>,
@@ -686,6 +695,25 @@ mod tests {
             extra: Default::default(),
             raw_body: None,
         }
+    }
+
+    #[test]
+    fn count_tokens_url_uses_messages_subresource() {
+        let p = provider();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+        assert_eq!(
+            AnthropicAdapter::new()
+                .count_tokens_url(&ctx)
+                .unwrap()
+                .as_deref(),
+            Some("https://api.anthropic.com/v1/messages/count_tokens")
+        );
     }
 
     #[test]
