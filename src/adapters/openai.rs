@@ -546,9 +546,10 @@ fn openai_events(v: &Value) -> Vec<StreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn usage_keeps_reasoning_as_output_breakdown() {
-        let events = parse_openai_json(&serde_json::json!({
+        let events = openai_events(&serde_json::json!({
             "choices": [],
             "usage": {
                 "prompt_tokens": 100,
@@ -573,7 +574,6 @@ mod tests {
         assert_eq!(usage.thinking, Some(30));
     }
 
-    use super::*;
     use crate::db::{ModelRow, ProviderRow};
     use crate::types::AuthScheme;
 
