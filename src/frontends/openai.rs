@@ -25,6 +25,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         .and_then(|m| m.as_array())
         .ok_or_else(|| ProxyError::bad_request("missing required field 'messages'"))?;
 
+    let mut translation_issues = nested_translation_issues(obj);
     let mut system = Vec::new();
     let mut out_messages = Vec::new();
 
@@ -167,6 +168,8 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
             extra.insert(k.clone(), v.clone());
         }
     }
+    translation_issues.extend(crate::frontends::resolve_tool_result_names(&mut out_messages));
+    crate::frontends::attach_translation_issues(&mut extra, translation_issues);
 
     Ok(InternalRequest {
         requested_model: model,
@@ -182,6 +185,89 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         extra,
         raw_body: None,
     })
+}
+
+fn nested_translation_issues(
+    obj: &serde_json::Map<String, Value>,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if let Some(messages) = obj.get("messages").and_then(Value::as_array) {
+        for (message_index, message) in messages.iter().enumerate() {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            if !matches!(
+                role,
+                "system" | "developer" | "user" | "assistant" | "tool" | "function"
+            ) {
+                issues.push(format!(
+                    "messages[{message_index}] has unsupported role '{role}'"
+                ));
+            }
+            let text_only = matches!(role, "system" | "developer" | "tool" | "function");
+            inspect_openai_content(
+                &format!("messages[{message_index}].content"),
+                message.get("content"),
+                text_only,
+                &mut issues,
+            );
+        }
+    }
+
+    if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
+        for (tool_index, tool) in tools.iter().enumerate() {
+            let kind = tool.get("type").and_then(Value::as_str).unwrap_or("function");
+            if kind != "function" {
+                issues.push(format!(
+                    "tools[{tool_index}] type '{kind}' has no canonical cross-format representation"
+                ));
+            }
+        }
+    }
+
+    issues
+}
+
+fn inspect_openai_content(
+    path: &str,
+    content: Option<&Value>,
+    text_only: bool,
+    issues: &mut Vec<String>,
+) {
+    let Some(Value::Array(parts)) = content else {
+        return;
+    };
+    for (part_index, part) in parts.iter().enumerate() {
+        let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+        let part_path = format!("{path}[{part_index}]");
+        let is_text = matches!(kind, "text" | "input_text" | "output_text");
+        let is_image = matches!(kind, "image_url" | "input_image");
+
+        if text_only && !is_text {
+            issues.push(format!(
+                "{part_path} type '{kind}' cannot be represented in this message role during translation"
+            ));
+            continue;
+        }
+        if !is_text && !is_image {
+            issues.push(format!(
+                "{part_path} type '{kind}' has no canonical cross-format representation"
+            ));
+            continue;
+        }
+        if is_image {
+            let url = part
+                .pointer("/image_url/url")
+                .and_then(Value::as_str)
+                .or_else(|| part.get("image_url").and_then(Value::as_str))
+                .or_else(|| part.get("url").and_then(Value::as_str));
+            if url.is_none() {
+                issues.push(format!("{part_path} image is missing a translatable URL"));
+            }
+        }
+    }
 }
 
 fn map_reasoning_effort(s: &str) -> Option<ThinkingLevel> {
