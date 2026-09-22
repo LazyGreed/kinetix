@@ -240,8 +240,7 @@ pub fn aggregate(
             // Unknown means unknown (FR-6.2/6.8): only emit detail fields the
             // upstream actually reported, never a coerced zero.
             if let Some(cached) = usage.cached {
-                usage_obj["prompt_tokens_details"] =
-                    serde_json::json!({ "cached_tokens": cached });
+                usage_obj["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
             }
             if let Some(t) = usage.thinking {
                 usage_obj["completion_tokens_details"] =
