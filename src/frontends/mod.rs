@@ -239,18 +239,9 @@ pub fn aggregate(
             });
             // Unknown means unknown (FR-6.2/6.8): only emit detail fields the
             // upstream actually reported, never a coerced zero.
-            let mut prompt_details = serde_json::Map::new();
             if let Some(cached) = usage.cached {
-                prompt_details.insert("cached_tokens".into(), serde_json::json!(cached));
-            }
-            if let Some(cache_write) = usage.cache_write {
-                prompt_details.insert(
-                    "cache_write_tokens".into(),
-                    serde_json::json!(cache_write),
-                );
-            }
-            if !prompt_details.is_empty() {
-                usage_obj["prompt_tokens_details"] = Value::Object(prompt_details);
+                usage_obj["prompt_tokens_details"] =
+                    serde_json::json!({ "cached_tokens": cached });
             }
             if let Some(t) = usage.thinking {
                 usage_obj["completion_tokens_details"] =
@@ -323,8 +314,15 @@ pub fn aggregate(
             // FR-6.2/6.8: input/output are the required fields (0 when the
             // upstream omitted them); cached tokens are omitted when unknown
             // rather than coerced to zero.
+            let cache_read = usage.cached.unwrap_or(0);
+            let cache_write = usage.cache_write.unwrap_or(0);
+            let ordinary_input = usage
+                .input
+                .unwrap_or(0)
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write);
             let mut usage_obj = serde_json::json!({
-                "input_tokens": usage.input.unwrap_or(0),
+                "input_tokens": ordinary_input,
                 "output_tokens": usage.output.unwrap_or(0),
             });
             if let Some(c) = usage.cached {
