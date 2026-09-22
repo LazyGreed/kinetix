@@ -1384,7 +1384,9 @@ pub async fn test_provider(
     let url = adapter
         .build_url(&ctx)
         .map_err(|e| ApiError::bad(e.message))?;
-    let outbound = adapter.build_body(&ctx, &internal);
+    let outbound = adapter
+        .build_body(&ctx, &internal)
+        .map_err(|e| ApiError::internal(e.message))?;
     let parsed_url =
         url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid probe URL: {e}")))?;
 
