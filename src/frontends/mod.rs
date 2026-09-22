@@ -61,7 +61,11 @@ pub(crate) fn resolve_tool_result_names(messages: &mut [Message]) -> Vec<String>
                 if name.is_none() {
                     if let Some(resolved) = names.get(tool_call_id) {
                         *name = Some(resolved.clone());
-                    } else if !tool_call_id.is_empty() {
+                    } else if tool_call_id.is_empty() {
+                        issues.push(format!(
+                            "messages[{message_index}] tool result is missing tool-call identity"
+                        ));
+                    } else {
                         issues.push(format!(
                             "messages[{message_index}] tool result references unknown tool call id '{tool_call_id}'"
                         ));
