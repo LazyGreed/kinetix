@@ -16,6 +16,9 @@ use crate::types::{InternalRequest, ProxyError, StreamEvent, UpstreamFailure, Wi
 pub struct UpstreamContext<'a> {
     pub provider: &'a crate::db::ProviderRow,
     pub model: &'a crate::db::ModelRow,
+    /// Selected account identity. This is non-secret context for account-scoped
+    /// plugin state; built-in adapters do not use it.
+    pub account_id: Option<&'a str>,
     /// The decrypted credential for the chosen account.
     pub credential: String,
 }
