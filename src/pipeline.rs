@@ -1843,20 +1843,14 @@ fn apply_continuity(
         return Ok(());
     }
 
-    if route.continuity_policy == "error" || route.portability() == "reject" {
+    if route.portability() == "reject" {
         return Err(ProxyError::unsupported(format!(
             "route '{}' forbids cross-provider fallback with non-portable conversation state for target '{}'",
             route.name, target.model.display_name
         )));
     }
-    if route.continuity_policy == "convert" {
-        return Err(ProxyError::unsupported(format!(
-            "route '{}' requested continuity conversion, but opaque reasoning/tool signatures cannot be converted safely for target '{}'",
-            route.name, target.model.display_name
-        )));
-    }
 
-    // continuity=strip / portability=strip_with_warning
+    // portability=strip_with_warning
     for msg in &mut req.messages {
         msg.parts
             .retain(|p| !matches!(p, crate::types::Part::Thinking { .. }));
