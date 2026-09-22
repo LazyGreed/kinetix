@@ -43,6 +43,7 @@ fn text_and_finish_events() -> Vec<StreamEvent> {
             input: Some(5),
             output: Some(3),
             cached: None,
+            cache_write: None,
             thinking: None,
         }),
         StreamEvent::Finish(FinishReason::Stop),
@@ -121,6 +122,7 @@ fn openai_non_streaming_aggregate_is_stable() {
             input: Some(5),
             output: Some(3),
             cached: None,
+            cache_write: None,
             thinking: None,
         },
     );
@@ -157,6 +159,7 @@ fn anthropic_non_streaming_aggregate_is_stable() {
             input: Some(5),
             output: Some(3),
             cached: None,
+            cache_write: None,
             thinking: None,
         },
     );
@@ -302,6 +305,7 @@ fn responses_non_streaming_aggregation_is_stable() {
         input: Some(10),
         output: Some(5),
         cached: Some(2),
+        cache_write: None,
         thinking: None,
     };
     let agg = frontends::aggregate(
