@@ -1234,10 +1234,10 @@ async fn send_upstream(
             ctx.provider.wire(),
         ) {
             Some(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
-            None => adapter.build_body(ctx, req),
+            None => adapter.build_body(ctx, req)?,
         }
     } else {
-        adapter.build_body(ctx, req)
+        adapter.build_body(ctx, req)?
     };
 
     crate::outbound::send_provider_request(
@@ -1256,16 +1256,22 @@ async fn send_upstream(
         },
     )
     .await
-    .map_err(|e| UpstreamFailure {
-        kind: if e.timeout {
-            FailureKind::Timeout
+    .map_err(|e| {
+        if let Some(failure) = e.adapter_failure {
+            failure
         } else {
-            FailureKind::ConnectionError
-        },
-        status: None,
-        retry_after_secs: None,
-        message: e.message,
-        quota_reset_at: None,
+            UpstreamFailure {
+                kind: if e.timeout {
+                    FailureKind::Timeout
+                } else {
+                    FailureKind::ConnectionError
+                },
+                status: None,
+                retry_after_secs: None,
+                message: e.message,
+                quota_reset_at: None,
+            }
+        }
     })
 }
 
