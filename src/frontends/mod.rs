@@ -19,7 +19,6 @@ pub enum FrontendFormat {
     OpenAiResponses,
 }
 
-
 const TRANSLATION_ISSUES_KEY: &str = "__kinetix_translation_issues";
 
 pub(crate) fn attach_translation_issues(
@@ -53,9 +52,7 @@ pub(crate) fn resolve_tool_result_names(messages: &mut [Message]) -> Vec<String>
 
         for part in &mut message.parts {
             if let Part::ToolResult {
-                tool_call_id,
-                name,
-                ..
+                tool_call_id, name, ..
             } = part
             {
                 if name.is_none() {
