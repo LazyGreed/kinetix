@@ -374,7 +374,12 @@ fn add_nullable_type(
                 return Ok(());
             }
             Value::String(_) => return Ok(()),
-            _ => return Err(schema_error(path, "nullable requires a string or array type")),
+            _ => {
+                return Err(schema_error(
+                    path,
+                    "nullable requires a string or array type",
+                ))
+            }
         }
     }
 
@@ -435,10 +440,8 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
                         sanitize_schema_node(schema, &format!("{path}.{key}.{name}"))?,
                     );
                 }
-                let incoming = serde_json::Map::from_iter([(
-                    "$defs".to_string(),
-                    Value::Object(sanitized),
-                )]);
+                let incoming =
+                    serde_json::Map::from_iter([("$defs".to_string(), Value::Object(sanitized))]);
                 merge_schema_maps(&mut out, &incoming, path)?;
             }
 
@@ -454,9 +457,9 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
             }
 
             "properties" => {
-                let properties = value
-                    .as_object()
-                    .ok_or_else(|| schema_error(&format!("{path}.properties"), "must be an object"))?;
+                let properties = value.as_object().ok_or_else(|| {
+                    schema_error(&format!("{path}.properties"), "must be an object")
+                })?;
                 let mut sanitized = serde_json::Map::new();
                 for (name, schema) in properties {
                     sanitized.insert(
@@ -525,14 +528,13 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
             }
 
             "nullable" => {
-                nullable = value
-                    .as_bool()
-                    .ok_or_else(|| schema_error(&format!("{path}.nullable"), "must be a boolean"))?;
+                nullable = value.as_bool().ok_or_else(|| {
+                    schema_error(&format!("{path}.nullable"), "must be a boolean")
+                })?;
             }
 
             "$id" | "$anchor" | "type" | "format" | "title" | "description" | "enum"
-            | "minItems" | "maxItems" | "minimum" | "maximum" | "required"
-            | "propertyOrdering" => {
+            | "minItems" | "maxItems" | "minimum" | "maximum" | "required" | "propertyOrdering" => {
                 out.insert(key.clone(), value.clone());
             }
 
@@ -548,7 +550,10 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
     if let Some(value) = const_value {
         if let Some(existing) = out.get("enum").and_then(Value::as_array) {
             if !existing.contains(&value) {
-                return Err(schema_error(&format!("{path}.const"), "const conflicts with enum"));
+                return Err(schema_error(
+                    &format!("{path}.const"),
+                    "const conflicts with enum",
+                ));
             }
         }
         out.insert("enum".to_string(), Value::Array(vec![value]));
@@ -1246,7 +1251,6 @@ mod schema_tests {
             json!(["path"])
         );
     }
-
 }
 
 #[cfg(test)]
