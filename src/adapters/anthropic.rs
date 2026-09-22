@@ -183,9 +183,7 @@ fn anthropic_reset_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 
 fn parse_anthropic_usage(usage: &Value) -> TokenUsage {
     let ordinary = usage.get("input_tokens").and_then(Value::as_u64);
-    let cached = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_u64);
+    let cached = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
     let cache_write = usage
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64);
