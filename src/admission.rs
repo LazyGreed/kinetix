@@ -177,10 +177,11 @@ impl AdmissionController {
     pub async fn check_current(&self, pool: &Pool, key: &VirtualKeyRow) -> Result<(), ProxyError> {
         let entry = self.entry(&key.id);
         self.ensure_initialized(pool, &key.id, &entry).await;
-        entry
+        let result = entry
             .ledger
             .lock()
-            .check_current(key, Utc::now(), Instant::now())
+            .check_current(key, Utc::now(), Instant::now());
+        result
     }
 
     fn reserve_initialized(
@@ -475,7 +476,7 @@ pub fn estimate_request(
                 ));
             }
             if let Some(model) = snapshot.models.get(&model_id) {
-                models.push(model);
+                models.push(model.clone());
             }
         }
         Resolved::Route { targets, .. } => {
@@ -485,7 +486,7 @@ pub fn estimate_request(
                     continue;
                 }
                 if seen.insert(target.model.id.clone()) {
-                    models.push(&target.model);
+                    models.push(target.model.clone());
                 }
             }
             if models.is_empty() {
