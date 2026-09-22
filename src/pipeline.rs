@@ -155,6 +155,7 @@ pub async fn run(
     request_id: String,
     allow_fallback: bool,
     session: Option<String>,
+    protocol_headers: Vec<(String, String)>,
 ) -> Result<Response, ProxyError> {
     let started = Instant::now();
     let snap = state.registry.snapshot();
@@ -739,6 +740,7 @@ pub async fn run(
                 &target_req,
                 use_passthrough,
                 &meta.request_id,
+                &protocol_headers,
             ),
         )
         .await
@@ -858,13 +860,21 @@ pub async fn run(
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
                 let error_body_remaining = phase_deadline.saturating_duration_since(Instant::now());
+                let mut upstream_error_body: Option<String> = None;
                 let failure = if error_body_remaining.is_zero() {
                     timeout_failure("upstream timed out while reading error response")
                 } else {
                     match tokio::time::timeout(error_body_remaining, resp.text()).await {
                         Ok(Ok(body)) => {
                             let native = adapter.classify_error(status, &body, &headers);
-                            apply_provider_failure_rules(&target.provider, status, &body, native)
+                            let failure = apply_provider_failure_rules(
+                                &target.provider,
+                                status,
+                                &body,
+                                native,
+                            );
+                            upstream_error_body = Some(body);
+                            failure
                         }
                         Ok(Err(error)) => UpstreamFailure {
                             kind: if error.is_timeout() {
@@ -890,6 +900,15 @@ pub async fn run(
                 );
 
                 handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                let client_error = preserve_anthropic_error(
+                    failure_to_error(&failure, &target),
+                    format,
+                    adapter.as_ref(),
+                    &failure,
+                    status,
+                    &headers,
+                    upstream_error_body.as_deref(),
+                );
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
                 if !can_fallback {
@@ -907,12 +926,12 @@ pub async fn run(
                         None,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
-                    return Err(failure_to_error(&failure, &target));
+                    return Err(client_error);
                 }
                 if failure.kind == FailureKind::TargetError {
                     skip_logical_target = target.route_target_id.clone();
                 }
-                last_error = Some(failure_to_error(&failure, &target));
+                last_error = Some(client_error);
                 continue;
             }
             Err(failure) => {
@@ -1207,6 +1226,7 @@ async fn send_upstream(
     req: &InternalRequest,
     use_passthrough: bool,
     request_id: &str,
+    protocol_headers: &[(String, String)],
 ) -> Result<reqwest::Response, UpstreamFailure> {
     let url = adapter.build_url(ctx).map_err(|e| UpstreamFailure {
         kind: FailureKind::BadRequest,
@@ -1253,6 +1273,11 @@ async fn send_upstream(
             json_body: Some(body),
             accept_event_stream: true,
             request_id: Some(request_id.to_string()),
+            headers: if adapter.wire_format() == "anthropic" {
+                protocol_headers.to_vec()
+            } else {
+                Vec::new()
+            },
             total_timeout: None,
         },
     )
@@ -1578,6 +1603,75 @@ async fn handle_key_failure(
         // Refresh the registry snapshot so later requests see the new status.
         let _ = state.registry.reload(&state.pool).await;
     }
+}
+
+fn safe_anthropic_error_body(body: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    if parsed.get("type").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let error = parsed.get("error")?.as_object()?;
+    let error_type = error.get("type")?.as_str()?;
+    let message = error.get("message")?.as_str()?;
+    let mut out = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": crate::crypto::redact(message),
+        }
+    });
+    if let Some(request_id) = parsed
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+    {
+        out["request_id"] = serde_json::json!(request_id);
+    }
+    Some(out)
+}
+
+fn anthropic_error_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str();
+            let allowed = matches!(
+                name,
+                "retry-after" | "retry-after-ms" | "x-should-retry" | "request-id"
+            ) || name.starts_with("anthropic-ratelimit-");
+            if !allowed {
+                return None;
+            }
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn preserve_anthropic_error(
+    mut error: ProxyError,
+    format: FrontendFormat,
+    adapter: &dyn Adapter,
+    failure: &UpstreamFailure,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: Option<&str>,
+) -> ProxyError {
+    if format != FrontendFormat::Anthropic
+        || adapter.wire_format() != "anthropic"
+        || failure.kind == FailureKind::AuthError
+    {
+        return error;
+    }
+
+    error.http_status_override = Some(status);
+    error.headers.extend(anthropic_error_headers(headers));
+    if let Some(body) = body.and_then(safe_anthropic_error_body) {
+        error.body_override = Some(body);
+    }
+    error
 }
 
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
@@ -3500,6 +3594,83 @@ mod route_policy_tests {
             predicate: TargetPredicate::default(),
             param_overrides: Value::Null,
         }
+    }
+
+    #[test]
+    fn anthropic_error_passthrough_is_sanitized_and_keeps_retry_metadata() {
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+        let failure = UpstreamFailure {
+            kind: FailureKind::ServerError,
+            status: Some(529),
+            retry_after_secs: Some(2),
+            message: "overloaded".into(),
+            quota_reset_at: None,
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        headers.insert("x-should-retry", "true".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-unified-remaining",
+            "0".parse().unwrap(),
+        );
+        headers.insert("request-id", "req_upstream_123".parse().unwrap());
+        headers.insert("set-cookie", "do-not-forward=true".parse().unwrap());
+
+        let error = preserve_anthropic_error(
+            ProxyError::upstream("overloaded"),
+            FrontendFormat::Anthropic,
+            &adapter,
+            &failure,
+            529,
+            &headers,
+            Some(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"busy","debug":"drop"},"request_id":"req_upstream_123","internal":"drop"}"#,
+            ),
+        );
+
+        assert_eq!(error.http_status_override, Some(529));
+        assert_eq!(
+            error.body_override.as_ref().unwrap(),
+            &serde_json::json!({
+                "type": "error",
+                "error": { "type": "overloaded_error", "message": "busy" },
+                "request_id": "req_upstream_123"
+            })
+        );
+        assert!(error
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-should-retry" && value == "true"));
+        assert!(error
+            .headers
+            .iter()
+            .any(|(name, _)| name == "anthropic-ratelimit-unified-remaining"));
+        assert!(!error.headers.iter().any(|(name, _)| name == "set-cookie"));
+    }
+
+    #[test]
+    fn anthropic_upstream_auth_failures_stay_internal() {
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+        let failure = UpstreamFailure {
+            kind: FailureKind::AuthError,
+            status: Some(401),
+            retry_after_secs: None,
+            message: "bad upstream credential".into(),
+            quota_reset_at: None,
+        };
+        let error = preserve_anthropic_error(
+            ProxyError::upstream("upstream auth failed"),
+            FrontendFormat::Anthropic,
+            &adapter,
+            &failure,
+            401,
+            &reqwest::header::HeaderMap::new(),
+            Some(
+                r#"{"type":"error","error":{"type":"authentication_error","message":"credential detail"}}"#,
+            ),
+        );
+        assert_eq!(error.http_status_override, None);
+        assert_eq!(error.body_override, None);
     }
 
     #[test]

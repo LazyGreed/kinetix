@@ -126,10 +126,43 @@ impl Default for AnthropicAdapter {
     }
 }
 
+fn anthropic_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        return Some(((ms / 1000.0).ceil() as u64).max(1));
+    }
+
+    if let Some(value) = headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        if let Ok(seconds) = value.parse::<f64>() {
+            if seconds.is_finite() && seconds >= 0.0 {
+                return Some((seconds.ceil() as u64).max(1));
+            }
+        }
+        if let Ok(when) = chrono::DateTime::parse_from_rfc2822(value) {
+            let when = when.with_timezone(&chrono::Utc);
+            let now = chrono::Utc::now();
+            if when > now {
+                return Some((when - now).num_seconds().max(1) as u64);
+            }
+        }
+    }
+
+    anthropic_reset_delay(headers)
+}
+
 /// Anthropic may omit Retry-After on 429s but provides RFC3339 reset
 /// timestamps. Use the earliest future reset as the client/cooldown hint.
 fn anthropic_reset_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    const RESET_HEADERS: [&str; 4] = [
+    const RESET_HEADERS: [&str; 5] = [
+        "anthropic-ratelimit-unified-reset",
         "anthropic-ratelimit-requests-reset",
         "anthropic-ratelimit-tokens-reset",
         "anthropic-ratelimit-input-tokens-reset",
@@ -320,11 +353,7 @@ impl Adapter for AnthropicAdapter {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        let retry_after_secs = headers
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .or_else(|| anthropic_reset_delay(headers));
+        let retry_after_secs = anthropic_retry_delay(headers);
 
         let lower = message.to_ascii_lowercase();
         let credential_error = status == 401
@@ -565,6 +594,23 @@ impl Adapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_retry_after_ms_takes_precedence() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        headers.insert("retry-after", "10".parse().unwrap());
+        assert_eq!(anthropic_retry_delay(&headers), Some(2));
+    }
+
+    #[test]
+    fn anthropic_retry_after_http_date_is_supported() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let when = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
+        headers.insert("retry-after", when.parse().unwrap());
+        let delay = anthropic_retry_delay(&headers).unwrap();
+        assert!((1..=30).contains(&delay));
+    }
 
     #[test]
     fn anthropic_reset_headers_supply_retry_delay() {

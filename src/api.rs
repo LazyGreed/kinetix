@@ -31,6 +31,7 @@ fn extract_session(headers: &HeaderMap) -> Option<String> {
     // it is a stable per-conversation identifier, not a guessed one.
     for name in [
         "x-kinetix-session",
+        "x-claude-code-session-id",
         "x-session-id",
         // Pi's `sessionAffinityFormat: "openai"` uses the underscore spelling.
         "session_id",
@@ -45,6 +46,23 @@ fn extract_session(headers: &HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_protocol_headers(format: FrontendFormat, headers: &HeaderMap) -> Vec<(String, String)> {
+    if format != FrontendFormat::Anthropic {
+        return Vec::new();
+    }
+    ["anthropic-version", "anthropic-beta"]
+        .into_iter()
+        .filter_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// Shared entry for both inbound frontends.
@@ -99,6 +117,7 @@ async fn handle(
 
     // 4. Run the pipeline.
     let session = extract_session(&headers);
+    let protocol_headers = extract_protocol_headers(format, &headers);
     match pipeline::run(
         &state,
         format,
@@ -107,6 +126,7 @@ async fn handle(
         request_id.clone(),
         true,
         session,
+        protocol_headers,
     )
     .await
     {
@@ -236,14 +256,23 @@ pub async fn healthz(State(state): State<AppState>) -> Response {
 pub fn error_response(format: FrontendFormat, request_id: &str, err: ProxyError) -> Response {
     let status =
         StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let body = frontends::models::error_body(format, &err);
+    let body = err
+        .body_override
+        .clone()
+        .unwrap_or_else(|| frontends::models::error_body(format, &err));
 
     let mut builder = Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .header("x-request-id", request_id);
+    let has_retry_after = err
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("retry-after"));
     if let Some(retry) = err.retry_after_secs {
-        builder = builder.header("retry-after", retry.to_string());
+        if !has_retry_after {
+            builder = builder.header("retry-after", retry.to_string());
+        }
     }
     for (k, v) in &err.headers {
         builder = builder.header(k, v);
@@ -251,4 +280,47 @@ pub fn error_response(format: FrontendFormat, request_id: &str, err: ProxyError)
     builder
         .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| Response::new(Body::from("internal error")))
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn claude_code_session_header_drives_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            "session-claude-code-1".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_session(&headers).as_deref(),
+            Some("session-claude-code-1")
+        );
+    }
+
+    #[test]
+    fn only_safe_anthropic_protocol_headers_are_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert(
+            "anthropic-beta",
+            "prompt-caching-2024-07-31".parse().unwrap(),
+        );
+        headers.insert(
+            "x-claude-code-session-id",
+            "session-secret-ish-context".parse().unwrap(),
+        );
+        headers.insert("authorization", "Bearer client-secret".parse().unwrap());
+
+        let forwarded = extract_protocol_headers(FrontendFormat::Anthropic, &headers);
+        assert_eq!(
+            forwarded,
+            vec![
+                ("anthropic-version".into(), "2023-06-01".into()),
+                ("anthropic-beta".into(), "prompt-caching-2024-07-31".into()),
+            ]
+        );
+        assert!(extract_protocol_headers(FrontendFormat::OpenAi, &headers).is_empty());
+    }
 }

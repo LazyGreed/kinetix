@@ -16,17 +16,25 @@ impl axum::response::IntoResponse for ProxyError {
         let status =
             StatusCode::from_u16(self.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut builder = Response::builder().status(status);
+        let has_retry_after = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("retry-after"));
         if let Some(retry) = self.retry_after_secs {
-            builder = builder.header("retry-after", retry.to_string());
+            if !has_retry_after {
+                builder = builder.header("retry-after", retry.to_string());
+            }
         }
         for (k, v) in &self.headers {
             builder = builder.header(k, v);
         }
+        let body = self
+            .body_override
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"error": {"message": self.message}}));
         builder
             .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({"error": {"message": self.message}}).to_string(),
-            ))
+            .body(Body::from(body.to_string()))
             .unwrap_or_else(|_| Response::new(Body::from("internal error")))
     }
 }

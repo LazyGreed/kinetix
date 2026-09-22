@@ -100,6 +100,8 @@ pub struct ProviderRequest {
     pub json_body: Option<Value>,
     pub accept_event_stream: bool,
     pub request_id: Option<String>,
+    /// Safe client protocol headers explicitly selected by the API boundary.
+    pub headers: Vec<(String, String)>,
     /// Optional whole-request timeout for bounded control-plane calls such as
     /// probes/discovery. Streaming proxy traffic must leave this as `None`.
     pub total_timeout: Option<Duration>,
@@ -355,6 +357,9 @@ async fn send_provider_request_once(
                 .apply_auth(ctx, builder)
                 .map_err(OutboundError::adapter)?;
             for (name, value) in ctx.provider.extra_headers_map() {
+                builder = builder.header(name, value);
+            }
+            for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
         }

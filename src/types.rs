@@ -468,6 +468,11 @@ pub struct ProxyError {
     pub retry_after_secs: Option<u64>,
     /// Response headers to surface (e.g. X-Kinetix-Fallback).
     pub headers: Vec<(String, String)>,
+    /// Preserve a compatible upstream HTTP status when the downstream wire
+    /// format can safely expose it.
+    pub http_status_override: Option<u16>,
+    /// Preserve a sanitized wire-compatible upstream error body.
+    pub body_override: Option<serde_json::Value>,
 }
 
 impl ProxyError {
@@ -489,6 +494,8 @@ impl ProxyError {
             message: msg.into(),
             retry_after_secs: retry_after,
             headers: Vec::new(),
+            http_status_override: None,
+            body_override: None,
         }
     }
     pub fn budget_exceeded(msg: impl Into<String>) -> Self {
@@ -503,6 +510,8 @@ impl ProxyError {
             message: msg.into(),
             retry_after_secs: retry_after,
             headers: Vec::new(),
+            http_status_override: None,
+            body_override: None,
         }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
@@ -519,9 +528,14 @@ impl ProxyError {
             message: msg.into(),
             retry_after_secs: None,
             headers: Vec::new(),
+            http_status_override: None,
+            body_override: None,
         }
     }
     pub fn http_status(&self) -> u16 {
+        if let Some(status) = self.http_status_override {
+            return status;
+        }
         match self.kind {
             ErrorKind::BadRequest => 400,
             ErrorKind::Unauthorized => 401,
