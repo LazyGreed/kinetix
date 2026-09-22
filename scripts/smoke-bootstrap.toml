@@ -59,6 +59,21 @@ models_path = "/models"
   thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
 
 
+[[providers]]
+name = "Synth Failure"
+base_url = "http://127.0.0.1:9199/gemini/v1beta"
+wire_format = "gemini"
+auth_scheme = "custom_header"
+custom_header_name = "x-goog-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-failure"
+  api_key = "smoke-failure-key"
+  priority = 1
+  quota_type = "none"
+
   [[providers.models]]
   upstream_id = "syn-fail"
   display_name = "Synthetic Failing Gemini"
@@ -115,7 +130,7 @@ fallback_triggers = { on429 = true, onQuota = true, on5xx = true, onTimeout = tr
 max_attempts = 2
 
   [[routes.targets]]
-  model = "Synth Gemini/syn-fail"
+  model = "Synth Failure/syn-fail"
   priority = 1
   weight = 1
 
