@@ -36,6 +36,16 @@ def record_result(client, upstream, capability, passed, detail="", duration_ms=0
     print(f"  [{status}] {client:<24} | {upstream:<14} | {capability:<18} ({duration_ms}ms) {detail}")
 
 
+def urlopen(req, timeout=15):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP {error.code} {req.full_url}: {body}"
+        ) from error
+
+
 def read_sse_events(response):
     """Parse raw SSE stream into a list of (event_type, data_dict_or_str)."""
     events = []
@@ -96,7 +106,7 @@ def test_pi_plain_stream(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     # Check for text chunks and [DONE]
@@ -138,7 +148,7 @@ def test_pi_tool_use(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     # Reassemble tool calls
@@ -188,7 +198,7 @@ def test_pi_multi_turn(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     has_chunks = any(isinstance(e[1], dict) and e[1].get("choices") for e in events)
@@ -196,31 +206,59 @@ def test_pi_multi_turn(upstream_model):
     record_result("Pi (OpenAI Chat)", upstream_model, "multi_turn", has_chunks, "turn 2 grounded", duration)
 
 
-def test_pi_session_affinity(upstream_model):
-    t0 = time.time()
-    url = f"{BASE_URL}/v1/chat/completions"
-    session_id = f"pi_sess_{int(time.time())}"
+def _target_marker(data, candidates):
+    text = json.dumps(data, sort_keys=True)
+    for candidate in candidates:
+        if f"target:{candidate}" in text:
+            return candidate
+    return None
+
+
+def _openai_sticky_request(headers, prompt_cache_key=None):
     payload = {
-        "model": upstream_model,
-        "stream": True,
-        "messages": [{"role": "user", "content": "ping"}]
+        "model": "syn-sticky-openai",
+        "stream": False,
+        "messages": [{"role": "user", "content": "sticky affinity"}],
     }
+    if prompt_cache_key:
+        payload["prompt_cache_key"] = prompt_cache_key
     req = urllib.request.Request(
-        url,
+        f"{BASE_URL}/v1/chat/completions",
         data=json.dumps(payload).encode(),
         headers={
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
             "User-Agent": "pi (linux; x86_64)",
-            "X-Session-Id": session_id,
-        }
+            **headers,
+        },
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        events = read_sse_events(resp)
+    with urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
 
-    passed = any(isinstance(e[1], dict) and e[1].get("choices") for e in events)
+
+def test_pi_session_affinity(_upstream_model):
+    t0 = time.time()
+    session_id = f"pi_sess_{int(time.time())}"
+    headers = {
+        "session_id": session_id,
+        "X-Client-Request-Id": session_id,
+        "X-Session-Affinity": session_id,
+    }
+    first = _openai_sticky_request(headers, session_id)
+    second = _openai_sticky_request(headers, session_id)
+    candidates = ("syn-openai-a", "syn-openai-b")
+    first_target = _target_marker(first, candidates)
+    second_target = _target_marker(second, candidates)
+    passed = first_target is not None and first_target == second_target
     duration = int((time.time() - t0) * 1000)
-    record_result("Pi (OpenAI Chat)", upstream_model, "session_affinity", passed, f"header: {session_id}", duration)
+    record_result(
+        "Pi (OpenAI Chat)",
+        "syn-sticky-openai",
+        "session_affinity",
+        passed,
+        f"{first_target} -> {second_target}",
+        duration,
+    )
 
 
 def test_pi_sync_aggregation(upstream_model):
@@ -240,7 +278,7 @@ def test_pi_sync_aggregation(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
     passed = data.get("object") == "chat.completion" and len(data.get("choices", [])) > 0
@@ -270,7 +308,7 @@ def test_responses_plain_stream(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -308,7 +346,7 @@ def test_responses_tool_use(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -338,7 +376,7 @@ def test_responses_multi_turn(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -347,31 +385,46 @@ def test_responses_multi_turn(upstream_model):
     record_result("Codex (Responses API)", upstream_model, "multi_turn", passed, "input chaining", duration)
 
 
-def test_responses_session_affinity(upstream_model):
+def test_responses_session_affinity(_upstream_model):
     t0 = time.time()
-    url = f"{BASE_URL}/v1/responses"
     session_id = f"codex_sess_{int(time.time())}"
-    payload = {
-        "model": upstream_model,
-        "stream": True,
-        "input": "ping"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "codex-cli/0.125.0",
+        "session_id": session_id,
+        "X-Client-Request-Id": session_id,
     }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-            "User-Agent": "codex-cli/0.125.0",
-            "X-Kinetix-Session": session_id,
-        }
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        events = read_sse_events(resp)
 
-    passed = any(e[0] == "response.completed" for e in events)
+    def request():
+        req = urllib.request.Request(
+            f"{BASE_URL}/v1/responses",
+            data=json.dumps({
+                "model": "syn-sticky-openai",
+                "stream": False,
+                "input": "sticky affinity",
+                "prompt_cache_key": session_id,
+            }).encode(),
+            headers=headers,
+        )
+        with urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    first = request()
+    second = request()
+    candidates = ("syn-openai-a", "syn-openai-b")
+    first_target = _target_marker(first, candidates)
+    second_target = _target_marker(second, candidates)
+    passed = first_target is not None and first_target == second_target
     duration = int((time.time() - t0) * 1000)
-    record_result("Codex (Responses API)", upstream_model, "session_affinity", passed, f"header: {session_id}", duration)
+    record_result(
+        "Codex (Responses API)",
+        "syn-sticky-openai",
+        "session_affinity",
+        passed,
+        f"{first_target} -> {second_target}",
+        duration,
+    )
 
 
 def test_responses_sync_aggregation(upstream_model):
@@ -391,7 +444,7 @@ def test_responses_sync_aggregation(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
     passed = data.get("object") == "response" and data.get("status") == "completed" and "output" in data
@@ -434,7 +487,7 @@ def test_anthropic_count_tokens(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
         mode = resp.headers.get("x-kinetix-token-count")
 
@@ -473,7 +526,7 @@ def test_anthropic_plain_stream(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -514,7 +567,7 @@ def test_anthropic_tool_use(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -556,7 +609,7 @@ def test_anthropic_multi_turn(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -565,33 +618,46 @@ def test_anthropic_multi_turn(upstream_model):
     record_result("Anthropic Agent", upstream_model, "multi_turn", passed, "tool_result turn", duration)
 
 
-def test_anthropic_session_affinity(upstream_model):
+def test_anthropic_session_affinity(_upstream_model):
     t0 = time.time()
-    url = f"{BASE_URL}/v1/messages"
     session_id = f"claude_sess_{int(time.time())}"
-    payload = {
-        "model": upstream_model,
-        "stream": True,
-        "max_tokens": 64,
-        "messages": [{"role": "user", "content": "ping"}]
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-            "User-Agent": "claude-code/0.2.0",
-            "X-Conversation-Id": session_id,
-        }
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        events = read_sse_events(resp)
 
-    passed = any(e[0] == "message_stop" for e in events)
+    def request():
+        req = urllib.request.Request(
+            f"{BASE_URL}/v1/messages",
+            data=json.dumps({
+                "model": "syn-sticky-anthropic",
+                "stream": False,
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "sticky affinity"}],
+            }).encode(),
+            headers={
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
+                "Content-Type": "application/json",
+                "User-Agent": "claude-cli/2.1.173 (external, cli)",
+                "X-Claude-Code-Session-Id": session_id,
+            },
+        )
+        with urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    first = request()
+    second = request()
+    candidates = ("syn-anthropic-a", "syn-anthropic-b")
+    first_target = _target_marker(first, candidates)
+    second_target = _target_marker(second, candidates)
+    passed = first_target is not None and first_target == second_target
     duration = int((time.time() - t0) * 1000)
-    record_result("Anthropic Agent", upstream_model, "session_affinity", passed, f"header: {session_id}", duration)
+    record_result(
+        "Anthropic Agent",
+        "syn-sticky-anthropic",
+        "session_affinity",
+        passed,
+        f"{first_target} -> {second_target}",
+        duration,
+    )
 
 
 def test_anthropic_sync_aggregation(upstream_model):
@@ -613,12 +679,348 @@ def test_anthropic_sync_aggregation(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
     passed = data.get("type") == "message" and data.get("role") == "assistant" and len(data.get("content", [])) > 0
     duration = int((time.time() - t0) * 1000)
     record_result("Anthropic Agent", upstream_model, "sync_aggregation", passed, f"id: {data.get('id')}", duration)
+
+
+
+# ---------------------------------------------------------------------------
+# Current coding-agent edge fixtures
+# ---------------------------------------------------------------------------
+
+_ONE_PIXEL_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wlq9mQAAAAASUVORK5CYII="
+)
+
+
+def test_pi_openrouter_affinity(_upstream_model):
+    t0 = time.time()
+    session_id = f"pi_openrouter_{int(time.time())}"
+    headers = {"X-Session-Id": session_id}
+    first = _openai_sticky_request(headers)
+    second = _openai_sticky_request(headers)
+    candidates = ("syn-openai-a", "syn-openai-b")
+    first_target = _target_marker(first, candidates)
+    second_target = _target_marker(second, candidates)
+    passed = first_target is not None and first_target == second_target
+    record_result(
+        "Pi (OpenAI Chat)",
+        "syn-sticky-openai",
+        "affinity_openrouter",
+        passed,
+        f"{first_target} -> {second_target}",
+        int((time.time()-t0)*1000),
+    )
+
+
+def test_pi_parallel_tools(upstream_model):
+    t0 = time.time()
+    payload = {
+        "model": upstream_model,
+        "stream": True,
+        "messages": [{"role": "user", "content": "fixture:multi-tools call both tools"}],
+        "tools": [
+            {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}},
+        ],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
+    )
+    with urlopen(req, timeout=15) as resp:
+        events = read_sse_events(resp)
+    names = set()
+    for _, ev in events:
+        if not isinstance(ev, dict) or not ev.get("choices"):
+            continue
+        for call in ev["choices"][0].get("delta", {}).get("tool_calls", []):
+            name = call.get("function", {}).get("name")
+            if name:
+                names.add(name)
+    passed = {"get_weather", "read_file"} <= names
+    record_result("Pi (OpenAI Chat)", upstream_model, "parallel_tools", passed, ",".join(sorted(names)), int((time.time()-t0)*1000))
+
+
+def test_pi_vision(upstream_model):
+    t0 = time.time()
+    payload = {
+        "model": upstream_model,
+        "stream": False,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "fixture:vision describe this"},
+                {"type": "image_url", "image_url": {"url": _ONE_PIXEL_PNG}},
+            ],
+        }],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+    passed = bool(data.get("choices"))
+    record_result("Pi (OpenAI Chat)", upstream_model, "vision", passed, "data-url image", int((time.time()-t0)*1000))
+
+
+def test_pi_thinking(upstream_model):
+    t0 = time.time()
+    payload = {
+        "model": upstream_model,
+        "stream": False,
+        "reasoning_effort": "high",
+        "messages": [{"role": "user", "content": "fixture:thinking solve carefully"}],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+    passed = bool(data.get("choices"))
+    record_result("Pi (OpenAI Chat)", upstream_model, "reasoning_control", passed, "reasoning_effort=high", int((time.time()-t0)*1000))
+
+
+def test_unknown_client_field_is_dropped(upstream_model):
+    t0 = time.time()
+    payload = {
+        "model": upstream_model,
+        "stream": False,
+        "messages": [{"role": "user", "content": "unknown-field compatibility"}],
+        "client_only_unknown": {"future": True},
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+    passed = bool(data.get("choices"))
+    record_result("Pi (OpenAI Chat)", upstream_model, "unknown_fields", passed, "not leaked to Gemini", int((time.time()-t0)*1000))
+
+
+def test_route_fallback():
+    t0 = time.time()
+    payload = {"model": "syn-fallback", "stream": False, "messages": [{"role": "user", "content": "fallback"}]}
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+        fallback = resp.headers.get("x-kinetix-fallback")
+    passed = bool(data.get("choices")) and fallback == "1"
+    record_result("Routing", "syn-fallback", "route_fallback", passed, f"header={fallback}", int((time.time()-t0)*1000))
+
+
+def _claude_headers(session_id=None):
+    headers = {
+        "x-api-key": API_KEY,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-cli/2.1.173 (external, cli)",
+    }
+    if session_id:
+        headers["X-Claude-Code-Session-Id"] = session_id
+    return headers
+
+
+def test_claude_native_protocol():
+    t0 = time.time()
+    payload = {
+        "model": "syn-anthropic",
+        "stream": False,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "fixture:claude-protocol hello"}],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers=_claude_headers("claude-protocol-session"),
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+    passed = data.get("type") == "message"
+    record_result("Claude Code", "syn-anthropic", "protocol_headers", passed, "version+beta+session", int((time.time()-t0)*1000))
+
+
+def test_claude_exact_count_tokens():
+    t0 = time.time()
+    payload = {
+        "model": "syn-anthropic",
+        "messages": [{"role": "user", "content": "count me"}],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/messages/count_tokens",
+        data=json.dumps(payload).encode(),
+        headers=_claude_headers("claude-count-session"),
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+        mode = resp.headers.get("x-kinetix-token-count")
+    passed = data.get("input_tokens") == 123 and mode == "exact"
+    record_result("Claude Code", "syn-anthropic", "count_tokens_exact", passed, f"mode={mode}", int((time.time()-t0)*1000))
+
+
+def test_claude_parallel_tools():
+    t0 = time.time()
+    payload = {
+        "model": "syn-anthropic",
+        "stream": True,
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "fixture:multi-tools use both"}],
+        "tools": [
+            {"name": "get_weather", "input_schema": {"type": "object"}},
+            {"name": "read_file", "input_schema": {"type": "object"}},
+        ],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers=_claude_headers("claude-tools-session"),
+    )
+    with urlopen(req, timeout=15) as resp:
+        events = read_sse_events(resp)
+    names = {
+        ev.get("content_block", {}).get("name")
+        for name, ev in events
+        if name == "content_block_start" and isinstance(ev, dict)
+        and ev.get("content_block", {}).get("type") == "tool_use"
+    }
+    names.discard(None)
+    passed = {"get_weather", "read_file"} <= names
+    record_result("Claude Code", "syn-anthropic", "parallel_tools", passed, ",".join(sorted(names)), int((time.time()-t0)*1000))
+
+
+def test_claude_vision_and_thinking():
+    t0 = time.time()
+    payload = {
+        "model": "syn-anthropic",
+        "stream": False,
+        "max_tokens": 128,
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "fixture:vision fixture:thinking inspect"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _ONE_PIXEL_PNG.split(",", 1)[1]}},
+            ],
+        }],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers=_claude_headers("claude-vision-session"),
+    )
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+    passed = data.get("type") == "message"
+    record_result("Claude Code", "syn-anthropic", "vision+thinking", passed, "native blocks", int((time.time()-t0)*1000))
+
+
+def test_openai_truncated_passthrough_identity():
+    t0 = time.time()
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=json.dumps({
+            "model": "syn-truncated-openai",
+            "stream": True,
+            "messages": [{"role": "user", "content": "truncate"}],
+        }).encode(),
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "pi (linux; x86_64)",
+        },
+    )
+    with urlopen(req, timeout=15) as resp:
+        events = read_sse_events(resp)
+
+    chunks = [
+        event for _, event in events
+        if isinstance(event, dict) and event.get("choices")
+    ]
+    errors = [
+        event for _, event in events
+        if isinstance(event, dict) and isinstance(event.get("error"), dict)
+    ]
+    ids = {event.get("id") for event in chunks}
+    models = {event.get("model") for event in chunks}
+    synthesized_error_chunks = [
+        event for event in chunks
+        if event.get("choices", [{}])[0].get("finish_reason") == "error"
+    ]
+    identity_neutral_error = all(
+        "id" not in event and "model" not in event for event in errors
+    )
+    passed = (
+        ids == {"upstream-openai-truncated"}
+        and models == {"syn-truncated-openai"}
+        and len(errors) == 1
+        and identity_neutral_error
+        and not synthesized_error_chunks
+        and any(event == "[DONE]" for _, event in events)
+    )
+    record_result(
+        "Pi (OpenAI Chat)",
+        "syn-truncated-openai",
+        "truncated_identity",
+        passed,
+        f"ids={ids}, models={models}, errors={len(errors)}",
+        int((time.time()-t0)*1000),
+    )
+
+
+def test_anthropic_broken_stream(model, capability):
+    t0 = time.time()
+    payload = {
+        "model": model,
+        "stream": True,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "broken stream"}],
+    }
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers=_claude_headers("claude-broken-session"),
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            events = read_sse_events(resp)
+        passed = capability == "truncated_stream" and any(
+            name == "error" for name, _ in events
+        )
+        detail = f"events={len(events)}"
+    except RuntimeError as error:
+        message = str(error)
+        passed = (
+            capability == "malformed_stream"
+            and "HTTP 502" in message
+            and '"type":"error"' in message
+            and '"type":"api_error"' in message
+        )
+        detail = message
+    record_result(
+        "Claude Code",
+        model,
+        capability,
+        passed,
+        detail,
+        int((time.time()-t0)*1000),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -638,11 +1040,18 @@ def run_matrix():
     test_pi_tool_use("syn-openai")
     test_pi_multi_turn("syn-openai")
     test_pi_session_affinity("syn-openai")
+    test_pi_openrouter_affinity("syn-openai")
     test_pi_sync_aggregation("syn-openai")
+    test_openai_truncated_passthrough_identity()
 
     test_pi_plain_stream("syn-gemini")
     test_pi_tool_use("syn-gemini")
     test_pi_multi_turn("syn-gemini")
+    test_pi_parallel_tools("syn-gemini")
+    test_pi_vision("syn-gemini")
+    test_pi_thinking("syn-gemini")
+    test_unknown_client_field_is_dropped("syn-gemini")
+    test_route_fallback()
 
     # 2. Next-Gen Coding Agent / Codex (OpenAI Responses API)
     print("\n==> Testing Next-Gen Coding Agent (OpenAI Responses API)")
@@ -662,6 +1071,13 @@ def run_matrix():
     test_anthropic_multi_turn("syn-gemini")
     test_anthropic_session_affinity("syn-gemini")
     test_anthropic_sync_aggregation("syn-gemini")
+
+    test_claude_native_protocol()
+    test_claude_exact_count_tokens()
+    test_claude_parallel_tools()
+    test_claude_vision_and_thinking()
+    test_anthropic_broken_stream("syn-malformed", "malformed_stream")
+    test_anthropic_broken_stream("syn-truncated", "truncated_stream")
 
     test_anthropic_plain_stream("syn-openai")
 

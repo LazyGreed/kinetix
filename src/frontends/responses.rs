@@ -93,9 +93,12 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     let stream = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     // Responses input is always translated through Kinetix's canonical model;
-    // there is no native Responses passthrough. Unknown top-level semantics are
-    // rejected by validate_supported_subset instead of being carried as extras.
-    let extra = serde_json::Map::new();
+    // there is no native Responses passthrough. Keep only explicitly supported
+    // portable extensions; unknown top-level semantics still fail closed.
+    let mut extra = serde_json::Map::new();
+    if let Some(prompt_cache_key) = obj.get("prompt_cache_key") {
+        extra.insert("prompt_cache_key".to_string(), prompt_cache_key.clone());
+    }
     let identity_issues = crate::frontends::resolve_tool_result_names(&mut out_messages);
     if let Some(issue) = identity_issues.first() {
         return Err(ProxyError::unsupported(format!(
@@ -120,7 +123,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
 }
 
 fn validate_supported_subset(obj: &serde_json::Map<String, Value>) -> Result<(), ProxyError> {
-    const SUPPORTED: [&str; 23] = [
+    const SUPPORTED: [&str; 24] = [
         "model",
         "input",
         "instructions",
@@ -136,6 +139,7 @@ fn validate_supported_subset(obj: &serde_json::Map<String, Value>) -> Result<(),
         "stream",
         "reasoning",
         "reasoning_effort",
+        "prompt_cache_key",
         "store",
         "background",
         "text",
@@ -157,6 +161,14 @@ fn validate_supported_subset(obj: &serde_json::Map<String, Value>) -> Result<(),
     if obj.get("stream").is_some_and(|value| !value.is_boolean()) {
         return Err(ProxyError::bad_request(
             "Responses API 'stream' must be boolean",
+        ));
+    }
+    if obj
+        .get("prompt_cache_key")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(ProxyError::bad_request(
+            "Responses API 'prompt_cache_key' must be a string",
         ));
     }
     for key in ["store", "background"] {

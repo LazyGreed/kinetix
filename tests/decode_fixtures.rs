@@ -311,6 +311,33 @@ fn responses_plain_string_input_and_instructions() {
 }
 
 #[test]
+fn responses_prompt_cache_key_is_preserved_as_portable_extension() {
+    let req = responses(
+        r#"{
+          "model":"gpt-5",
+          "input":"hi",
+          "prompt_cache_key":"session-123"
+        }"#,
+    );
+    assert_eq!(
+        req.extra
+            .get("prompt_cache_key")
+            .and_then(|value| value.as_str()),
+        Some("session-123")
+    );
+
+    let invalid = frontends::decode(
+        FrontendFormat::OpenAiResponses,
+        serde_json::json!({
+            "model":"gpt-5",
+            "input":"hi",
+            "prompt_cache_key":123
+        }),
+    );
+    assert!(invalid.is_err());
+}
+
+#[test]
 fn responses_rejects_stateful_hosted_and_untranslated_semantics() {
     let cases = [
         serde_json::json!({

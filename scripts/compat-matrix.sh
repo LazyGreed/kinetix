@@ -23,8 +23,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Building release binary (if not already built)"
-cargo build --release --quiet
+if [ -n "${KINETIX_BIN:-}" ]; then
+  BIN="$KINETIX_BIN"
+  echo "==> Using prebuilt Kinetix binary: $BIN"
+else
+  BIN="$ROOT/target/release/kinetix"
+  echo "==> Building release binary for local compatibility run"
+  cargo build --release --quiet
+fi
+
+if [ ! -x "$BIN" ]; then
+  echo "Kinetix binary is not executable: $BIN"
+  exit 1
+fi
 
 echo "==> Starting synthetic upstream on :$UPSTREAM_PORT"
 SYN_DELAY_MS=1 python3 scripts/synthetic_upstream.py "$UPSTREAM_PORT" >"$UP_LOG" 2>&1 &
@@ -45,7 +56,8 @@ KINETIX_ALLOW_PRIVATE_UPSTREAMS=true \
 KINETIX_ALLOW_INSECURE_TLS=true \
 KINETIX_BOOTSTRAP_FILE="$BOOTSTRAP" \
 KINETIX_HOME="$WORK" \
-  ./target/release/kinetix serve >"$LOG" 2>&1 &
+KINETIX_IP_RATE_LIMIT_PER_MIN=0 \
+  "$BIN" serve >"$LOG" 2>&1 &
 KPID=$!
 
 for _ in $(seq 1 60); do

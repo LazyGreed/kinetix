@@ -30,6 +30,45 @@ models_path = "/models"
   enabled = true
   context_window = 200000
   max_output_tokens = 8192
+  capabilities = ["text", "vision", "reasoning", "tool_calling"]
+  thinking_map = { levels = { low = { "reasoning_effort" = "low" }, medium = { "reasoning_effort" = "medium" }, high = { "reasoning_effort" = "high" } } }
+
+  [[providers.models]]
+  upstream_id = "syn-openai-a"
+  display_name = "Synthetic OpenAI A"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+  [[providers.models]]
+  upstream_id = "syn-openai-b"
+  display_name = "Synthetic OpenAI B"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+[[providers]]
+name = "Synth OpenAI Truncated"
+base_url = "http://127.0.0.1:9199/openai/v1"
+wire_format = "openai"
+auth_scheme = "bearer"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-openai-truncated"
+  api_key = "smoke-openai-truncated-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-truncated-openai"
+  display_name = "Synthetic Truncated OpenAI"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
   capabilities = ["text", "tool_calling"]
 
 [[providers]]
@@ -54,4 +93,164 @@ models_path = "/models"
   enabled = true
   context_window = 200000
   max_output_tokens = 8192
+  capabilities = ["text", "vision", "reasoning", "tool_calling"]
+  thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+
+
+[[providers]]
+name = "Synth Failure"
+base_url = "http://127.0.0.1:9199/gemini/v1beta"
+wire_format = "gemini"
+auth_scheme = "custom_header"
+custom_header_name = "x-goog-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-failure"
+  api_key = "smoke-failure-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-fail"
+  display_name = "Synthetic Failing Gemini"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "vision", "reasoning", "tool_calling"]
+  thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+
+[[providers]]
+name = "Synth Anthropic"
+base_url = "http://127.0.0.1:9199/anthropic/v1"
+wire_format = "anthropic"
+auth_scheme = "custom_header"
+custom_header_name = "x-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-anthropic"
+  api_key = "smoke-anthropic-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-anthropic"
+  display_name = "Synthetic Anthropic"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "vision", "reasoning", "tool_calling"]
+  thinking_map = { budget_field = "thinking.budget_tokens", levels = { low = 512, medium = 2048, high = 4096 } }
+
+  [[providers.models]]
+  upstream_id = "syn-anthropic-a"
+  display_name = "Synthetic Anthropic A"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
   capabilities = ["text", "tool_calling"]
+
+  [[providers.models]]
+  upstream_id = "syn-anthropic-b"
+  display_name = "Synthetic Anthropic B"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+[[providers]]
+name = "Synth Malformed"
+base_url = "http://127.0.0.1:9199/anthropic/v1"
+wire_format = "anthropic"
+auth_scheme = "custom_header"
+custom_header_name = "x-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-malformed"
+  api_key = "smoke-malformed-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-malformed"
+  display_name = "Synthetic Malformed Anthropic"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+[[providers]]
+name = "Synth Truncated"
+base_url = "http://127.0.0.1:9199/anthropic/v1"
+wire_format = "anthropic"
+auth_scheme = "custom_header"
+custom_header_name = "x-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-truncated"
+  api_key = "smoke-truncated-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-truncated"
+  display_name = "Synthetic Truncated Anthropic"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+[[routes]]
+name = "syn-sticky-openai"
+strategy = "round-robin"
+sticky_routing = true
+max_attempts = 2
+
+  [[routes.targets]]
+  model = "Synth OpenAI/syn-openai-a"
+  priority = 1
+  weight = 1
+
+  [[routes.targets]]
+  model = "Synth OpenAI/syn-openai-b"
+  priority = 1
+  weight = 1
+
+[[routes]]
+name = "syn-sticky-anthropic"
+strategy = "round-robin"
+sticky_routing = true
+max_attempts = 2
+
+  [[routes.targets]]
+  model = "Synth Anthropic/syn-anthropic-a"
+  priority = 1
+  weight = 1
+
+  [[routes.targets]]
+  model = "Synth Anthropic/syn-anthropic-b"
+  priority = 1
+  weight = 1
+
+[[routes]]
+name = "syn-fallback"
+strategy = "priority"
+fallback_triggers = { on429 = true, onQuota = true, on5xx = true, onTimeout = true }
+max_attempts = 2
+
+  [[routes.targets]]
+  model = "Synth Failure/syn-fail"
+  priority = 1
+  weight = 1
+
+  [[routes.targets]]
+  model = "Synth Gemini/syn-gemini"
+  priority = 2
+  weight = 1

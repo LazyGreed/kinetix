@@ -2908,7 +2908,7 @@ async fn drive_stream_passthrough(
     mut meta: RequestMeta,
     req: InternalRequest,
     mut attempt: Attempt,
-    _encoder_ctx: EncoderCtx,
+    encoder_ctx: EncoderCtx,
     started: Instant,
     key: Option<db::VirtualKeyRow>,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -3113,9 +3113,32 @@ async fn drive_stream_passthrough(
 
     if status == "stream_error" && committed {
         state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
+        let message = error_message
+            .as_deref()
+            .unwrap_or("upstream stream interrupted");
+        if format == FrontendFormat::OpenAi {
+            // Same-format passthrough has already exposed the upstream stream
+            // identity. Do not synthesize a new chat completion id/model for
+            // the terminal error.
+            let frame = serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "upstream_error",
+                    "code": "stream_error"
+                }
+            });
+            let _ = tx
+                .send(Ok(frontends::sse_frame(None, &frame.to_string())))
+                .await;
+            let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
+        } else {
+            let mut encoder = Encoder::new(format, encoder_ctx);
+            for frame in encoder.error_frame(message) {
+                let _ = tx.send(Ok(frame)).await;
+            }
+        }
     }
 
-    let _ = format;
     finalize_log(
         &state,
         &snap,

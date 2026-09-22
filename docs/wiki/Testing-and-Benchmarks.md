@@ -45,10 +45,18 @@ scripts/ci.sh --fast     # skips release/smoke/bench/dashboard
 
 Run this before pushing — it mirrors `.github/workflows/ci.yml`.
 
-## Real client acceptance
+## Coding-agent compatibility matrix
 
-Pi (a coding agent) is run against Kinetix end-to-end: plain streaming, a
-tool-calling turn, multi-turn sessions, and the Anthropic-format client. See
+`scripts/compat-matrix.sh` starts deterministic synthetic OpenAI, Gemini, and
+Anthropic upstreams plus a fresh Kinetix instance, then runs current Pi and
+Claude Code wire profiles end to end. Coverage includes sync/streaming chat,
+tool-result continuation and parallel tools, current session-affinity headers,
+vision, reasoning/thinking controls, Anthropic protocol headers and exact
+`count_tokens`, route fallback, unknown-field translation, malformed streams,
+and post-commit truncation.
+
+The matrix runs in normal pull-request CI after Rust tests and reuses the same
+debug binary/toolchain cache; it does not add a second Rust build job. See
 [`docs/pi-compatibility.md`](https://github.com/PrightCord/kinetix/blob/main/docs/pi-compatibility.md)
 and [`docs/compatibility.md`](https://github.com/PrightCord/kinetix/blob/main/docs/compatibility.md).
 
@@ -76,6 +84,7 @@ the 50 req/s target with zero errors, idle RSS ~13 MB, cold start ~75 ms.
 
 ## CI
 
-`.github/workflows/ci.yml` runs, on every push/PR: build the dashboard → fmt →
-clippy → tests → release build → smoke → benchmark matrix → `cargo deny check`,
-plus a separate dashboard job (`tsc`, `vite build`).
+`.github/workflows/ci.yml` runs rustfmt and the dashboard in parallel, then
+runs Clippy, Rust tests, builds the debug `kinetix` binary, and executes the
+Pi + Claude Code compatibility matrix in the same Rust job. Dependency policy
+runs on pushes.

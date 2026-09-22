@@ -49,6 +49,19 @@ class _Disconnected(Exception):
     """Client went away mid-stream (expected under cancellation benchmarks)."""
 
 
+
+def _contains_key(value, names):
+    if isinstance(value, dict):
+        return any(k in names or _contains_key(v, names) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_contains_key(v, names) for v in value)
+    return False
+
+
+def _fixture(req, name):
+    return f"fixture:{name}" in json.dumps(req, sort_keys=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -100,13 +113,74 @@ class Handler(BaseHTTPRequestHandler):
         # client sets this on the request body.
         tool_fragments = int(req.get("tool_fragments", 0) or 0)
 
+        if "/anthropic/" in self.path:
+            self._anthropic(req, model, stream, want_tools)
+            return
+
+        if "syn-fail" in self.path or model == "syn-fail":
+            self._json(503, {"error": {"message": "synthetic primary failure"}})
+            return
+
         if "/gemini/" in self.path:
-            self._gemini(model, want_tools)
+            if "client_only_unknown" in req:
+                self._json(400, {"error": {"message": "unknown client field leaked upstream"}})
+                return
+            if _fixture(req, "thinking") and not _contains_key(req, {"thinkingConfig"}):
+                self._json(400, {"error": {"message": "thinking control was not translated"}})
+                return
+            if _fixture(req, "vision") and not _contains_key(req, {"inlineData", "inline_data"}):
+                self._json(400, {"error": {"message": "image was not translated"}})
+                return
+            self._gemini(model, want_tools, req)
         else:
-            self._openai(model, stream, want_tools, tool_fragments)
+            self._openai(model, stream, want_tools, tool_fragments, req)
+
+    def _json(self, status, obj, headers=None):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
 
     # -- OpenAI-compatible SSE -------------------------------------------
-    def _openai(self, model, stream, want_tools=False, tool_fragments=0):
+    def _openai(self, model, stream, want_tools=False, tool_fragments=0, req=None):
+        if model == "syn-truncated-openai":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            def raw_frame(obj):
+                self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+                self.wfile.flush()
+                mark_write()
+
+            raw_frame({
+                "id": "upstream-openai-truncated",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }],
+            })
+            raw_frame({
+                "id": "upstream-openai-truncated",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "partial"},
+                    "finish_reason": None,
+                }],
+            })
+            return
+
         if not stream:
             body = json.dumps(
                 {
@@ -114,7 +188,18 @@ class Handler(BaseHTTPRequestHandler):
                     "object": "chat.completion",
                     "model": model,
                     "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": WORD * 4}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    f"target:{model}"
+                                    if model in ("syn-openai-a", "syn-openai-b")
+                                    else WORD * 4
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
                     ],
                     "usage": {"prompt_tokens": 100, "completion_tokens": TOKENS, "total_tokens": 100 + TOKENS},
                 }
@@ -172,9 +257,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
+            stream_word = (
+                f"target:{model}"
+                if model in ("syn-openai-a", "syn-openai-b")
+                else WORD
+            )
             for _ in range(TOKENS):
                 frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
-                       "choices": [{"index": 0, "delta": {"content": WORD}, "finish_reason": None}]})
+                       "choices": [{"index": 0, "delta": {"content": stream_word}, "finish_reason": None}]})
                 if DELAY_MS:
                     time.sleep(DELAY_MS / 1000.0)
             frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
@@ -187,8 +277,159 @@ class Handler(BaseHTTPRequestHandler):
         except (_Disconnected, BrokenPipeError, ConnectionResetError):
             pass
 
+    # -- Anthropic Messages -------------------------------------------------
+    def _anthropic(self, req, model, stream, want_tools=False):
+        if self.path.endswith("/messages/count_tokens"):
+            self._json(200, {"input_tokens": 123})
+            return
+
+        if _fixture(req, "claude-protocol"):
+            if self.headers.get("anthropic-version") != "2023-06-01":
+                self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "missing anthropic-version"}})
+                return
+            if not self.headers.get("anthropic-beta"):
+                self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "missing anthropic-beta"}})
+                return
+
+        if _fixture(req, "thinking") and not _contains_key(req, {"thinking"}):
+            self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "thinking control missing"}})
+            return
+        if _fixture(req, "vision") and not _contains_key(req, {"source"}):
+            self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "image missing"}})
+            return
+
+        if model == "syn-malformed":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self.wfile.write(b"event: message_start\n")
+            self.wfile.write(b"data: {not-json}\n\n")
+            self.wfile.flush()
+            return
+
+        if model == "syn-truncated":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            start = {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_truncated",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                },
+            }
+            self.wfile.write(b"event: message_start\n")
+            self.wfile.write(b"data: " + json.dumps(start).encode() + b"\n\n")
+            self.wfile.write(b"event: content_block_delta\n")
+            self.wfile.write(b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n')
+            self.wfile.flush()
+            return
+
+        if not stream:
+            text = (
+                f"target:{model}"
+                if model in ("syn-anthropic-a", "syn-anthropic-b")
+                else WORD * 4
+            )
+            content = [{"type": "text", "text": text}]
+            self._json(200, {
+                "id": "msg_syn_1",
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": content,
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 100, "output_tokens": 12},
+            }, {"request-id": "req_syn_anthropic"})
+            return
+
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def event(name, obj):
+            try:
+                self.wfile.write(f"event: {name}\n".encode())
+                self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+                self.wfile.flush()
+                mark_write()
+            except (BrokenPipeError, ConnectionResetError):
+                raise _Disconnected()
+
+        try:
+            event("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_syn_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 100, "output_tokens": 0},
+                },
+            })
+            if want_tools:
+                calls = [("toolu_syn_1", "get_weather", {"city": "Paris"})]
+                if _fixture(req, "multi-tools"):
+                    calls.append(("toolu_syn_2", "read_file", {"path": "src/main.rs"}))
+                for index, (tool_id, name, args) in enumerate(calls):
+                    event("content_block_start", {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}},
+                    })
+                    event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": json.dumps(args)},
+                    })
+                    event("content_block_stop", {"type": "content_block_stop", "index": index})
+                event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                    "usage": {"output_tokens": 12},
+                })
+            else:
+                event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                text = (
+                    f"target:{model}"
+                    if model in ("syn-anthropic-a", "syn-anthropic-b")
+                    else WORD
+                )
+                event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                })
+                event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 4},
+                })
+            event("message_stop", {"type": "message_stop"})
+        except (_Disconnected, BrokenPipeError, ConnectionResetError):
+            pass
+
     # -- Gemini SSE -------------------------------------------------------
-    def _gemini(self, model, want_tools=False):
+    def _gemini(self, model, want_tools=False, req=None):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -207,7 +448,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             time.sleep(TTFT_MS / 1000.0)
             if want_tools:
-                frame({"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}]}}]})
+                calls = [
+                    {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}
+                ]
+                if req is not None and _fixture(req, "multi-tools"):
+                    calls.append(
+                        {"functionCall": {"name": "read_file", "args": {"path": "src/main.rs"}}}
+                    )
+                frame({"candidates": [{"content": {"role": "model", "parts": calls}}]})
                 frame({"candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "STOP"}],
                        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10,
                                          "totalTokenCount": 110}})
