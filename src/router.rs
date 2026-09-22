@@ -38,10 +38,7 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/chat/completions", post(api::chat_completions))
         .route("/v1/responses", post(api::responses))
         .route("/v1/messages", post(api::messages))
-        .route(
-            "/v1/messages/count_tokens",
-            post(api::count_message_tokens),
-        )
+        .route("/v1/messages/count_tokens", post(api::count_message_tokens))
         .route("/v1/models", get(api::list_models));
 
     let admin_api = Router::new()
