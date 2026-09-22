@@ -392,9 +392,19 @@ impl Adapter for GeminiAdapter {
         // hint indicates a daily/quota reset and stays an exhaustion.
         let short_retry = retry_after_secs.map(|s| s <= 90).unwrap_or(false);
 
+        let lower = message.to_ascii_lowercase();
+        let credential_error = status == 401
+            || gstatus == "UNAUTHENTICATED"
+            || lower.contains("api key not valid")
+            || lower.contains("invalid api key")
+            || lower.contains("invalid authentication credentials");
+
         let kind = match status {
-            400 | 404 | 422 => FailureKind::BadRequest,
-            401 | 403 => FailureKind::AuthError,
+            400 if credential_error => FailureKind::AuthError,
+            400 | 422 => FailureKind::BadRequest,
+            401 => FailureKind::AuthError,
+            403 if credential_error => FailureKind::AuthError,
+            403 | 404 => FailureKind::TargetError,
             429 if short_retry => FailureKind::RateLimit,
             429 => classify_429(gstatus, &message),
             s if s >= 500 => FailureKind::ServerError,
