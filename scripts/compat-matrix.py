@@ -403,6 +403,54 @@ def test_responses_sync_aggregation(upstream_model):
 # Client 3: Anthropic Agent (Messages API)
 # ---------------------------------------------------------------------------
 
+def test_anthropic_count_tokens(upstream_model):
+    t0 = time.time()
+    url = f"{BASE_URL}/v1/messages/count_tokens"
+    payload = {
+        "model": upstream_model,
+        "system": "You are Claude Code, an agentic coding partner.",
+        "messages": [
+            {"role": "user", "content": "Inspect src/main.rs and summarize it."}
+        ],
+        "tools": [{
+            "name": "read_file",
+            "description": "Read a file from disk",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        }]
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "x-api-key": API_KEY,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "prompt-caching-2024-07-31",
+            "x-claude-code-session-id": f"claude_count_{int(time.time())}",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-code/0.2.0",
+        }
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+        mode = resp.headers.get("x-kinetix-token-count")
+
+    count = data.get("input_tokens")
+    passed = isinstance(count, int) and count > 0 and mode in ("exact", "estimated")
+    duration = int((time.time() - t0) * 1000)
+    record_result(
+        "Anthropic Agent",
+        upstream_model,
+        "count_tokens",
+        passed,
+        f"input_tokens: {count}, mode: {mode}",
+        duration,
+    )
+
+
 def test_anthropic_plain_stream(upstream_model):
     t0 = time.time()
     url = f"{BASE_URL}/v1/messages"
@@ -608,6 +656,7 @@ def run_matrix():
 
     # 3. Anthropic Agent / Claude Code (Messages API)
     print("\n==> Testing Anthropic Agent (Claude Code / Anthropic Wire Format)")
+    test_anthropic_count_tokens("syn-gemini")
     test_anthropic_plain_stream("syn-gemini")
     test_anthropic_tool_use("syn-gemini")
     test_anthropic_multi_turn("syn-gemini")
