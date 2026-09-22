@@ -44,6 +44,30 @@ const CIRCUIT_OPEN_SECS: i64 = 30;
 const BACKOFF_BASE_MS: u64 = 100;
 const BACKOFF_CAP_MS: u64 = 1000;
 
+fn provider_phase_timeout(provider: &db::ProviderRow) -> Duration {
+    Duration::from_millis(provider.timeout_ms.max(1) as u64)
+}
+
+fn timeout_failure(message: &'static str) -> UpstreamFailure {
+    UpstreamFailure {
+        kind: FailureKind::Timeout,
+        status: None,
+        retry_after_secs: None,
+        message: message.into(),
+        quota_reset_at: None,
+    }
+}
+
+fn phase_budget(deadline: Instant, provider_timeout: Duration) -> Option<(Instant, Duration)> {
+    let now = Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return None;
+    }
+    let budget = remaining.min(provider_timeout);
+    Some((now + budget, budget))
+}
+
 /// Request-scoped metadata carried into the usage log and Route Trace.
 pub struct RequestMeta {
     pub request_id: String,
@@ -101,6 +125,9 @@ struct Attempt {
     prefetched: Vec<Bytes>,
     /// Parsed complete events for a successful non-SSE JSON response.
     full_events: Option<Vec<StreamEvent>>,
+    /// Maximum silence between upstream transport chunks after pre-commit
+    /// validation. This is a per-gap timer, never a total stream lifetime.
+    idle_timeout: Duration,
     adapter: Arc<dyn Adapter>,
     /// Same-format passthrough is only possible when the upstream is actually
     /// SSE. A JSON response is normalized through parse_full_response().
@@ -117,9 +144,9 @@ struct Attempt {
 /// body's drop-guard, which only exists once a response is produced. During the
 /// pre-commit selection/connect window there is no body to observe, so a client
 /// that goes away then is noticed only when the upstream responds or the
-/// provider timeout elapses. That window is bounded by `provider.timeout_ms`.
-/// Post-commit cancellation is immediate (the guard flips the flag and wakes the
-/// driver).
+/// first-event phase budget elapses. The whole pre-commit window is also capped
+/// by `MAX_PRE_COMMIT_DEADLINE`. Post-commit cancellation is immediate; active
+/// streams have no total wall-clock timeout and only enforce per-gap idle time.
 pub async fn run(
     state: &AppState,
     format: FrontendFormat,
@@ -609,20 +636,54 @@ pub async fn run(
         // (Monitoring). Excludes upstream network time.
         crate::alerts::record_added_latency(started.elapsed().as_millis() as u64);
 
-        match send_upstream(
-            state,
-            &adapter,
-            &ctx,
-            &req,
-            use_passthrough,
-            &meta.request_id,
+        let provider_timeout = provider_phase_timeout(&target.provider);
+        let Some((phase_deadline, send_budget)) = phase_budget(deadline, provider_timeout) else {
+            trace.step("skip", None, "pre-commit deadline exceeded");
+            break;
+        };
+        let send_result = match tokio::time::timeout(
+            send_budget,
+            send_upstream(
+                state,
+                &adapter,
+                &ctx,
+                &req,
+                use_passthrough,
+                &meta.request_id,
+            ),
         )
         .await
         {
+            Ok(result) => result,
+            Err(_) => Err(timeout_failure(
+                "upstream timed out before response headers",
+            )),
+        };
+
+        match send_result {
             Ok(resp) => {
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
-                    let prepared = match prepare_success_response(resp, &adapter).await {
+                    let first_event_remaining =
+                        phase_deadline.saturating_duration_since(Instant::now());
+                    let prepared_result = if first_event_remaining.is_zero() {
+                        Err(timeout_failure(
+                            "upstream timed out before first valid event",
+                        ))
+                    } else {
+                        match tokio::time::timeout(
+                            first_event_remaining,
+                            prepare_success_response(resp, &adapter),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(timeout_failure(
+                                "upstream timed out before first valid event",
+                            )),
+                        }
+                    };
+                    let prepared = match prepared_result {
                         Ok(prepared) => prepared,
                         Err(failure) => {
                             state.flight.record(
@@ -685,6 +746,7 @@ pub async fn run(
                         stream: prepared.stream,
                         prefetched: prepared.prefetched,
                         full_events: prepared.full_events,
+                        idle_timeout: provider_timeout,
                         adapter: adapter.clone(),
                         passthrough: use_passthrough && prepared.is_sse,
                     };
@@ -694,11 +756,32 @@ pub async fn run(
                     .await);
                 }
 
-                // Classify and maybe fail over.
+                // Classify and maybe fail over. Reading an error body is still
+                // part of the pre-commit phase and cannot outlive its budget.
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
-                let body = resp.text().await.unwrap_or_default();
-                let failure = adapter.classify_error(status, &body, &headers);
+                let error_body_remaining = phase_deadline.saturating_duration_since(Instant::now());
+                let failure = if error_body_remaining.is_zero() {
+                    timeout_failure("upstream timed out while reading error response")
+                } else {
+                    match tokio::time::timeout(error_body_remaining, resp.text()).await {
+                        Ok(Ok(body)) => adapter.classify_error(status, &body, &headers),
+                        Ok(Err(error)) => UpstreamFailure {
+                            kind: if error.is_timeout() {
+                                FailureKind::Timeout
+                            } else {
+                                FailureKind::ConnectionError
+                            },
+                            status: Some(status),
+                            retry_after_secs: None,
+                            message: classify_reqwest(&error),
+                            quota_reset_at: None,
+                        },
+                        Err(_) => {
+                            timeout_failure("upstream timed out while reading error response")
+                        }
+                    }
+                };
                 state.flight.record(
                     &meta.request_id,
                     started.elapsed().as_millis() as u64,
@@ -869,6 +952,7 @@ async fn send_upstream(
             json_body: Some(body),
             accept_event_stream: true,
             request_id: Some(request_id.to_string()),
+            total_timeout: None,
         },
     )
     .await
@@ -1850,6 +1934,7 @@ async fn drive_stream(
     let mut terminal_seen = false;
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
@@ -1875,9 +1960,16 @@ async fn drive_stream(
                     break;
                 }
             }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                status = "stream_error";
+                status_code = 504;
+                error_message = Some("upstream stream idle timeout".into());
+                break 'outer;
+            }
             chunk = chunks.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
+                        idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
@@ -2045,6 +2137,7 @@ async fn drive_stream_passthrough(
     let mut pending_frames: Vec<String> = Vec::new();
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
@@ -2070,9 +2163,16 @@ async fn drive_stream_passthrough(
                     break;
                 }
             }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                status = "stream_error";
+                status_code = 504;
+                error_message = Some("upstream stream idle timeout".into());
+                break 'outer;
+            }
             chunk = chunks.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
+                        idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
@@ -2308,7 +2408,19 @@ async fn drive_aggregate(
         let mut framer = crate::sse::SseFramer::new();
         let mut terminal_seen = false;
 
-        'outer: while let Some(chunk) = chunks.next().await {
+        'outer: loop {
+            let next = match tokio::time::timeout(attempt.idle_timeout, chunks.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    status = "stream_error";
+                    status_code = 504;
+                    error_message = Some("upstream stream idle timeout".into());
+                    break;
+                }
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     let frames = match framer.push(&bytes) {

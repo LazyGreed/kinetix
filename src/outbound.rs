@@ -17,6 +17,9 @@ use crate::adapters::{Adapter, UpstreamContext};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_PINNED_CLIENTS: usize = 256;
+/// TCP/TLS establishment has its own bound. Provider `timeout_ms` is enforced
+/// by the pipeline as first-event/idle phase budgets, never as total wall time.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct ResolvedDestination {
@@ -79,6 +82,9 @@ pub struct ProviderRequest {
     pub json_body: Option<Value>,
     pub accept_event_stream: bool,
     pub request_id: Option<String>,
+    /// Optional whole-request timeout for bounded control-plane calls such as
+    /// probes/discovery. Streaming proxy traffic must leave this as `None`.
+    pub total_timeout: Option<Duration>,
 }
 
 /// Resolve a URL and validate the entire DNS answer set. The returned addresses
@@ -177,7 +183,7 @@ fn pinned_client(
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(CONNECT_TIMEOUT)
         .http2_adaptive_window(true)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -254,9 +260,12 @@ pub async fn send_provider_request(
         let client = pinned_client(cache, &destination, insecure_tls)?;
 
         let authorized = credentials_authorized(ctx, &current);
-        let mut builder = client
-            .request(method.clone(), current.clone())
-            .timeout(Duration::from_millis(ctx.provider.timeout_ms as u64));
+        let mut builder = client.request(method.clone(), current.clone());
+        // Whole-request deadlines are reserved for bounded control-plane calls.
+        // Proxy streaming uses phase timers in pipeline.rs instead.
+        if let Some(timeout) = request.total_timeout {
+            builder = builder.timeout(timeout);
+        }
 
         if body.is_some() {
             builder = builder.header("content-type", "application/json");
