@@ -3300,6 +3300,7 @@ mod route_policy_tests {
             tool_choice_name: None,
             params: Default::default(),
             stream: true,
+            include_usage: false,
             thinking: None,
             extra: Default::default(),
             raw_body: Some(r#"{"model":"route","temperature":0.1}"#.into()),
