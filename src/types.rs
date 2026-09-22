@@ -263,6 +263,10 @@ pub struct InternalRequest {
     pub tool_choice_name: Option<String>,
     pub params: SamplingParams,
     pub stream: bool,
+    /// Client-visible OpenAI streaming usage preference. This is intentionally
+    /// separate from Kinetix's internal need to request upstream usage for
+    /// accounting.
+    pub include_usage: bool,
     pub thinking: Option<ThinkingLevel>,
     /// Fields the client sent that we did not model; forwarded or stripped per config.
     pub extra: serde_json::Map<String, serde_json::Value>,

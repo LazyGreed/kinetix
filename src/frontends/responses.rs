@@ -122,6 +122,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         tool_choice_name,
         params,
         stream,
+        include_usage: false,
         thinking,
         extra,
         raw_body: None,

@@ -64,6 +64,12 @@ impl Encoder {
         }
     }
 
+    pub fn set_include_usage(&mut self, include_usage: bool) {
+        if let Encoder::OpenAi(encoder) = self {
+            encoder.set_include_usage(include_usage);
+        }
+    }
+
     /// Encode one internal event into zero or more SSE frames.
     pub fn encode(&mut self, event: StreamEvent) -> Vec<Bytes> {
         match self {

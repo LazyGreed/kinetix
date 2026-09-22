@@ -650,6 +650,14 @@ pub async fn run(
                     format!("request uses a feature that cannot be translated: {msg}"),
                 ));
             }
+            if let Err(error) = check_thinking_translation(&target.model, &target_req) {
+                trace.finish("rejected");
+                state
+                    .live
+                    .finish(&meta.request_id, "rejected", 0, None, None);
+                let _ = db::insert_route_trace(&state.pool, &trace).await;
+                return Err(error);
+            }
         }
 
         // Bounded exponential backoff between attempts (FR-4.4). Never applied
@@ -1197,6 +1205,7 @@ async fn send_upstream(
             raw,
             &ctx.model.upstream_id,
             !req.stream,
+            true,
             ctx.provider.wire(),
         ) {
             Some(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
@@ -1871,6 +1880,35 @@ fn apply_continuity(
 
 /// Check the admin's parameter policy; reject when a value is unsupported and
 /// the policy is `reject` (FR-10.6).
+fn thinking_level_key(level: crate::types::ThinkingLevel) -> &'static str {
+    match level {
+        crate::types::ThinkingLevel::Off => "off",
+        crate::types::ThinkingLevel::Low => "low",
+        crate::types::ThinkingLevel::Medium => "medium",
+        crate::types::ThinkingLevel::High => "high",
+    }
+}
+
+fn check_thinking_translation(
+    model: &db::ModelRow,
+    req: &InternalRequest,
+) -> Result<(), ProxyError> {
+    let Some(level) = req.thinking else {
+        return Ok(());
+    };
+    if level == crate::types::ThinkingLevel::Off {
+        return Ok(());
+    }
+    let key = thinking_level_key(level);
+    if model.thinking().levels.contains_key(key) {
+        return Ok(());
+    }
+    Err(ProxyError::unsupported(format!(
+        "thinking level '{key}' has no configured mapping for model '{}'",
+        model.display_name
+    )))
+}
+
 fn check_param_policy(target: &ResolvedTarget, req: &InternalRequest) -> Result<(), ProxyError> {
     let params = target.model.params();
     let checks: [(&str, Option<f64>); 3] = [
@@ -2148,6 +2186,7 @@ async fn drive_stream(
     notify: Arc<tokio::sync::Notify>,
 ) {
     let mut encoder = Encoder::new(format, encoder_ctx);
+    encoder.set_include_usage(req.include_usage);
     let mut usage = TokenUsage::default();
     let mut ttft_ms: Option<i64> = None;
     let mut status = "success";
@@ -2488,8 +2527,12 @@ async fn drive_stream_passthrough(
                                             if payload_is_terminal(payload, &events) {
                                                 terminal_seen = true;
                                             }
-                                            for event in events {
-                                                if let StreamEvent::Usage(value) = &event {
+                                            let usage_only = !events.is_empty()
+                                                && events
+                                                    .iter()
+                                                    .all(|event| matches!(event, StreamEvent::Usage(_)));
+                                            for event in &events {
+                                                if let StreamEvent::Usage(value) = event {
                                                     usage.merge(value);
                                                 }
                                                 match event {
@@ -2513,6 +2556,12 @@ async fn drive_stream_passthrough(
                                                     }
                                                     _ => {}
                                                 }
+                                            }
+                                            if format == FrontendFormat::OpenAi
+                                                && !req.include_usage
+                                                && usage_only
+                                            {
+                                                continue;
                                             }
                                         }
                                         Err(failure) => {
@@ -3251,10 +3300,44 @@ mod route_policy_tests {
             tool_choice_name: None,
             params: Default::default(),
             stream: true,
+            include_usage: false,
             thinking: None,
             extra: Default::default(),
             raw_body: Some(r#"{"model":"route","temperature":0.1}"#.into()),
         }
+    }
+
+    fn model(thinking_map: Value) -> db::ModelRow {
+        db::ModelRow {
+            id: "model_test".into(),
+            provider_id: "prov_test".into(),
+            upstream_id: "upstream".into(),
+            display_name: "Model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: thinking_map.to_string(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
+    #[test]
+    fn translated_thinking_requires_an_explicit_model_mapping() {
+        let mut req = request();
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+
+        assert!(check_thinking_translation(&model(serde_json::json!({})), &req).is_err());
+        assert!(check_thinking_translation(
+            &model(serde_json::json!({"levels":{"high":{"reasoning_effort":"high"}}})),
+            &req,
+        )
+        .is_ok());
     }
 
     #[test]

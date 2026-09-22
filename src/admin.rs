@@ -307,6 +307,7 @@ pub async fn test_stream(
             ..Default::default()
         },
         stream,
+        include_usage: false,
         thinking: None,
         extra: Default::default(),
         raw_body: None,
@@ -1373,6 +1374,7 @@ pub async fn test_provider(
             ..Default::default()
         },
         stream: false,
+        include_usage: false,
         thinking: None,
         extra: Default::default(),
         raw_body: None,
