@@ -314,7 +314,7 @@ pub async fn test_stream(
     };
 
     let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
-    if let Err(e) = limits::enforce(&state.pool, &key, &req.requested_model).await {
+    if let Err(e) = limits::validate(&key, &req.requested_model) {
         return crate::api::error_response(format, &request_id, e);
     }
 

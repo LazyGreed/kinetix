@@ -84,6 +84,9 @@ pub struct RequestMeta {
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
+    /// Atomic RPM/TPM/budget reservation owned by this request. Dropping it
+    /// before finalization cancels the reservation.
+    pub admission: Option<crate::admission::AdmissionReservation>,
     /// Set by a watchdog when the client disconnects, so an in-flight upstream
     /// response can be aborted even if the write channel still looks open.
     pub disconnected: Arc<std::sync::atomic::AtomicBool>,
@@ -109,6 +112,7 @@ impl RequestMeta {
             cache_status: "bypass",
             commit_state: "",
             session: None,
+            admission: None,
             disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             disconnect_at: Arc::new(parking_lot::Mutex::new(None)),
         }
@@ -390,9 +394,16 @@ pub async fn run(
 ) -> Result<Response, ProxyError> {
     let started = Instant::now();
     let snap = state.registry.snapshot();
+    let admission = match &key {
+        Some(key) => {
+            Some(crate::limits::reserve(&state.admission, &state.pool, &snap, key, &req).await?)
+        }
+        None => None,
+    };
     let mut trace = RouteTrace::new(request_id.clone(), req.requested_model.clone());
     let mut meta = RequestMeta::new(request_id.clone(), format, req.requested_model.clone());
     meta.session = session.clone();
+    meta.admission = admission;
     if let Some(k) = &key {
         meta.key_id = Some(k.id.clone());
         meta.key_name = Some(k.name.clone());
@@ -3368,6 +3379,13 @@ async fn finalize_log(
     let prices = attempt.target.model.prices();
     let cost = cost::compute_cost(&prices, &usage);
     let cost_known = cost.is_some();
+
+    // Reconcile only when both canonical token totals are complete. The
+    // reservation object keeps its conservative estimate for partial/unknown
+    // streams and cancels itself if the request exits before finalization.
+    if let Some(admission) = meta.admission.take() {
+        admission.reconcile(&usage, cost);
+    }
 
     // Accounting truthfulness (FR-6.8): provider-reported vs unknown.
     let usage_confidence = if usage.input.is_some() || usage.output.is_some() {

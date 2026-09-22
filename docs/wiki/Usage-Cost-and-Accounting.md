@@ -44,13 +44,22 @@ Enforced before proxying:
 - **Daily** / **monthly** USD budgets.
 - Status (revoked → 401, disabled → 403), expiry, allowed models, IP allowlist.
 
-Counter reads fail **open** on a database error (log + serve) so a brief
-control-plane outage cannot fail a serviceable request; the in-memory
-status/expiry/allowed-model checks still apply.
+Inference admission is atomic per virtual key. Kinetix reserves one RPM slot,
+a conservative token allowance, and conservative priced spend before dispatch.
+Active reservations participate in later admission decisions immediately, so a
+concurrent burst cannot all observe the same stale counter. Complete provider
+usage reconciles the reservation after the request; partial/unknown usage keeps
+the conservative reservation.
 
-> Budget **reservation** is intentionally not implemented (FR-6.9): concurrent
-> requests may briefly overshoot a budget. This is a documented, accepted residual
-> risk, not a bug.
+The in-memory ledger is seeded once from durable usage history. After that,
+usage-log writes are for reporting/accounting durability rather than admission
+correctness: an async/dropped log cannot reopen capacity in the running process.
+If historical counters cannot be read during startup/first use, Kinetix starts
+that key's in-memory ledger from zero so a control-plane outage still does not
+take down the data plane.
+
+USD reservation remains unavailable when any possible target is unpriced, per
+FR-6.3; Kinetix does not invent vendor prices.
 
 ## Usage views
 
