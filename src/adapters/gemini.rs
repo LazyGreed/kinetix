@@ -684,3 +684,28 @@ mod schema_tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod error_scope_tests {
+    use super::*;
+    use crate::adapters::Adapter;
+
+    #[test]
+    fn permission_denied_does_not_poison_gemini_credential() {
+        let adapter = GeminiAdapter::new();
+        let forbidden = adapter.classify_error(
+            403,
+            r#"{"error":{"status":"PERMISSION_DENIED","message":"project is not allowed to use this model"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(forbidden.kind, FailureKind::TargetError);
+
+        let invalid_key = adapter.classify_error(
+            400,
+            r#"{"error":{"status":"INVALID_ARGUMENT","message":"API key not valid. Please pass a valid API key."}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(invalid_key.kind, FailureKind::AuthError);
+    }
+}
