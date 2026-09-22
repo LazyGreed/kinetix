@@ -86,7 +86,7 @@ upstreams:
 |---|---|---|
 | **Pi Coding Agent** | `/v1/chat/completions` | Plain streaming, tool calls & delta reassembly, multi-turn continuation, session affinity, sync fallback |
 | **Next-Gen / Codex CLI** | `/v1/responses` | Plain streaming, tool calling, input chaining, session affinity, sync fallback |
-| **Claude Code / Anthropic Agent** | `/v1/messages` | Plain streaming, tool calling, tool result continuation, session affinity, sync fallback |
+| **Claude Code / Anthropic Agent** | `/v1/messages`, `/v1/messages/count_tokens` | Token counting, plain streaming, tool calling, tool result continuation, session affinity, sync fallback |
 
 Chat Completions scenarios cover same-format OpenAI passthrough and translated
 Gemini paths. Responses scenarios exercise Kinetix's translated Responses
@@ -101,6 +101,17 @@ and `anthropic-version`. Streaming emits `message_start` → content blocks →
 upstream reports usage only at stream end, `message_start` reports
 `input_tokens: 0` and `message_delta` carries the output count; the authoritative
 input/output/thinking counts are recorded in the usage log and the Route Trace.
+
+`POST /v1/messages/count_tokens` returns the Anthropic-compatible
+`{"input_tokens": N}` shape. Kinetix uses the upstream Anthropic token-count API
+when routing resolves unambiguously to a healthy built-in Anthropic target.
+Plugin adapters, heterogeneous Routes, non-Anthropic targets, or temporarily
+unavailable exact targets use a deterministic local estimate instead. The
+estimate is based on canonical system/messages plus tool names, descriptions,
+and schemas; images use Kinetix's coarse canonical image estimate. The response
+header `X-Kinetix-Token-Count` is `exact` or `estimated` so callers can tell
+which path was used. Token counting never advances round-robin/weighted route
+state.
 
 ## Reasoning / thinking models
 
@@ -129,5 +140,5 @@ not a Kinetix bug. Raise `max_tokens` or lower the thinking level.
 - **OpenAI-compatible:** same-format passthrough forwards the upstream's frames
   verbatim, preserving unknown/vendor fields (FR-2.10) — e.g. vendor `cost` or
   `reasoning_details` fields Kinetix itself never produces.
-- **Anthropic:** the `anthropic-version` header is **not** auto-added (no hidden
-  defaults); set it via the provider's extra headers.
+- **Anthropic:** inbound `anthropic-version` and `anthropic-beta` are forwarded
+  to Anthropic upstreams; Kinetix does not invent hidden version/beta defaults.
