@@ -3202,3 +3202,183 @@ pub async fn dry_run(
         "note": "Dry run only: no production state was mutated and no upstream call was made.",
     }))
 }
+
+#[cfg(test)]
+mod route_policy_tests {
+    use super::*;
+
+    fn route(triggers: Value) -> db::RouteRow {
+        db::RouteRow {
+            id: "route_test".into(),
+            name: "test".into(),
+            description: String::new(),
+            strategy: "priority".into(),
+            fallback_triggers: triggers.to_string(),
+            continuity_policy: "strip".into(),
+            portability_policy: "strip_with_warning".into(),
+            sticky_routing: 0,
+            cache_affinity: 0,
+            max_attempts: None,
+            enabled: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn provider(rules: Value) -> db::ProviderRow {
+        db::ProviderRow {
+            id: "prov_test".into(),
+            name: "test".into(),
+            base_url: "https://api.example.com".into(),
+            wire_format: "openai".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: "{}".into(),
+            timeout_ms: 1000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: rules.to_string(),
+            enabled: 1,
+            follow_redirects: 0,
+            credential_hosts: String::new(),
+            allow_insecure_tls: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            wire_plugin: String::new(),
+            credential_plugin: String::new(),
+            model_source_plugin: String::new(),
+        }
+    }
+
+    fn request() -> InternalRequest {
+        InternalRequest {
+            requested_model: "route".into(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            tool_choice_name: None,
+            params: Default::default(),
+            stream: true,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: Some(r#"{"model":"route","temperature":0.1}"#.into()),
+        }
+    }
+
+    #[test]
+    fn route_fallback_triggers_are_executable() {
+        let r = route(serde_json::json!({
+            "on429": false,
+            "onQuota": false,
+            "on5xx": false,
+            "onTimeout": false
+        }));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::RateLimit));
+        assert!(!route_allows_fallback(
+            Some(&r),
+            FailureKind::QuotaExhausted
+        ));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::ServerError));
+        assert!(!route_allows_fallback(
+            Some(&r),
+            FailureKind::ConnectionError
+        ));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::Timeout));
+        assert!(route_allows_fallback(Some(&r), FailureKind::AuthError));
+        assert!(route_allows_fallback(Some(&r), FailureKind::TargetError));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::BadRequest));
+    }
+
+    #[test]
+    fn missing_fallback_trigger_defaults_to_enabled() {
+        let r = route(serde_json::json!({}));
+        assert!(route_allows_fallback(Some(&r), FailureKind::RateLimit));
+        assert!(route_allows_fallback(Some(&r), FailureKind::QuotaExhausted));
+        assert!(route_allows_fallback(Some(&r), FailureKind::ServerError));
+        assert!(route_allows_fallback(Some(&r), FailureKind::Timeout));
+    }
+
+    #[test]
+    fn direct_target_error_does_not_rotate_credentials() {
+        assert!(!route_allows_fallback(None, FailureKind::TargetError));
+        assert!(route_allows_fallback(None, FailureKind::AuthError));
+    }
+
+    #[test]
+    fn target_parameter_overrides_update_canonical_and_passthrough_request() {
+        let mut req = request();
+        apply_target_overrides(
+            &mut req,
+            &serde_json::json!({
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "max_tokens": 512,
+                "stop": ["END"],
+                "provider_specific": true
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(req.params.temperature, Some(0.7));
+        assert_eq!(req.params.top_p, Some(0.8));
+        assert_eq!(req.params.max_tokens, Some(512));
+        assert_eq!(req.params.stop, vec!["END"]);
+        assert_eq!(req.extra.get("provider_specific"), Some(&Value::Bool(true)));
+
+        let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(raw["temperature"], 0.7);
+        assert_eq!(raw["top_p"], 0.8);
+        assert_eq!(raw["max_tokens"], 512);
+        assert_eq!(raw["provider_specific"], true);
+    }
+
+    #[test]
+    fn provider_failure_rules_override_native_classification() {
+        let p = provider(serde_json::json!({
+            "quota": {
+                "statuses": [429],
+                "codes": ["billing_hard_limit"]
+            }
+        }));
+        let native = UpstreamFailure {
+            kind: FailureKind::RateLimit,
+            status: Some(429),
+            retry_after_secs: None,
+            message: "limit reached".into(),
+            quota_reset_at: None,
+        };
+        let classified = apply_provider_failure_rules(
+            &p,
+            429,
+            r#"{"error":{"code":"billing_hard_limit","message":"limit reached"}}"#,
+            native,
+        );
+        assert_eq!(classified.kind, FailureKind::QuotaExhausted);
+    }
+
+    #[test]
+    fn provider_failure_rule_requires_all_configured_selectors() {
+        let p = provider(serde_json::json!({
+            "quota": {
+                "statuses": [429],
+                "codes": ["billing_hard_limit"],
+                "message_contains": ["daily"]
+            }
+        }));
+        let native = UpstreamFailure {
+            kind: FailureKind::RateLimit,
+            status: Some(429),
+            retry_after_secs: None,
+            message: "limit reached".into(),
+            quota_reset_at: None,
+        };
+        let classified = apply_provider_failure_rules(
+            &p,
+            429,
+            r#"{"error":{"code":"billing_hard_limit","message":"per-minute limit reached"}}"#,
+            native,
+        );
+        assert_eq!(classified.kind, FailureKind::RateLimit);
+    }
+}
+
