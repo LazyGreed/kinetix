@@ -3457,6 +3457,146 @@ mod route_policy_tests {
         }
     }
 
+
+    fn account() -> db::AccountRow {
+        db::AccountRow {
+            id: "acc_test".into(),
+            provider_id: "prov_test".into(),
+            label: "test".into(),
+            secret_enc: String::new(),
+            key_mask: String::new(),
+            status: "healthy".into(),
+            cooldown_until: None,
+            quota_reset_at: None,
+            quota_type: "none".into(),
+            quota_window_s: None,
+            soft_quota_usd: None,
+            priority: 1,
+            weight: 1,
+            last_error: None,
+            last_probe_at: None,
+            circuit_open_until: None,
+            consecutive_failures: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn target() -> ResolvedTarget {
+        ResolvedTarget {
+            account: account(),
+            model: model(serde_json::json!({})),
+            provider: provider(serde_json::json!({})),
+            route_target_id: Some("rt_test".into()),
+            priority: 1,
+            weight: 1,
+            predicate: TargetPredicate::default(),
+            param_overrides: Value::Null,
+        }
+    }
+
+    #[test]
+    fn tool_stream_indexes_are_canonical_across_chunk_local_resets() {
+        let mut state = ToolStreamState::new("req_test");
+        let first = state.normalize(vec![
+            StreamEvent::TextDelta("a".into()),
+            StreamEvent::ToolCallStart {
+                index: 3,
+                id: Some("call_a".into()),
+                name: "alpha".into(),
+                signature: None,
+            },
+            StreamEvent::ToolCallArgsDelta {
+                index: 3,
+                args: "{}".into(),
+            },
+        ]);
+        let second = state.normalize(vec![
+            StreamEvent::TextDelta("b".into()),
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: None,
+                name: "beta".into(),
+                signature: None,
+            },
+            StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                args: "{\"x\":1}".into(),
+            },
+        ]);
+
+        assert!(matches!(
+            &first[1],
+            StreamEvent::ToolCallStart { index: 0, id: Some(id), .. } if id == "call_a"
+        ));
+        assert!(matches!(
+            &first[2],
+            StreamEvent::ToolCallArgsDelta { index: 0, .. }
+        ));
+        assert!(matches!(
+            &second[1],
+            StreamEvent::ToolCallStart { index: 1, id: Some(id), .. }
+                if id == "call_reqtest_1"
+        ));
+        assert!(matches!(
+            &second[2],
+            StreamEvent::ToolCallArgsDelta { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn portability_strip_updates_canonical_and_raw_request_state() {
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![
+                crate::types::Part::Thinking {
+                    text: "hidden".into(),
+                    signature: Some("sig".into()),
+                },
+                crate::types::Part::Text("answer".into()),
+            ],
+        }];
+        req.raw_body = Some(
+            serde_json::json!({
+                "model":"route",
+                "messages":[{
+                    "role":"assistant",
+                    "content":[
+                        {"type":"thinking","thinking":"hidden","signature":"sig"},
+                        {"type":"text","text":"answer"}
+                    ]
+                }]
+            })
+            .to_string(),
+        );
+
+        let route = route(serde_json::json!({}));
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        apply_continuity(&mut req, &route, &target, &mut trace).unwrap();
+
+        assert!(!request_has_opaque_state(&req));
+        let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(raw["messages"][0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(raw["messages"][0]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn portability_reject_refuses_opaque_state() {
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![crate::types::Part::Thinking {
+                text: "hidden".into(),
+                signature: Some("sig".into()),
+            }],
+        }];
+        let mut route = route(serde_json::json!({}));
+        route.portability_policy = "reject".into();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        assert!(apply_continuity(&mut req, &route, &target(), &mut trace).is_err());
+    }
+
     #[test]
     fn translated_thinking_requires_an_explicit_model_mapping() {
         let mut req = request();
