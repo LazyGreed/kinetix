@@ -39,10 +39,14 @@ pub trait Adapter: Send + Sync {
         &self,
         ctx: &UpstreamContext<'_>,
         req: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder;
+    ) -> Result<reqwest::RequestBuilder, UpstreamFailure>;
 
     /// Translate the internal request into the upstream JSON body.
-    fn build_body(&self, ctx: &UpstreamContext<'_>, req: &InternalRequest) -> serde_json::Value;
+    fn build_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+    ) -> Result<serde_json::Value, UpstreamFailure>;
 
     /// Parse an upstream non-2xx response into a classified failure.
     fn classify_error(
@@ -183,11 +187,21 @@ impl Adapter for UnimplementedAdapter {
         &self,
         _ctx: &UpstreamContext<'_>,
         req: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
-        req
+    ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
+        Ok(req)
     }
-    fn build_body(&self, _ctx: &UpstreamContext<'_>, _req: &InternalRequest) -> serde_json::Value {
-        serde_json::Value::Null
+    fn build_body(
+        &self,
+        _ctx: &UpstreamContext<'_>,
+        _req: &InternalRequest,
+    ) -> Result<serde_json::Value, UpstreamFailure> {
+        Err(UpstreamFailure {
+            kind: crate::types::FailureKind::ServerError,
+            status: None,
+            retry_after_secs: None,
+            message: "adapter not implemented".into(),
+            quota_reset_at: None,
+        })
     }
     fn classify_error(
         &self,
