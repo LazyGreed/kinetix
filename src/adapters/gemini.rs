@@ -828,6 +828,82 @@ mod schema_tests {
     use super::*;
 
     #[test]
+    fn generation_config_uses_canonical_policy_keys_for_gemini_wire_names() {
+        let provider = crate::db::ProviderRow {
+            id: "p".into(),
+            name: "p".into(),
+            base_url: "https://example.com".into(),
+            wire_format: "gemini".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: "{}".into(),
+            timeout_ms: 1000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: "{}".into(),
+            enabled: 1,
+            follow_redirects: 0,
+            credential_hosts: String::new(),
+            allow_insecure_tls: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            wire_plugin: String::new(),
+            credential_plugin: String::new(),
+            model_source_plugin: String::new(),
+        };
+        let model = crate::db::ModelRow {
+            id: "m".into(),
+            provider_id: "p".into(),
+            upstream_id: "gemini".into(),
+            display_name: "Gemini".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: json!({
+                "top_p": { "supported": true, "max": 0.8, "policy": "clamp" },
+                "top_k": { "supported": true, "max": 40.0, "policy": "clamp" }
+            })
+            .to_string(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        };
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            credential: "k".into(),
+        };
+        let req = InternalRequest {
+            requested_model: "m".into(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            tool_choice_name: None,
+            params: SamplingParams {
+                top_p: Some(0.95),
+                top_k: Some(99.0),
+                ..Default::default()
+            },
+            stream: true,
+            include_usage: false,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        };
+
+        let cfg = GeminiAdapter::build_generation_config(&ctx, &req);
+        assert_eq!(cfg["topP"], 0.8);
+        assert_eq!(cfg["topK"], 40.0);
+        assert!(cfg.get("top_p").is_none());
+        assert!(cfg.get("top_k").is_none());
+    }
+
+    #[test]
     fn sanitize_schema_resolves_nested_local_refs_before_stripping_defs() {
         let input = json!({
             "$ref": "#/$defs/Envelope",
