@@ -138,8 +138,9 @@ impl Adapter for PluginAdapter {
                     .adapter_apply_auth(&self.plugin_id, &p, &credential),
             )
             .map_err(|e| Self::plugin_failure("apply_auth", e))?;
-        let headers: Vec<(String, String)> = serde_json::from_str(&headers_json)
-            .map_err(|e| Self::protocol_failure("apply_auth", format!("invalid header JSON: {e}")))?;
+        let headers: Vec<(String, String)> = serde_json::from_str(&headers_json).map_err(|e| {
+            Self::protocol_failure("apply_auth", format!("invalid header JSON: {e}"))
+        })?;
 
         let mut req = req;
         for (name, value) in headers {
@@ -298,7 +299,9 @@ pub fn request_to_json(req: &InternalRequest) -> String {
         let (mode, name) = match req.tool_choice {
             Some(crate::types::ToolChoice::None) => ("none", None),
             Some(crate::types::ToolChoice::Required) => ("required", None),
-            Some(crate::types::ToolChoice::Specific) => ("specific", req.tool_choice_name.as_deref()),
+            Some(crate::types::ToolChoice::Specific) => {
+                ("specific", req.tool_choice_name.as_deref())
+            }
             Some(crate::types::ToolChoice::Auto) | None => ("auto", None),
         };
         json!({ "mode": mode, "name": name })
