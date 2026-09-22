@@ -250,6 +250,9 @@ pub async fn count_tokens(
         return Ok(estimate());
     };
     let adapter = state.adapters.for_provider(&target.provider);
+    if !adapter.supports_count_tokens() {
+        return Ok(estimate());
+    }
     let credential = state
         .credential_for(&target.provider, &target.account)
         .await
