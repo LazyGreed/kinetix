@@ -887,6 +887,194 @@ fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
     format!("{}|{}|{}", route.id, t.account.id, t.model.id)
 }
 
+fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> bool {
+    if !kind.is_retryable() {
+        return false;
+    }
+    let Some(route) = route else {
+        return true;
+    };
+    let triggers: Value =
+        serde_json::from_str(&route.fallback_triggers).unwrap_or_else(|_| serde_json::json!({}));
+    let enabled = |name: &str| triggers.get(name).and_then(Value::as_bool).unwrap_or(true);
+    match kind {
+        FailureKind::RateLimit => enabled("on429"),
+        FailureKind::QuotaExhausted => enabled("onQuota"),
+        FailureKind::ServerError | FailureKind::ConnectionError => enabled("on5xx"),
+        FailureKind::Timeout => enabled("onTimeout"),
+        // Credential-global failures should try another account. Target-local
+        // failures should try another logical route target.
+        FailureKind::AuthError | FailureKind::TargetError => true,
+        FailureKind::BadRequest => false,
+    }
+}
+
+fn failure_rule_matches(rule: &Value, status: u16, code: &str, message: &str) -> bool {
+    let Some(obj) = rule.as_object() else {
+        return false;
+    };
+    let mut constrained = false;
+
+    if let Some(statuses) = obj.get("statuses").and_then(Value::as_array) {
+        constrained = true;
+        if !statuses.iter().any(|v| v.as_u64() == Some(status as u64)) {
+            return false;
+        }
+    }
+    if let Some(single) = obj.get("status").and_then(Value::as_u64) {
+        constrained = true;
+        if single != status as u64 {
+            return false;
+        }
+    }
+    if let Some(codes) = obj.get("codes").and_then(Value::as_array) {
+        constrained = true;
+        let lower = code.to_ascii_lowercase();
+        if !codes
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|candidate| candidate.eq_ignore_ascii_case(&lower))
+        {
+            return false;
+        }
+    }
+    if let Some(needles) = obj.get("message_contains").and_then(Value::as_array) {
+        constrained = true;
+        let lower = message.to_ascii_lowercase();
+        if !needles
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+        {
+            return false;
+        }
+    }
+
+    constrained
+}
+
+/// Apply admin-configured provider classification rules after the native
+/// adapter has extracted the provider's normal status/code/message semantics.
+///
+/// Supported keys: `auth`, `quota`, `rate_limit`, `target`,
+/// `bad_request`. Each rule may contain `status`/`statuses`, `codes`,
+/// and/or `message_contains`.
+pub(crate) fn apply_provider_failure_rules(
+    provider: &db::ProviderRow,
+    status: u16,
+    body: &str,
+    mut failure: UpstreamFailure,
+) -> UpstreamFailure {
+    let rules: Value =
+        serde_json::from_str(&provider.rate_limit_rules).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(obj) = rules.as_object() else {
+        return failure;
+    };
+    if obj.is_empty() {
+        return failure;
+    }
+
+    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let code = parsed
+        .pointer("/error/code")
+        .or_else(|| parsed.pointer("/error/status"))
+        .or_else(|| parsed.pointer("/error/type"))
+        .or_else(|| parsed.get("code"))
+        .or_else(|| parsed.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let message = parsed
+        .pointer("/error/message")
+        .or_else(|| parsed.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or(&failure.message);
+
+    let ordered = [
+        ("auth", FailureKind::AuthError),
+        ("quota", FailureKind::QuotaExhausted),
+        ("rate_limit", FailureKind::RateLimit),
+        ("target", FailureKind::TargetError),
+        ("bad_request", FailureKind::BadRequest),
+    ];
+    for (name, kind) in ordered {
+        if obj
+            .get(name)
+            .map(|rule| failure_rule_matches(rule, status, code, message))
+            .unwrap_or(false)
+        {
+            failure.kind = kind;
+            break;
+        }
+    }
+    failure
+}
+
+fn apply_target_overrides(
+    req: &mut InternalRequest,
+    overrides: &Value,
+) -> Result<(), ProxyError> {
+    let Some(obj) = overrides.as_object() else {
+        if overrides.is_null() {
+            return Ok(());
+        }
+        return Err(ProxyError::internal(
+            "route target param_overrides must be a JSON object",
+        ));
+    };
+    if obj.is_empty() {
+        return Ok(());
+    }
+
+    for (key, value) in obj {
+        match key.as_str() {
+            "temperature" => req.params.temperature = value.as_f64(),
+            "top_p" => req.params.top_p = value.as_f64(),
+            "top_k" => req.params.top_k = value.as_f64(),
+            "max_tokens" | "max_completion_tokens" => {
+                req.params.max_tokens = value.as_u64().and_then(|v| u32::try_from(v).ok())
+            }
+            "seed" => req.params.seed = value.as_i64(),
+            "presence_penalty" => req.params.presence_penalty = value.as_f64(),
+            "frequency_penalty" => req.params.frequency_penalty = value.as_f64(),
+            "stop" => {
+                req.params.stop = match value {
+                    Value::String(v) => vec![v.clone()],
+                    Value::Array(values) => values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    Value::Null => Vec::new(),
+                    _ => {
+                        return Err(ProxyError::bad_request(
+                            "route target override 'stop' must be a string or array",
+                        ))
+                    }
+                }
+            }
+            _ => {
+                req.extra.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    // Same-format passthrough must observe the exact same target overrides as
+    // translated requests.
+    if let Some(raw) = req.raw_body.as_mut() {
+        let mut parsed: Value = serde_json::from_str(raw)
+            .map_err(|_| ProxyError::bad_request("client request body is not valid JSON"))?;
+        let Some(raw_obj) = parsed.as_object_mut() else {
+            return Err(ProxyError::bad_request("client request body must be a JSON object"));
+        };
+        for (key, value) in obj {
+            raw_obj.insert(key.clone(), value.clone());
+        }
+        *raw = parsed.to_string();
+    }
+
+    Ok(())
+}
+
 fn default_quota_window(account: &db::AccountRow) -> i64 {
     match account.quota_type.as_str() {
         "daily" => 86_400,
