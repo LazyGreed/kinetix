@@ -3332,9 +3332,9 @@ mod route_policy_tests {
         let mut req = request();
         req.thinking = Some(crate::types::ThinkingLevel::High);
 
-        assert!(check_thinking_translation(&model(json!({})), &req).is_err());
+        assert!(check_thinking_translation(&model(serde_json::json!({})), &req).is_err());
         assert!(check_thinking_translation(
-            &model(json!({"levels":{"high":{"reasoning_effort":"high"}}})),
+            &model(serde_json::json!({"levels":{"high":{"reasoning_effort":"high"}}})),
             &req,
         )
         .is_ok());
