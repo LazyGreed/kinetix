@@ -144,14 +144,13 @@ fn token_count_exact_target(
     req: &InternalRequest,
 ) -> Result<Option<ResolvedTarget>, ProxyError> {
     let snap = state.registry.snapshot();
-    let resolved = crate::registry::Registry::resolve_in(&snap, &req.requested_model).ok_or_else(
-        || {
+    let resolved =
+        crate::registry::Registry::resolve_in(&snap, &req.requested_model).ok_or_else(|| {
             ProxyError::not_found(format!(
                 "model '{}' is not configured. Use GET /v1/models to list available models.",
                 req.requested_model
             ))
-        },
-    )?;
+        })?;
     let needs = req.capability_needs();
     let allowed_providers = key.allowed_providers();
 
@@ -190,7 +189,10 @@ fn token_count_exact_target(
             let account = select_accounts(&snap, &provider_id, None)?
                 .into_iter()
                 .find(|account| {
-                    matches!(pool::effective_status(account), pool::AccountStatus::Healthy)
+                    matches!(
+                        pool::effective_status(account),
+                        pool::AccountStatus::Healthy
+                    )
                 });
             Ok(account.map(|account| ResolvedTarget {
                 account,
@@ -320,8 +322,7 @@ pub async fn count_tokens(
         .map_err(|error| ProxyError::upstream(classify_reqwest(&error)))?;
     if !(200..300).contains(&status) {
         let native = adapter.classify_error(status, &text, &headers);
-        let failure =
-            apply_provider_failure_rules(&target.provider, status, &text, native);
+        let failure = apply_provider_failure_rules(&target.provider, status, &text, native);
         return Err(preserve_anthropic_error(
             failure_to_error(&failure, &target),
             FrontendFormat::Anthropic,
