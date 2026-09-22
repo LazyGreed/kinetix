@@ -21,6 +21,8 @@ const MAX_PINNED_CLIENTS: usize = 256;
 /// TCP/TLS establishment has its own bound. Provider `timeout_ms` is enforced
 /// by the pipeline as first-event/idle phase budgets, never as total wall time.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_EMPTY_BAD_GATEWAY_RETRIES: usize = 1;
+const EMPTY_BAD_GATEWAY_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ResolvedDestination {
@@ -91,6 +93,7 @@ impl OutboundError {
     }
 }
 
+#[derive(Clone)]
 pub struct ProviderRequest {
     pub method: Method,
     pub url: Url,
@@ -244,6 +247,18 @@ fn redirected_method(status: StatusCode, method: &Method) -> (Method, bool) {
 /// Every redirect target is re-resolved and revalidated. Provider credentials
 /// and provider-defined headers are stripped at each hop and only reapplied when
 /// the redirect host is authorized by the provider credential binding.
+fn should_retry_empty_bad_gateway(
+    accept_event_stream: bool,
+    status: StatusCode,
+    content_length: Option<u64>,
+    retries_done: usize,
+) -> bool {
+    accept_event_stream
+        && retries_done < MAX_EMPTY_BAD_GATEWAY_RETRIES
+        && status == StatusCode::BAD_GATEWAY
+        && content_length == Some(0)
+}
+
 pub async fn send_provider_request(
     cache: &DashMap<String, reqwest::Client>,
     allow_private: bool,
@@ -252,10 +267,51 @@ pub async fn send_provider_request(
     ctx: &UpstreamContext<'_>,
     request: ProviderRequest,
 ) -> Result<reqwest::Response, OutboundError> {
+    let mut retries_done = 0usize;
+    loop {
+        let response = send_provider_request_once(
+            cache,
+            allow_private,
+            allow_insecure_global,
+            adapter,
+            ctx,
+            &request,
+        )
+        .await?;
+
+        if should_retry_empty_bad_gateway(
+            request.accept_event_stream,
+            response.status(),
+            response.content_length(),
+            retries_done,
+        ) {
+            retries_done += 1;
+            tracing::warn!(
+                account_id = ctx.account_id.unwrap_or("<unknown>"),
+                provider = %ctx.provider.name,
+                retry = retries_done,
+                "retrying empty upstream 502 before route fallback"
+            );
+            tokio::time::sleep(EMPTY_BAD_GATEWAY_BACKOFF).await;
+            continue;
+        }
+
+        return Ok(response);
+    }
+}
+
+async fn send_provider_request_once(
+    cache: &DashMap<String, reqwest::Client>,
+    allow_private: bool,
+    allow_insecure_global: bool,
+    adapter: &Arc<dyn Adapter>,
+    ctx: &UpstreamContext<'_>,
+    request: &ProviderRequest,
+) -> Result<reqwest::Response, OutboundError> {
     let insecure_tls = allow_insecure_global || ctx.provider.insecure_tls();
-    let mut current = request.url;
-    let mut method = request.method;
-    let mut body = request.json_body;
+    let mut current = request.url.clone();
+    let mut method = request.method.clone();
+    let mut body = request.json_body.clone();
 
     if !credentials_authorized(ctx, &current) {
         let host = current.host_str().unwrap_or("<missing>");
@@ -277,8 +333,6 @@ pub async fn send_provider_request(
 
         let authorized = credentials_authorized(ctx, &current);
         let mut builder = client.request(method.clone(), current.clone());
-        // Whole-request deadlines are reserved for bounded control-plane calls.
-        // Proxy streaming uses phase timers in pipeline.rs instead.
         if let Some(timeout) = request.total_timeout {
             builder = builder.timeout(timeout);
         }
@@ -382,6 +436,46 @@ mod tests {
     }
 
     #[test]
+    fn retries_only_explicitly_empty_streaming_bad_gateways() {
+        assert!(should_retry_empty_bad_gateway(
+            true,
+            StatusCode::BAD_GATEWAY,
+            Some(0),
+            0,
+        ));
+        assert!(!should_retry_empty_bad_gateway(
+            true,
+            StatusCode::BAD_GATEWAY,
+            Some(1),
+            0,
+        ));
+        assert!(!should_retry_empty_bad_gateway(
+            true,
+            StatusCode::BAD_GATEWAY,
+            None,
+            0,
+        ));
+        assert!(!should_retry_empty_bad_gateway(
+            false,
+            StatusCode::BAD_GATEWAY,
+            Some(0),
+            0,
+        ));
+        assert!(!should_retry_empty_bad_gateway(
+            true,
+            StatusCode::BAD_GATEWAY,
+            Some(0),
+            1,
+        ));
+        assert!(!should_retry_empty_bad_gateway(
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(0),
+            0,
+        ));
+    }
+
+    #[test]
     fn redirect_credentials_are_host_bound() {
         let provider = provider();
         let model = crate::db::ModelRow {
@@ -404,6 +498,7 @@ mod tests {
         let ctx = UpstreamContext {
             provider: &provider,
             model: &model,
+            account_id: None,
             credential: "secret".into(),
         };
 

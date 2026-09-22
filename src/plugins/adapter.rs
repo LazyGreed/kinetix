@@ -59,7 +59,15 @@ impl PluginAdapter {
     }
 
     fn provider_json(ctx: &UpstreamContext<'_>) -> String {
-        serde_json::to_string(ctx.provider).unwrap_or_else(|_| "{}".to_string())
+        let mut provider =
+            serde_json::to_value(ctx.provider).unwrap_or_else(|_| serde_json::json!({}));
+        if let (Some(account_id), Some(object)) = (ctx.account_id, provider.as_object_mut()) {
+            object.insert(
+                "_kinetix".into(),
+                serde_json::json!({ "account_id": account_id }),
+            );
+        }
+        serde_json::to_string(&provider).unwrap_or_else(|_| "{}".to_string())
     }
 
     fn model_json(ctx: &UpstreamContext<'_>) -> String {

@@ -644,6 +644,7 @@ pub async fn run(
         let ctx = UpstreamContext {
             provider: &target.provider,
             model: &target.model,
+            account_id: Some(target.account.id.as_str()),
             credential,
         };
 
