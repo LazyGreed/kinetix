@@ -151,7 +151,7 @@ pub async fn run(
     state: &AppState,
     format: FrontendFormat,
     key: Option<db::VirtualKeyRow>,
-    mut req: InternalRequest,
+    req: InternalRequest,
     request_id: String,
     allow_fallback: bool,
     session: Option<String>,
