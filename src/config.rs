@@ -674,7 +674,6 @@ pub fn load_bootstrap(path: &std::path::Path) -> Result<BootstrapConfig> {
     Ok(cfg)
 }
 
-
 #[cfg(test)]
 mod bootstrap_config_tests {
     use super::*;
