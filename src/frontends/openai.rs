@@ -47,6 +47,21 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
             }
             "assistant" => {
                 let mut parts = decode_content_parts(m.get("content"));
+                if let Some(reasoning) = m
+                    .get("reasoning_content")
+                    .or_else(|| m.get("reasoning"))
+                    .and_then(Value::as_str)
+                {
+                    if !reasoning.is_empty() {
+                        parts.push(Part::Thinking {
+                            text: reasoning.to_string(),
+                            signature: m
+                                .get("reasoning_signature")
+                                .and_then(Value::as_str)
+                                .map(String::from),
+                        });
+                    }
+                }
                 if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tcs {
                         let id = tc.get("id").and_then(|i| i.as_str()).map(String::from);
