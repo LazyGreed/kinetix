@@ -14,6 +14,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::adapters::{Adapter, UpstreamContext};
+use crate::types::UpstreamFailure;
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_PINNED_CLIENTS: usize = 256;
@@ -50,6 +51,7 @@ impl ResolvedDestination {
 pub struct OutboundError {
     pub message: String,
     pub timeout: bool,
+    pub adapter_failure: Option<UpstreamFailure>,
 }
 
 impl OutboundError {
@@ -57,6 +59,7 @@ impl OutboundError {
         Self {
             message: message.into(),
             timeout: false,
+            adapter_failure: None,
         }
     }
 
@@ -72,7 +75,19 @@ impl OutboundError {
                 crate::crypto::redact(&error.to_string())
             )
         };
-        Self { message, timeout }
+        Self {
+            message,
+            timeout,
+            adapter_failure: None,
+        }
+    }
+
+    fn adapter(failure: UpstreamFailure) -> Self {
+        Self {
+            message: failure.message.clone(),
+            timeout: matches!(failure.kind, crate::types::FailureKind::Timeout),
+            adapter_failure: Some(failure),
+        }
     }
 }
 
@@ -197,6 +212,7 @@ fn pinned_client(
     let client = builder.build().map_err(|e| OutboundError {
         message: format!("building pinned upstream client failed: {e}"),
         timeout: false,
+        adapter_failure: None,
     })?;
 
     if cache.len() >= MAX_PINNED_CLIENTS {
@@ -281,7 +297,9 @@ pub async fn send_provider_request(
         }
 
         if authorized {
-            builder = adapter.apply_auth(ctx, builder);
+            builder = adapter
+                .apply_auth(ctx, builder)
+                .map_err(OutboundError::adapter)?;
             for (name, value) in ctx.provider.extra_headers_map() {
                 builder = builder.header(name, value);
             }
