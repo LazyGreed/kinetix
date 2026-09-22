@@ -3116,9 +3116,26 @@ async fn drive_stream_passthrough(
         let message = error_message
             .as_deref()
             .unwrap_or("upstream stream interrupted");
-        let mut encoder = Encoder::new(format, encoder_ctx);
-        for frame in encoder.error_frame(message) {
-            let _ = tx.send(Ok(frame)).await;
+        if format == FrontendFormat::OpenAi {
+            // Same-format passthrough has already exposed the upstream stream
+            // identity. Do not synthesize a new chat completion id/model for
+            // the terminal error.
+            let frame = serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "upstream_error",
+                    "code": "stream_error"
+                }
+            });
+            let _ = tx
+                .send(Ok(frontends::sse_frame(None, &frame.to_string())))
+                .await;
+            let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
+        } else {
+            let mut encoder = Encoder::new(format, encoder_ctx);
+            for frame in encoder.error_frame(message) {
+                let _ = tx.send(Ok(frame)).await;
+            }
         }
     }
 
