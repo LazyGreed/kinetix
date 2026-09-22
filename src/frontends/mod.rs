@@ -10,13 +10,68 @@ pub mod responses;
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::types::{FinishReason, InternalRequest, ProxyError, StreamEvent};
+use crate::types::{FinishReason, InternalRequest, Message, Part, ProxyError, StreamEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontendFormat {
     OpenAi,
     Anthropic,
     OpenAiResponses,
+}
+
+
+const TRANSLATION_ISSUES_KEY: &str = "__kinetix_translation_issues";
+
+pub(crate) fn attach_translation_issues(
+    extra: &mut serde_json::Map<String, Value>,
+    issues: Vec<String>,
+) {
+    if !issues.is_empty() {
+        extra.insert(
+            TRANSLATION_ISSUES_KEY.to_string(),
+            Value::Array(issues.into_iter().map(Value::String).collect()),
+        );
+    }
+}
+
+/// Resolve tool-result names from previous assistant tool calls. Some inbound
+/// formats only repeat the call id on the result, while Gemini requires the
+/// original function name on its function-response object.
+pub(crate) fn resolve_tool_result_names(messages: &mut [Message]) -> Vec<String> {
+    let mut names = std::collections::HashMap::<String, String>::new();
+    let mut issues = Vec::new();
+
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        for part in &message.parts {
+            if let Part::ToolCall {
+                id: Some(id), name, ..
+            } = part
+            {
+                names.insert(id.clone(), name.clone());
+            }
+        }
+
+        for part in &mut message.parts {
+            if let Part::ToolResult {
+                tool_call_id,
+                name,
+                ..
+            } = part
+            {
+                if name.is_none() {
+                    if let Some(resolved) = names.get(tool_call_id) {
+                        *name = Some(resolved.clone());
+                    } else if !tool_call_id.is_empty() {
+                        issues.push(format!(
+                            "messages[{message_index}] tool result references unknown tool call id '{tool_call_id}'"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    issues
 }
 
 impl FrontendFormat {
@@ -300,6 +355,16 @@ fn openai_finish_str(f: &FinishReason) -> &str {
 pub fn translation_unsupported(
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
+    if let Some(issue) = extra
+        .get(TRANSLATION_ISSUES_KEY)
+        .and_then(Value::as_array)
+        .and_then(|issues| issues.first())
+        .and_then(Value::as_str)
+    {
+        return Some(format!(
+            "unsupported nested content cannot be translated safely: {issue}"
+        ));
+    }
     // Fields that materially change the meaning of a completion and have no
     // faithful translation into the other supported wire formats.
     if let Some(n) = extra.get("n").and_then(|v| v.as_u64()) {
