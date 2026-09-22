@@ -3595,6 +3595,83 @@ mod route_policy_tests {
     }
 
     #[test]
+    fn anthropic_error_passthrough_is_sanitized_and_keeps_retry_metadata() {
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+        let failure = UpstreamFailure {
+            kind: FailureKind::ServerError,
+            status: Some(529),
+            retry_after_secs: Some(2),
+            message: "overloaded".into(),
+            quota_reset_at: None,
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        headers.insert("x-should-retry", "true".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-unified-remaining",
+            "0".parse().unwrap(),
+        );
+        headers.insert("request-id", "req_upstream_123".parse().unwrap());
+        headers.insert("set-cookie", "do-not-forward=true".parse().unwrap());
+
+        let error = preserve_anthropic_error(
+            ProxyError::upstream("overloaded"),
+            FrontendFormat::Anthropic,
+            &adapter,
+            &failure,
+            529,
+            &headers,
+            Some(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"busy","debug":"drop"},"request_id":"req_upstream_123","internal":"drop"}"#,
+            ),
+        );
+
+        assert_eq!(error.http_status_override, Some(529));
+        assert_eq!(
+            error.body_override.as_ref().unwrap(),
+            &serde_json::json!({
+                "type": "error",
+                "error": { "type": "overloaded_error", "message": "busy" },
+                "request_id": "req_upstream_123"
+            })
+        );
+        assert!(error
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-should-retry" && value == "true"));
+        assert!(error
+            .headers
+            .iter()
+            .any(|(name, _)| name == "anthropic-ratelimit-unified-remaining"));
+        assert!(!error.headers.iter().any(|(name, _)| name == "set-cookie"));
+    }
+
+    #[test]
+    fn anthropic_upstream_auth_failures_stay_internal() {
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+        let failure = UpstreamFailure {
+            kind: FailureKind::AuthError,
+            status: Some(401),
+            retry_after_secs: None,
+            message: "bad upstream credential".into(),
+            quota_reset_at: None,
+        };
+        let error = preserve_anthropic_error(
+            ProxyError::upstream("upstream auth failed"),
+            FrontendFormat::Anthropic,
+            &adapter,
+            &failure,
+            401,
+            &reqwest::header::HeaderMap::new(),
+            Some(
+                r#"{"type":"error","error":{"type":"authentication_error","message":"credential detail"}}"#,
+            ),
+        );
+        assert_eq!(error.http_status_override, None);
+        assert_eq!(error.body_override, None);
+    }
+
+    #[test]
     fn tool_stream_indexes_are_canonical_across_chunk_local_resets() {
         let mut state = ToolStreamState::new("req_test");
         let first = state.normalize(vec![
