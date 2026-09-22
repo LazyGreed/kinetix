@@ -1880,6 +1880,13 @@ fn strip_opaque_raw_body(req: &mut InternalRequest) {
         return;
     };
     for message in messages {
+        if let Some(object) = message.as_object_mut() {
+            object.remove("reasoning_content");
+            object.remove("reasoning_signature");
+            if object.get("reasoning").is_some_and(Value::is_string) {
+                object.remove("reasoning");
+            }
+        }
         let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
