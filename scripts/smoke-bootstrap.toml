@@ -31,7 +31,7 @@ models_path = "/models"
   context_window = 200000
   max_output_tokens = 8192
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
-  thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+  thinking_map = { levels = { low = { "reasoning_effort" = "low" }, medium = { "reasoning_effort" = "medium" }, high = { "reasoning_effort" = "high" } } }
 
 [[providers]]
 name = "Synth Gemini"
@@ -56,7 +56,7 @@ models_path = "/models"
   context_window = 200000
   max_output_tokens = 8192
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
-  thinking_map = { levels = { low = { "reasoning_effort" = "low" }, medium = { "reasoning_effort" = "medium" }, high = { "reasoning_effort" = "high" } } }
+  thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
 
 
   [[providers.models]]
@@ -94,7 +94,7 @@ capability_mode = "permissive"
 
   [[providers.models]]
   upstream_id = "syn-malformed"
-  display_name = "Synthetic Malformed OpenAI"
+  display_name = "Synthetic Malformed Anthropic"
   enabled = true
   context_window = 200000
   max_output_tokens = 8192
@@ -102,7 +102,7 @@ capability_mode = "permissive"
 
   [[providers.models]]
   upstream_id = "syn-truncated"
-  display_name = "Synthetic Truncated OpenAI"
+  display_name = "Synthetic Truncated Anthropic"
   enabled = true
   context_window = 200000
   max_output_tokens = 8192
