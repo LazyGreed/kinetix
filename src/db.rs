@@ -1415,6 +1415,34 @@ pub async fn account_spend_since(pool: &Pool, account_id: &str, since_iso: &str)
 }
 
 /// Count of requests for a key since a timestamp (for RPM/TPM windows).
+pub async fn key_usage_entries_since(
+    pool: &Pool,
+    key_id: &str,
+    since_iso: &str,
+) -> Result<Vec<(String, i64)>> {
+    let rows = sqlx::query(
+        "SELECT ts,
+                COALESCE(input_tokens,0) + COALESCE(output_tokens,0) AS tokens
+         FROM usage_logs
+         WHERE key_id = ? AND ts >= ?
+         ORDER BY ts ASC",
+    )
+    .bind(key_id)
+    .bind(since_iso)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("ts"),
+                row.get::<i64, _>("tokens"),
+            )
+        })
+        .collect())
+}
+
 pub async fn key_usage_since(pool: &Pool, key_id: &str, since_iso: &str) -> Result<(i64, i64)> {
     let row = sqlx::query(
         "SELECT COUNT(*) as n, COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) as t
