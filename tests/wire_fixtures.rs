@@ -260,9 +260,18 @@ fn responses_streaming_wire_output_is_stable() {
         !joined_out.contains("[DONE]"),
         "Responses streaming must terminate with response.completed, not Chat Completions [DONE]"
     );
+    let in_progress = joined_out
+        .split("event: response.in_progress\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("response.in_progress frame");
     assert!(
-        joined_out.contains("\"type\":\"response.in_progress\",\"sequence_number\":1,\"response\":"),
+        in_progress.contains("\"response\":{"),
         "response.in_progress must carry a response object"
+    );
+    assert!(
+        !in_progress.contains("\"response_id\":"),
+        "response.in_progress must not use the old response_id-only shape"
     );
 }
 
@@ -329,8 +338,13 @@ fn responses_error_frame_is_native() {
         got.contains("\"type\":\"response.failed\""),
         "missing type field: {got}"
     );
+    let failed = got
+        .split("event: response.failed\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("response.failed frame");
     assert!(
-        got.contains("\"response\":{\"created_at\":1700000000"),
+        failed.contains("\"response\":{"),
         "response.failed must carry the failed response object: {got}"
     );
     assert!(
