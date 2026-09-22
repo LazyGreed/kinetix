@@ -920,7 +920,9 @@ fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> boo
         return false;
     }
     let Some(route) = route else {
-        return true;
+        // A target-local model/project failure cannot be repaired by trying a
+        // different credential for the same direct provider/model.
+        return kind != FailureKind::TargetError;
     };
     let triggers: Value =
         serde_json::from_str(&route.fallback_triggers).unwrap_or_else(|_| serde_json::json!({}));
