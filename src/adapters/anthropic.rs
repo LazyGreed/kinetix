@@ -653,7 +653,7 @@ mod tests {
             credential: "sk-ant-api03-regular-key".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         assert!(body.get("system").is_none());
     }
 
@@ -668,7 +668,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -689,7 +689,7 @@ mod tests {
             credential: "some-opaque-or-exchanged-credential".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -710,7 +710,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -735,7 +735,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
@@ -764,7 +764,7 @@ mod tests {
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
-        let body = AnthropicAdapter::new().build_body(&ctx, &req);
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         let system = body
             .get("system")
             .and_then(|v| v.as_str())
