@@ -80,6 +80,7 @@ export interface ModelPrice {
   inputPer1M: number;
   outputPer1M: number;
   cachedPer1M: number;
+  cacheWritePer1M: number;
   thinkingPer1M: number;
 }
 
@@ -164,6 +165,7 @@ export interface RequestLog {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens: number;
   thinkingTokens: number;
   costUsd: number;
   cacheStatus: 'hit' | 'miss' | 'bypass';
