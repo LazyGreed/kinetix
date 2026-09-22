@@ -541,6 +541,23 @@ pub async fn run(
                 "soft quota reached",
             );
             state.record_skip();
+            if !allow_fallback
+                || !route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted)
+            {
+                trace.finish("failed");
+                state.live.finish(
+                    &meta.request_id,
+                    "failed",
+                    started.elapsed().as_millis() as u64,
+                    None,
+                    None,
+                );
+                let _ = db::insert_route_trace(&state.pool, &trace).await;
+                return Err(ProxyError::rate_limited(
+                    "account soft quota reached",
+                    None,
+                ));
+            }
             continue;
         }
 
