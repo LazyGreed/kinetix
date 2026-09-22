@@ -307,6 +307,7 @@ pub async fn test_stream(
             ..Default::default()
         },
         stream,
+        include_usage: false,
         thinking: None,
         extra: Default::default(),
         raw_body: None,
