@@ -73,6 +73,7 @@ export const UsageView: React.FC<UsageViewProps> = ({
   const totalSpend = keys.reduce((acc, k) => acc + k.currentMonthlySpend, 0);
   const totalTokens = keys.reduce((acc, k) => acc + k.totalTokens, 0);
   const totalCachedTokens = filtered.reduce((acc, r) => acc + r.cachedTokens, 0);
+  const totalCacheWriteTokens = filtered.reduce((acc, r) => acc + r.cacheWriteTokens, 0);
   const totalThinkingTokens = filtered.reduce((acc, r) => acc + r.thinkingTokens, 0);
 
   const yesterday = useMemo(() => {
@@ -128,7 +129,7 @@ export const UsageView: React.FC<UsageViewProps> = ({
             </SketchBadge>
           </h2>
           <p className="text-base font-body text-[var(--ink)]/80">
-            Every request is attributed to a team member or project, tracking input, output, cached, and reasoning tokens.
+            Every request is attributed to a team member or project, tracking inclusive input/output totals plus cache-read, cache-write, and reasoning breakdowns.
           </p>
         </div>
 
@@ -188,7 +189,7 @@ export const UsageView: React.FC<UsageViewProps> = ({
             {formatTokens(totalCachedTokens)}
           </div>
           <span className="text-xs font-mono text-[var(--ink)]/70 block mt-1">
-            Cached tokens in window ({filtered.length} reqs)
+            Reads: {formatTokens(totalCachedTokens)} · writes: {formatTokens(totalCacheWriteTokens)} ({filtered.length} reqs)
           </span>
         </WobblyCard>
 
@@ -370,7 +371,8 @@ export const UsageView: React.FC<UsageViewProps> = ({
                 <th className="p-2">Model Display Name</th>
                 <th className="p-2">Input / 1M</th>
                 <th className="p-2">Output / 1M</th>
-                <th className="p-2">Cached / 1M</th>
+                <th className="p-2">Cache Read / 1M</th>
+                <th className="p-2">Cache Write / 1M</th>
                 <th className="p-2">Thinking / 1M</th>
               </tr>
             </thead>
@@ -381,6 +383,7 @@ export const UsageView: React.FC<UsageViewProps> = ({
                   <td className="p-2">${m.prices.inputPer1M.toFixed(2)}</td>
                   <td className="p-2">${m.prices.outputPer1M.toFixed(2)}</td>
                   <td className="p-2">${m.prices.cachedPer1M.toFixed(4)}</td>
+                  <td className="p-2">${m.prices.cacheWritePer1M.toFixed(4)}</td>
                   <td className="p-2">
                     {m.capabilities.reasoning ? `$${m.prices.thinkingPer1M.toFixed(2)}` : '—'}
                   </td>
