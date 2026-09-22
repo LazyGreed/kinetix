@@ -4,10 +4,11 @@ use kinetix::plugins::response_contract::{events_to_json, json_to_events};
 use kinetix::types::{FailureKind, FinishReason, StreamEvent, TokenUsage};
 use serde_json::{json, Value};
 
+const RESPONSE_SCHEMA_JSON: &str =
+    include_str!("../wit/contracts/kinetix.plugin.response.v1.schema.json");
 const ALL_EVENTS: &str = include_str!("../wit/fixtures/plugin-response/v1/all-events.json");
 const WARNING: &str = include_str!("../wit/fixtures/plugin-response/v1/warning.json");
-const TERMINAL_ERROR: &str =
-    include_str!("../wit/fixtures/plugin-response/v1/terminal-error.json");
+const TERMINAL_ERROR: &str = include_str!("../wit/fixtures/plugin-response/v1/terminal-error.json");
 const INVALID_VERSION: &str =
     include_str!("../wit/fixtures/plugin-response/v1/invalid-version.json");
 const INVALID_MISSING_TEXT: &str =
@@ -119,6 +120,77 @@ fn additive_unknown_fields_are_accepted() {
         events.as_slice(),
         [StreamEvent::TextDelta(text)] if text == "ok"
     ));
+}
+
+
+#[test]
+fn schema_u64_bounds_match_runtime_validator() {
+    let schema: Value = serde_json::from_str(RESPONSE_SCHEMA_JSON).expect("valid response schema");
+    let event_schemas = schema
+        .pointer("/$defs/event/oneOf")
+        .and_then(Value::as_array)
+        .expect("event schemas");
+
+    let event_schema = |event_type: &str| {
+        event_schemas
+            .iter()
+            .find(|event| {
+                event
+                    .pointer("/properties/type/const")
+                    .and_then(Value::as_str)
+                    == Some(event_type)
+            })
+            .expect("event schema")
+    };
+
+    let usage = event_schema("usage");
+    for field in ["input", "output", "cached", "cache_write", "thinking"] {
+        let pointer = format!("/properties/{field}/maximum");
+        assert_eq!(
+            usage.pointer(&pointer).and_then(Value::as_u64),
+            Some(u64::MAX),
+            "usage.{field} schema maximum must match the runtime u64 validator"
+        );
+    }
+
+    let error = event_schema("error");
+    assert_eq!(
+        error
+            .pointer("/properties/retry_after_secs/maximum")
+            .and_then(Value::as_u64),
+        Some(u64::MAX),
+        "error.retry_after_secs schema maximum must match the runtime u64 validator"
+    );
+
+    let max_usage = format!(
+        r#"{{"schema":"kinetix.plugin.response","schema_version":1,"events":[{{"type":"usage","input":{0},"output":{0},"cached":{0},"cache_write":{0},"thinking":{0}}}]}}"#,
+        u64::MAX
+    );
+    let events = json_to_events(&max_usage).expect("u64::MAX usage must be accepted");
+    assert!(matches!(
+        events.as_slice(),
+        [StreamEvent::Usage(TokenUsage {
+            input: Some(input),
+            output: Some(output),
+            cached: Some(cached),
+            cache_write: Some(cache_write),
+            thinking: Some(thinking),
+        })] if *input == u64::MAX
+            && *output == u64::MAX
+            && *cached == u64::MAX
+            && *cache_write == u64::MAX
+            && *thinking == u64::MAX
+    ));
+
+    let max_retry_after = format!(
+        r#"{{"schema":"kinetix.plugin.response","schema_version":1,"events":[{{"type":"error","kind":"rate_limit","message":"slow down","retry_after_secs":{}}}]}}"#,
+        u64::MAX
+    );
+    let error = json_to_events(&max_retry_after).expect_err("terminal error must fail");
+    assert_eq!(error.retry_after_secs, Some(u64::MAX));
+
+    let overflow = r#"{"schema":"kinetix.plugin.response","schema_version":1,"events":[{"type":"usage","input":18446744073709551616}]}"#;
+    assert!(json_to_events(overflow).is_err());
 }
 
 #[test]
