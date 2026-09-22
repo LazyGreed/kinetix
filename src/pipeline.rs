@@ -444,9 +444,11 @@ pub async fn run(
         .min(5)
         .max(1);
 
-    // Prompt-cache affinity: reorder so a previously-served target leads.
+    // Sticky routing and prompt-cache affinity share the same bounded session
+    // mapping: both prefer the last successful target while still allowing
+    // ordinary health/fallback logic to move away from it.
     if let (Some(route), Some(session)) = (&route, &session) {
-        if route.cache_affinity != 0 {
+        if route.cache_affinity != 0 || route.sticky_routing != 0 {
             if let Some(sticky_key) = state.sticky_lookup(session, STICKY_TTL) {
                 if let Some(pos) = targets
                     .iter()
@@ -456,7 +458,11 @@ pub async fn run(
                     trace.step(
                         "candidate",
                         Some(targets[0].account.label.clone()),
-                        "cache-affinity: session sticky target promoted (FR-7.3)",
+                        if route.sticky_routing != 0 {
+                            "sticky-routing: previous session target promoted (FR-7.5)"
+                        } else {
+                            "cache-affinity: session target promoted (FR-7.3)"
+                        },
                     );
                 }
             }
@@ -467,9 +473,22 @@ pub async fn run(
     let mut last_error: Option<ProxyError> = None;
     let mut all_accounts: Vec<db::AccountRow> = Vec::new();
     let mut attempts_done = 0usize;
+    let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
     for target in targets.iter() {
+        if let (Some(skip), Some(target_id)) =
+            (skip_logical_target.as_deref(), target.route_target_id.as_deref())
+        {
+            if skip == target_id {
+                trace.step(
+                    "skip",
+                    Some(target.account.label.clone()),
+                    "same logical target skipped after target-local failure",
+                );
+                continue;
+            }
+        }
         if attempts_done >= max_attempts || Instant::now() >= deadline {
             if Instant::now() >= deadline {
                 trace.step("skip", None, "pre-commit deadline exceeded");
@@ -552,14 +571,23 @@ pub async fn run(
         // bound-but-unavailable plugin adapter fails closed.
         let adapter = state.adapters.for_provider(&target.provider);
 
+        // Every target gets an isolated request view. Target overrides and
+        // continuity transforms must never leak into a later fallback target.
+        let mut target_req = req.clone();
+
         // Continuity / portability policy on cross-provider fallback (FR-2.11).
         if attempts_done > 0 {
             if let Some(route) = &route {
-                match apply_continuity(&mut req, route, target, &mut trace) {
-                    Ok(()) => {}
-                    Err(e) => return Err(e),
-                }
+                apply_continuity(&mut target_req, route, target, &mut trace)?;
             }
+        }
+        apply_target_overrides(&mut target_req, &target.param_overrides)?;
+        if target.param_overrides.as_object().is_some_and(|obj| !obj.is_empty()) {
+            trace.step(
+                "candidate",
+                Some(target.account.label.clone()),
+                "applied target parameter overrides",
+            );
         }
 
         let ctx = UpstreamContext {
@@ -569,7 +597,7 @@ pub async fn run(
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
-        if let Err(e) = check_param_policy(&target, &req) {
+        if let Err(e) = check_param_policy(&target, &target_req) {
             trace.finish("rejected");
             state
                 .live
@@ -579,13 +607,13 @@ pub async fn run(
         }
 
         // Same-format passthrough (FR-2.7).
-        let use_passthrough =
-            req.raw_body.is_some() && passthrough::is_passthrough(format, target.provider.wire());
+        let use_passthrough = target_req.raw_body.is_some()
+            && passthrough::is_passthrough(format, target.provider.wire());
 
         // Never silently drop behaviorally significant client fields on a
         // translating path (FR-2.8). A request-level failure; never retried.
         if !use_passthrough {
-            if let Some(msg) = crate::frontends::translation_unsupported(&req.extra) {
+            if let Some(msg) = crate::frontends::translation_unsupported(&target_req.extra) {
                 trace.finish("rejected");
                 state
                     .live
@@ -647,7 +675,7 @@ pub async fn run(
                 state,
                 &adapter,
                 &ctx,
-                &req,
+                &target_req,
                 use_passthrough,
                 &meta.request_id,
             ),
@@ -751,7 +779,7 @@ pub async fn run(
                         passthrough: use_passthrough && prepared.is_sse,
                     };
                     return Ok(stream_response(
-                        state, snap, format, meta, req, attempt, started, key, trace,
+                        state, snap, format, meta, target_req, attempt, started, key, trace,
                     )
                     .await);
                 }
@@ -2767,7 +2795,9 @@ async fn finalize_log(
     // Persist prompt-cache-affinity mapping for the next turn (FR-7.3).
     if let (Some(session), Some(route_id)) = (&meta.session, &meta.route_id) {
         if let Some(route) = snap.routes.get(route_id) {
-            if route.cache_affinity != 0 && status == "success" {
+            if (route.cache_affinity != 0 || route.sticky_routing != 0)
+                && status == "success"
+            {
                 state.sticky_remember(
                     session,
                     format!(
