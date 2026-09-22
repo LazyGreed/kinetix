@@ -108,7 +108,9 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
             extra.insert(k.clone(), v.clone());
         }
     }
-    translation_issues.extend(crate::frontends::resolve_tool_result_names(&mut out_messages));
+    translation_issues.extend(crate::frontends::resolve_tool_result_names(
+        &mut out_messages,
+    ));
     crate::frontends::attach_translation_issues(&mut extra, translation_issues);
 
     Ok(InternalRequest {
@@ -127,9 +129,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     })
 }
 
-fn nested_translation_issues(
-    obj: &serde_json::Map<String, Value>,
-) -> Vec<String> {
+fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String> {
     let mut issues = Vec::new();
 
     if let Some(Value::Array(blocks)) = obj.get("system") {
@@ -145,7 +145,10 @@ fn nested_translation_issues(
 
     if let Some(messages) = obj.get("messages").and_then(Value::as_array) {
         for (message_index, message) in messages.iter().enumerate() {
-            let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
             if !matches!(role, "user" | "assistant") {
                 issues.push(format!(
                     "messages[{message_index}] has unsupported role '{role}'"
