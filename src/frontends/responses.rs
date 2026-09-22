@@ -1055,8 +1055,15 @@ impl ResponsesEncoder {
             "input_tokens": self.usage.as_ref().and_then(|u| u.input).unwrap_or(0),
             "output_tokens": self.usage.as_ref().and_then(|u| u.output).unwrap_or(0),
         });
-        if let Some(c) = self.usage.as_ref().and_then(|u| u.cached) {
-            usage_obj["input_token_details"] = json!({ "cached_tokens": c });
+        let mut input_details = serde_json::Map::new();
+        if let Some(cached) = self.usage.as_ref().and_then(|u| u.cached) {
+            input_details.insert("cached_tokens".into(), json!(cached));
+        }
+        if let Some(cache_write) = self.usage.as_ref().and_then(|u| u.cache_write) {
+            input_details.insert("cache_write_tokens".into(), json!(cache_write));
+        }
+        if !input_details.is_empty() {
+            usage_obj["input_token_details"] = Value::Object(input_details);
         }
         if let Some(t) = self.usage.as_ref().and_then(|u| u.thinking) {
             usage_obj["output_token_details"] = json!({ "reasoning_tokens": t });
@@ -1164,8 +1171,15 @@ pub fn aggregate_responses(
         "input_tokens": usage.input.unwrap_or(0),
         "output_tokens": usage.output.unwrap_or(0),
     });
-    if let Some(c) = usage.cached {
-        usage_obj["input_token_details"] = json!({ "cached_tokens": c });
+    let mut input_details = serde_json::Map::new();
+    if let Some(cached) = usage.cached {
+        input_details.insert("cached_tokens".into(), json!(cached));
+    }
+    if let Some(cache_write) = usage.cache_write {
+        input_details.insert("cache_write_tokens".into(), json!(cache_write));
+    }
+    if !input_details.is_empty() {
+        usage_obj["input_token_details"] = Value::Object(input_details);
     }
     if let Some(t) = usage.thinking {
         usage_obj["output_token_details"] = json!({ "reasoning_tokens": t });
