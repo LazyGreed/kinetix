@@ -1055,8 +1055,8 @@ impl ResponsesEncoder {
             "input_tokens": self.usage.as_ref().and_then(|u| u.input).unwrap_or(0),
             "output_tokens": self.usage.as_ref().and_then(|u| u.output).unwrap_or(0),
         });
-        if let Some(c) = self.usage.as_ref().and_then(|u| u.cached) {
-            usage_obj["input_token_details"] = json!({ "cached_tokens": c });
+        if let Some(cached) = self.usage.as_ref().and_then(|u| u.cached) {
+            usage_obj["input_token_details"] = json!({ "cached_tokens": cached });
         }
         if let Some(t) = self.usage.as_ref().and_then(|u| u.thinking) {
             usage_obj["output_token_details"] = json!({ "reasoning_tokens": t });
@@ -1164,8 +1164,8 @@ pub fn aggregate_responses(
         "input_tokens": usage.input.unwrap_or(0),
         "output_tokens": usage.output.unwrap_or(0),
     });
-    if let Some(c) = usage.cached {
-        usage_obj["input_token_details"] = json!({ "cached_tokens": c });
+    if let Some(cached) = usage.cached {
+        usage_obj["input_token_details"] = json!({ "cached_tokens": cached });
     }
     if let Some(t) = usage.thinking {
         usage_obj["output_token_details"] = json!({ "reasoning_tokens": t });

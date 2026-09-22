@@ -118,7 +118,11 @@ pub struct CapabilityNeeds {
 pub struct Prices {
     pub input_per_1m: Option<f64>,
     pub output_per_1m: Option<f64>,
+    /// Cache-read price. Cached tokens are a breakdown already included in input.
     pub cached_per_1m: Option<f64>,
+    /// Cache-write/creation price. Cache-write tokens are included in input.
+    pub cache_write_per_1m: Option<f64>,
+    /// Thinking/reasoning price. Thinking tokens are included in output.
     pub thinking_per_1m: Option<f64>,
 }
 
@@ -315,9 +319,15 @@ impl InternalRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
+    /// Total effective input tokens, including cache-read/write breakdowns.
     pub input: Option<u64>,
+    /// Total generated tokens, including thinking/reasoning breakdowns.
     pub output: Option<u64>,
+    /// Cache-read tokens already included in `input`.
     pub cached: Option<u64>,
+    /// Cache-write/creation tokens already included in `input`.
+    pub cache_write: Option<u64>,
+    /// Thinking/reasoning tokens already included in `output`.
     pub thinking: Option<u64>,
 }
 
@@ -331,6 +341,9 @@ impl TokenUsage {
         }
         if other.cached.is_some() {
             self.cached = other.cached;
+        }
+        if other.cache_write.is_some() {
+            self.cache_write = other.cache_write;
         }
         if other.thinking.is_some() {
             self.thinking = other.thinking;

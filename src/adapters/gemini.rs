@@ -848,13 +848,20 @@ fn events_from_gemini(v: &Value) -> Vec<StreamEvent> {
     }
 
     if let Some(usage) = v.get("usageMetadata") {
+        let candidates = usage.get("candidatesTokenCount").and_then(Value::as_u64);
+        let thinking = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+        let output = match (candidates, thinking) {
+            (Some(candidates), Some(thinking)) => Some(candidates.saturating_add(thinking)),
+            (Some(candidates), None) => Some(candidates),
+            (None, Some(thinking)) => Some(thinking),
+            (None, None) => None,
+        };
         events.push(StreamEvent::Usage(TokenUsage {
-            input: usage.get("promptTokenCount").and_then(|v| v.as_u64()),
-            output: usage.get("candidatesTokenCount").and_then(|v| v.as_u64()),
-            cached: usage
-                .get("cachedContentTokenCount")
-                .and_then(|v| v.as_u64()),
-            thinking: usage.get("thoughtsTokenCount").and_then(|v| v.as_u64()),
+            input: usage.get("promptTokenCount").and_then(Value::as_u64),
+            output,
+            cached: usage.get("cachedContentTokenCount").and_then(Value::as_u64),
+            cache_write: None,
+            thinking,
         }));
     }
 
@@ -1036,6 +1043,31 @@ mod schema_tests {
         assert_eq!(cfg["topK"], 40.0);
         assert!(cfg.get("top_p").is_none());
         assert!(cfg.get("top_k").is_none());
+    }
+
+    #[test]
+    fn usage_includes_thinking_in_total_output() {
+        let events = events_from_gemini(&json!({
+            "candidates": [],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "cachedContentTokenCount": 40,
+                "candidatesTokenCount": 50,
+                "thoughtsTokenCount": 30
+            }
+        }));
+        let usage = events
+            .into_iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.input, Some(100));
+        assert_eq!(usage.output, Some(80));
+        assert_eq!(usage.cached, Some(40));
+        assert_eq!(usage.cache_write, None);
+        assert_eq!(usage.thinking, Some(30));
     }
 
     #[test]

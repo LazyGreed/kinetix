@@ -43,6 +43,7 @@ fn text_and_finish_events() -> Vec<StreamEvent> {
             input: Some(5),
             output: Some(3),
             cached: None,
+            cache_write: None,
             thinking: None,
         }),
         StreamEvent::Finish(FinishReason::Stop),
@@ -121,6 +122,7 @@ fn openai_non_streaming_aggregate_is_stable() {
             input: Some(5),
             output: Some(3),
             cached: None,
+            cache_write: None,
             thinking: None,
         },
     );
@@ -157,6 +159,7 @@ fn anthropic_non_streaming_aggregate_is_stable() {
             input: Some(5),
             output: Some(3),
             cached: None,
+            cache_write: None,
             thinking: None,
         },
     );
@@ -179,6 +182,28 @@ fn anthropic_non_streaming_aggregate_is_stable() {
     )
     .unwrap();
     assert_eq!(body, expected, "Anthropic non-streaming aggregate changed");
+}
+
+#[test]
+fn anthropic_aggregate_maps_inclusive_input_back_to_native_cache_fields() {
+    let body = frontends::aggregate(
+        FrontendFormat::Anthropic,
+        "test-model",
+        "req_fixture",
+        vec![StreamEvent::Finish(FinishReason::Stop)],
+        &TokenUsage {
+            input: Some(200),
+            output: Some(25),
+            cached: Some(70),
+            cache_write: Some(30),
+            thinking: None,
+        },
+    );
+
+    assert_eq!(body["usage"]["input_tokens"], 100);
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 70);
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 30);
+    assert_eq!(body["usage"]["output_tokens"], 25);
 }
 
 #[test]
@@ -302,6 +327,7 @@ fn responses_non_streaming_aggregation_is_stable() {
         input: Some(10),
         output: Some(5),
         cached: Some(2),
+        cache_write: None,
         thinking: None,
     };
     let agg = frontends::aggregate(

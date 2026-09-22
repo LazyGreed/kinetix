@@ -386,7 +386,7 @@ fn event_to_value(ev: &StreamEvent) -> Value {
         }
         StreamEvent::Usage(u) => json!({
             "type": "usage", "input": u.input, "output": u.output,
-            "cached": u.cached, "thinking": u.thinking
+            "cached": u.cached, "cache_write": u.cache_write, "thinking": u.thinking
         }),
         StreamEvent::Finish(r) => json!({ "type": "finish", "reason": r.as_str() }),
     }
@@ -476,6 +476,7 @@ fn value_to_event(v: &Value) -> Result<StreamEvent, UpstreamFailure> {
             input: v.get("input").and_then(|x| x.as_u64()),
             output: v.get("output").and_then(|x| x.as_u64()),
             cached: v.get("cached").and_then(|x| x.as_u64()),
+            cache_write: v.get("cache_write").and_then(|x| x.as_u64()),
             thinking: v.get("thinking").and_then(|x| x.as_u64()),
         }),
         "finish" => StreamEvent::Finish(match v.get("reason").and_then(|x| x.as_str()) {
@@ -600,6 +601,7 @@ mod tests {
                 input: Some(10),
                 output: Some(4),
                 cached: None,
+                cache_write: Some(1),
                 thinking: Some(2),
             }),
             StreamEvent::Finish(FinishReason::ToolCalls),
@@ -616,6 +618,7 @@ mod tests {
         match &back[5] {
             StreamEvent::Usage(u) => {
                 assert_eq!(u.input, Some(10));
+                assert_eq!(u.cache_write, Some(1));
                 assert_eq!(u.thinking, Some(2));
             }
             _ => panic!("expected usage"),

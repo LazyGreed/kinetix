@@ -101,7 +101,7 @@ fn gemini_usage_only_in_final_event() {
         });
         let u = usage.expect("usage present");
         assert_eq!(u.input, Some(11));
-        assert_eq!(u.output, Some(2));
+        assert_eq!(u.output, Some(3));
         assert_eq!(u.thinking, Some(1));
     }
 }

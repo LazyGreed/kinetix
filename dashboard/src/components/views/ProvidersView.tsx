@@ -93,6 +93,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [modelMaxOutput, setModelMaxOutput] = useState(DEFAULT_MAX_OUTPUT);
   const [modelInputPrice, setModelInputPrice] = useState(1.0);
   const [modelOutputPrice, setModelOutputPrice] = useState(4.0);
+  const [modelCachedPrice, setModelCachedPrice] = useState(0);
+  const [modelCacheWritePrice, setModelCacheWritePrice] = useState(0);
+  const [modelThinkingPrice, setModelThinkingPrice] = useState(0);
   const [capText, setCapText] = useState(true);
   const [capVision, setCapVision] = useState(true);
   const [capReasoning, setCapReasoning] = useState(false);
@@ -194,6 +197,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         inputPer1M: 0,
         outputPer1M: 0,
         cachedPer1M: 0,
+        cacheWritePer1M: 0,
         thinkingPer1M: 0,
       },
       parameters: {},
@@ -352,6 +356,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setModelMaxOutput(m.maxOutputTokens || DEFAULT_MAX_OUTPUT);
     setModelInputPrice(m.prices.inputPer1M || 0);
     setModelOutputPrice(m.prices.outputPer1M || 0);
+    setModelCachedPrice(m.prices.cachedPer1M || 0);
+    setModelCacheWritePrice(m.prices.cacheWritePer1M || 0);
+    setModelThinkingPrice(m.prices.thinkingPer1M || 0);
     setCapText(m.capabilities.text);
     setCapVision(m.capabilities.vision);
     setCapReasoning(m.capabilities.reasoning);
@@ -368,6 +375,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setModelMaxOutput(DEFAULT_MAX_OUTPUT);
     setModelInputPrice(1.0);
     setModelOutputPrice(4.0);
+    setModelCachedPrice(0);
+    setModelCacheWritePrice(0);
+    setModelThinkingPrice(0);
     setCapText(true);
     setCapVision(true);
     setCapReasoning(false);
@@ -400,8 +410,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       prices: {
         inputPer1M: Number(modelInputPrice) || 0,
         outputPer1M: Number(modelOutputPrice) || 0,
-        cachedPer1M: Number(modelInputPrice ? (modelInputPrice * 0.25).toFixed(2) : 0),
-        thinkingPer1M: capReasoning ? Number(modelOutputPrice) || 0 : 0,
+        cachedPer1M: Number(modelCachedPrice) || 0,
+        cacheWritePer1M: Number(modelCacheWritePrice) || 0,
+        thinkingPer1M: Number(modelThinkingPrice) || 0,
       },
       parameters: {},
       thinkingMap: {
@@ -429,6 +440,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     prices: {
       input_per_1m: Number(modelInputPrice) || null,
       output_per_1m: Number(modelOutputPrice) || null,
+      cached_per_1m: Number(modelCachedPrice) || null,
+      cache_write_per_1m: Number(modelCacheWritePrice) || null,
+      thinking_per_1m: Number(modelThinkingPrice) || null,
     },
   });
 
@@ -854,7 +868,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                             </strong>
                             <div>Input: ${m.prices.inputPer1M} / 1M</div>
                             <div>Output: ${m.prices.outputPer1M} / 1M</div>
-                            <div>Cached: ${m.prices.cachedPer1M} / 1M</div>
+                            <div>Cache read: ${m.prices.cachedPer1M} / 1M</div>
+                            <div>Cache write: ${m.prices.cacheWritePer1M} / 1M</div>
                             {m.capabilities.reasoning && (
                               <div>Thinking: ${m.prices.thinkingPer1M} / 1M</div>
                             )}
@@ -1302,32 +1317,27 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
                 {/* Token Pricing */}
                 <div className="grid grid-cols-2 gap-3 bg-[var(--erased-soft)] p-3 border border-[var(--ink)] rounded">
-                  <div>
-                    <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
-                      Input Price ($ / 1M)
-                    </label>
-                    <input
-                      type="number"
-                      step={0.01}
-                      min={0}
-                      value={modelInputPrice}
-                      onChange={(e) => setModelInputPrice(Number(e.target.value))}
-                      className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-sm font-mono focus:outline-none rounded"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
-                      Output Price ($ / 1M)
-                    </label>
-                    <input
-                      type="number"
-                      step={0.01}
-                      min={0}
-                      value={modelOutputPrice}
-                      onChange={(e) => setModelOutputPrice(Number(e.target.value))}
-                      className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-sm font-mono focus:outline-none rounded"
-                    />
-                  </div>
+                  {[
+                    ['Input Price ($ / 1M)', modelInputPrice, setModelInputPrice],
+                    ['Output Price ($ / 1M)', modelOutputPrice, setModelOutputPrice],
+                    ['Cache Read ($ / 1M)', modelCachedPrice, setModelCachedPrice],
+                    ['Cache Write ($ / 1M)', modelCacheWritePrice, setModelCacheWritePrice],
+                    ['Thinking ($ / 1M)', modelThinkingPrice, setModelThinkingPrice],
+                  ].map(([label, value, setter]) => (
+                    <div key={String(label)}>
+                      <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                        {String(label)}
+                      </label>
+                      <input
+                        type="number"
+                        step={0.01}
+                        min={0}
+                        value={Number(value)}
+                        onChange={(e) => (setter as React.Dispatch<React.SetStateAction<number>>)(Number(e.target.value))}
+                        className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-sm font-mono focus:outline-none rounded"
+                      />
+                    </div>
+                  ))}
                 </div>
 
                 {/* Capabilities */}

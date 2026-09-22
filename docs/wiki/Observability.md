@@ -26,7 +26,7 @@ in-memory snapshot, so the instance is not dropped from a load balancer.
 | `kinetix_error_rate` | Error fraction (gauge). |
 | `kinetix_cost_usd_total` | Total known spend. |
 | `kinetix_avg_latency_ms` / `kinetix_avg_ttft_ms` | Averages. |
-| `kinetix_cached_tokens_total` | Cached-token total. |
+| `kinetix_cached_tokens_total` / `kinetix_cache_write_tokens_total` | Cache-read / cache-write token totals. |
 | `kinetix_fallback_hops_total` / `kinetix_route_fallbacks_total` / `kinetix_route_skip_total` | Routing. |
 | `kinetix_failures_pre_commit_total` / `kinetix_failures_post_commit_total` | Failures before/after the commit point. |
 | `kinetix_cancellations_total` / `kinetix_cancellation_latency_ms` | Client disconnects + detection latency. |

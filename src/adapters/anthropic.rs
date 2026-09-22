@@ -181,6 +181,32 @@ fn anthropic_reset_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .min()
 }
 
+fn parse_anthropic_usage(usage: &Value) -> TokenUsage {
+    let ordinary = usage.get("input_tokens").and_then(Value::as_u64);
+    let cached = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let cache_write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let input = if ordinary.is_some() || cached.is_some() || cache_write.is_some() {
+        Some(
+            ordinary
+                .unwrap_or(0)
+                .saturating_add(cached.unwrap_or(0))
+                .saturating_add(cache_write.unwrap_or(0)),
+        )
+    } else {
+        None
+    };
+
+    TokenUsage {
+        input,
+        output: usage.get("output_tokens").and_then(Value::as_u64),
+        cached,
+        cache_write,
+        thinking: None,
+    }
+}
+
 #[async_trait]
 impl Adapter for AnthropicAdapter {
     fn wire_format(&self) -> &'static str {
@@ -473,14 +499,7 @@ impl Adapter for AnthropicAdapter {
             }
             "message_delta" => {
                 if let Some(usage) = v.get("usage") {
-                    events.push(StreamEvent::Usage(TokenUsage {
-                        input: usage.get("input_tokens").and_then(|v| v.as_u64()),
-                        output: usage.get("output_tokens").and_then(|v| v.as_u64()),
-                        cached: usage
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_u64()),
-                        thinking: None,
-                    }));
+                    events.push(StreamEvent::Usage(parse_anthropic_usage(usage)));
                 }
                 if let Some(reason) = v.pointer("/delta/stop_reason").and_then(|r| r.as_str()) {
                     events.push(StreamEvent::Finish(match reason {
@@ -493,14 +512,7 @@ impl Adapter for AnthropicAdapter {
             }
             "message_start" => {
                 if let Some(usage) = v.pointer("/message/usage") {
-                    events.push(StreamEvent::Usage(TokenUsage {
-                        input: usage.get("input_tokens").and_then(|v| v.as_u64()),
-                        output: usage.get("output_tokens").and_then(|v| v.as_u64()),
-                        cached: usage
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_u64()),
-                        thinking: None,
-                    }));
+                    events.push(StreamEvent::Usage(parse_anthropic_usage(usage)));
                 }
             }
             _ => {}
@@ -555,14 +567,7 @@ impl Adapter for AnthropicAdapter {
             }
         }
         if let Some(usage) = body.get("usage") {
-            events.push(StreamEvent::Usage(TokenUsage {
-                input: usage.get("input_tokens").and_then(|v| v.as_u64()),
-                output: usage.get("output_tokens").and_then(|v| v.as_u64()),
-                cached: usage
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_u64()),
-                thinking: None,
-            }));
+            events.push(StreamEvent::Usage(parse_anthropic_usage(usage)));
         }
         if let Some(reason) = body.get("stop_reason").and_then(|r| r.as_str()) {
             events.push(StreamEvent::Finish(match reason {
@@ -603,6 +608,21 @@ impl Adapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_normalizes_cache_read_and_creation_into_total_input() {
+        let usage = serde_json::json!({
+            "input_tokens": 100,
+            "cache_creation_input_tokens": 30,
+            "cache_read_input_tokens": 70,
+            "output_tokens": 25
+        });
+        let normalized = parse_anthropic_usage(&usage);
+        assert_eq!(normalized.input, Some(200));
+        assert_eq!(normalized.cached, Some(70));
+        assert_eq!(normalized.cache_write, Some(30));
+        assert_eq!(normalized.output, Some(25));
+    }
 
     #[test]
     fn anthropic_retry_after_ms_takes_precedence() {

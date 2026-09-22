@@ -110,6 +110,7 @@ pub async fn seed_if_empty(
                 input_per_1m: m.prices.as_ref().and_then(|x| x.input_per_1m),
                 output_per_1m: m.prices.as_ref().and_then(|x| x.output_per_1m),
                 cached_per_1m: m.prices.as_ref().and_then(|x| x.cached_per_1m),
+                cache_write_per_1m: m.prices.as_ref().and_then(|x| x.cache_write_per_1m),
                 thinking_per_1m: m.prices.as_ref().and_then(|x| x.thinking_per_1m),
             };
             let model_id = db::insert_model(

@@ -911,14 +911,15 @@ pub async fn delete_model(pool: &Pool, id: &str) -> Result<()> {
 pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Result<String> {
     let id = format!("price_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
-        "INSERT INTO price_versions (id, model_id, input_per_1m, output_per_1m, cached_per_1m, thinking_per_1m, created_at)
-         VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO price_versions (id, model_id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m, thinking_per_1m, created_at)
+         VALUES (?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(model_id)
     .bind(p.input_per_1m)
     .bind(p.output_per_1m)
     .bind(p.cached_per_1m)
+    .bind(p.cache_write_per_1m)
     .bind(p.thinking_per_1m)
     .bind(now_iso())
     .execute(pool)
@@ -1203,6 +1204,7 @@ pub struct UsageLogRow {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub thinking_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub cost_known: i64,
@@ -1226,10 +1228,10 @@ pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
         "INSERT INTO usage_logs
         (id, request_id, ts, key_id, key_name, client_format, requested_model, effective_model, route_id,
          route_name, fallback_hops, fallback_path, status, status_code, latency_ms, ttft_ms, input_tokens,
-         output_tokens, cached_tokens, thinking_tokens, cost_usd, cost_known, price_version_id, cache_status,
+         output_tokens, cached_tokens, cache_write_tokens, thinking_tokens, cost_usd, cost_known, price_version_id, cache_status,
          serving_account_id, serving_account, serving_provider, upstream_request_id, flagged, error_message,
          usage_confidence, commit_state, retry_count, route_trace_id, opaque_route_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&u.id)
     .bind(&u.request_id)
@@ -1250,6 +1252,7 @@ pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
     .bind(u.input_tokens)
     .bind(u.output_tokens)
     .bind(u.cached_tokens)
+    .bind(u.cache_write_tokens)
     .bind(u.thinking_tokens)
     .bind(u.cost_usd)
     .bind(u.cost_known)
@@ -1319,6 +1322,7 @@ pub async fn usage_summary(pool: &Pool) -> Result<Value> {
             COALESCE(SUM(input_tokens),0) as input_tokens,
             COALESCE(SUM(output_tokens),0) as output_tokens,
             COALESCE(SUM(cached_tokens),0) as cached_tokens,
+            COALESCE(SUM(cache_write_tokens),0) as cache_write_tokens,
             COALESCE(SUM(thinking_tokens),0) as thinking_tokens,
             COALESCE(SUM(CASE WHEN cost_known != 0 THEN cost_usd ELSE 0.0 END),0.0) as cost_usd,
             COALESCE(SUM(CASE WHEN cost_known = 0 THEN 1 ELSE 0 END),0) as unknown_cost_rows,
@@ -1337,6 +1341,7 @@ pub async fn usage_summary(pool: &Pool) -> Result<Value> {
         "input_tokens": row.get::<i64, _>("input_tokens"),
         "output_tokens": row.get::<i64, _>("output_tokens"),
         "cached_tokens": row.get::<i64, _>("cached_tokens"),
+        "cache_write_tokens": row.get::<i64, _>("cache_write_tokens"),
         "thinking_tokens": row.get::<i64, _>("thinking_tokens"),
         "cost_usd": row.get::<f64, _>("cost_usd"),
         // USD totals are only meaningful for priced usage; unknown-cost rows

@@ -102,6 +102,7 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
             "input_tokens",
             "output_tokens",
             "cached_tokens",
+            "cache_write_tokens",
             "thinking_tokens",
             "cost_usd",
             "cost_known",
@@ -128,6 +129,9 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
                 r.input_tokens.map(|v| v.to_string()).unwrap_or_default(),
                 r.output_tokens.map(|v| v.to_string()).unwrap_or_default(),
                 r.cached_tokens.map(|v| v.to_string()).unwrap_or_default(),
+                r.cache_write_tokens
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
                 r.thinking_tokens.map(|v| v.to_string()).unwrap_or_default(),
                 r.cost_usd.map(|v| format!("{v:.6}")).unwrap_or_default(),
                 r.cost_known.to_string(),
@@ -145,6 +149,9 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
     {
         let total_in: i64 = rows.iter().filter_map(|r| r.input_tokens).sum();
         let total_out: i64 = rows.iter().filter_map(|r| r.output_tokens).sum();
+        let total_cached: i64 = rows.iter().filter_map(|r| r.cached_tokens).sum();
+        let total_cache_write: i64 = rows.iter().filter_map(|r| r.cache_write_tokens).sum();
+        let total_thinking: i64 = rows.iter().filter_map(|r| r.thinking_tokens).sum();
         let total_cost: f64 = rows.iter().filter_map(|r| r.cost_usd).sum();
         let fallbacks = rows.iter().filter(|r| r.fallback_hops > 0).count();
         let errors = rows
@@ -160,6 +167,9 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
             "requests",
             "input_tokens",
             "output_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+            "thinking_tokens",
             "cost_usd",
             "fallbacks",
             "errors",
@@ -169,6 +179,9 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
             &rows.len().to_string(),
             &total_in.to_string(),
             &total_out.to_string(),
+            &total_cached.to_string(),
+            &total_cache_write.to_string(),
+            &total_thinking.to_string(),
             &format!("{total_cost:.6}"),
             &fallbacks.to_string(),
             &errors.to_string(),
