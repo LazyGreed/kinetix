@@ -845,6 +845,21 @@ mod schema_tests {
     use super::*;
 
     #[test]
+    fn thinking_signature_round_trips_into_gemini_history() {
+        let mut out = Vec::new();
+        GeminiAdapter::encode_parts(
+            &[Part::Thinking {
+                text: String::new(),
+                signature: Some("sig-thinking".into()),
+            }],
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["thought"], true);
+        assert_eq!(out[0]["thoughtSignature"], "sig-thinking");
+    }
+
+    #[test]
     fn generation_config_uses_canonical_policy_keys_for_gemini_wire_names() {
         let provider = crate::db::ProviderRow {
             id: "p".into(),
