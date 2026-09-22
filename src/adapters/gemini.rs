@@ -175,25 +175,26 @@ impl GeminiAdapter {
         Value::Object(cfg)
     }
 
-    fn build_tools(req: &InternalRequest) -> Option<Value> {
+    fn build_tools(req: &InternalRequest) -> Result<Option<Value>, UpstreamFailure> {
         if req.tools.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let decls: Vec<Value> = req
+        let decls: Result<Vec<Value>, UpstreamFailure> = req
             .tools
             .iter()
-            .map(|t| {
-                let mut d = json!({ "name": t.name });
-                if let Some(desc) = &t.description {
-                    d["description"] = json!(desc);
+            .map(|tool| {
+                let mut declaration = json!({ "name": tool.name });
+                if let Some(description) = &tool.description {
+                    declaration["description"] = json!(description);
                 }
-                if !t.parameters.is_null() {
-                    d["parameters"] = sanitize_schema(&t.parameters);
+                if !tool.parameters.is_null() {
+                    declaration["parametersJsonSchema"] =
+                        sanitize_schema(&tool.parameters, &format!("tool '{}'", tool.name))?;
                 }
-                d
+                Ok(declaration)
             })
             .collect();
-        Some(json!([{ "functionDeclarations": decls }]))
+        Ok(Some(json!([{ "functionDeclarations": decls? }])))
     }
 
     fn build_tool_config(req: &InternalRequest) -> Option<Value> {
@@ -270,224 +271,321 @@ fn insert_rec(obj: &mut serde_json::Map<String, Value>, path: &[&str], value: Va
     }
 }
 
-/// Resolve local JSON-Schema references before removing definition containers.
-/// Gemini does not accept `$ref`, so stripping `$defs` first would leave
-/// dangling references and silently weaken tool validation.
-fn resolve_local_refs(schema: &Value) -> Value {
-    fn resolve(node: &Value, root: &Value, stack: &mut Vec<String>) -> Value {
-        match node {
-            Value::Object(map) => {
-                if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
-                    if reference.starts_with("#/") {
-                        if stack.iter().any(|seen| seen == reference) {
-                            // Recursive schemas cannot be represented faithfully
-                            // in Gemini's inline subset. Stop expansion safely
-                            // rather than recursing forever or forwarding $ref.
-                            return json!({});
-                        }
-                        if let Some(target) = root.pointer(&reference[1..]) {
-                            stack.push(reference.to_string());
-                            let mut resolved = resolve(target, root, stack);
-                            stack.pop();
-
-                            // Modern JSON Schema permits siblings alongside $ref.
-                            // Preserve them by overlaying the resolved object.
-                            if let Some(out) = resolved.as_object_mut() {
-                                for (key, value) in map {
-                                    if key != "$ref" {
-                                        out.insert(key.clone(), resolve(value, root, stack));
-                                    }
-                                }
-                                return resolved;
-                            }
-                            if map.len() == 1 {
-                                return resolved;
-                            }
-                        }
-                    }
-                }
-                Value::Object(
-                    map.iter()
-                        .map(|(key, value)| (key.clone(), resolve(value, root, stack)))
-                        .collect(),
-                )
-            }
-            Value::Array(values) => Value::Array(
-                values
-                    .iter()
-                    .map(|value| resolve(value, root, stack))
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
+/// Return a request-local failure for a tool schema Kinetix cannot translate
+/// to Gemini without weakening its validation semantics.
+fn schema_error(path: &str, message: impl Into<String>) -> UpstreamFailure {
+    UpstreamFailure {
+        kind: FailureKind::BadRequest,
+        status: None,
+        retry_after_secs: None,
+        message: format!("Gemini tool schema at {path}: {}", message.into()),
+        quota_reset_at: None,
     }
-
-    resolve(schema, schema, &mut Vec::new())
 }
 
-fn merge_all_of(branches: &[Value]) -> Value {
-    let mut out = serde_json::Map::new();
-    for branch in branches {
-        let Value::Object(map) = branch else {
-            continue;
-        };
-        for (key, value) in map {
-            match (out.get_mut(key), value) {
-                (Some(Value::Object(existing)), Value::Object(incoming)) if key == "properties" => {
-                    for (property, schema) in incoming {
-                        existing.insert(property.clone(), schema.clone());
-                    }
-                }
-                (Some(Value::Array(existing)), Value::Array(incoming)) if key == "required" => {
-                    for value in incoming {
-                        if !existing.contains(value) {
-                            existing.push(value.clone());
-                        }
-                    }
-                }
-                (None, _) => {
-                    out.insert(key.clone(), value.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-    Value::Object(out)
-}
-
-fn normalize_type_array(
-    values: &[Value],
-    source: &serde_json::Map<String, Value>,
-) -> serde_json::Map<String, Value> {
-    let mut out = source.clone();
-    let nullable = values.iter().any(|value| value.as_str() == Some("null"));
-    let non_null: Vec<&str> = values
+fn sanitize_schema_list(value: &Value, path: &str) -> Result<Vec<Value>, UpstreamFailure> {
+    value
+        .as_array()
+        .ok_or_else(|| schema_error(path, "expected an array of schemas"))?
         .iter()
-        .filter_map(Value::as_str)
-        .filter(|value| *value != "null")
-        .collect();
-    out.remove("type");
+        .enumerate()
+        .map(|(index, schema)| sanitize_schema_node(schema, &format!("{path}[{index}]")))
+        .collect()
+}
+
+fn merge_schema_maps(
+    target: &mut serde_json::Map<String, Value>,
+    incoming: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), UpstreamFailure> {
+    for (key, value) in incoming {
+        match key.as_str() {
+            "properties" | "$defs" => {
+                let source = value
+                    .as_object()
+                    .ok_or_else(|| schema_error(&format!("{path}.{key}"), "must be an object"))?;
+                let destination = target
+                    .entry(key.clone())
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .expect("schema map initialized as object");
+                for (name, schema) in source {
+                    if let Some(previous) = destination.get(name) {
+                        if previous != schema {
+                            return Err(schema_error(
+                                &format!("{path}.{key}.{name}"),
+                                "conflicting allOf schemas cannot be represented safely",
+                            ));
+                        }
+                    } else {
+                        destination.insert(name.clone(), schema.clone());
+                    }
+                }
+            }
+            "required" => {
+                let source = value
+                    .as_array()
+                    .ok_or_else(|| schema_error(&format!("{path}.required"), "must be an array"))?;
+                let destination = target
+                    .entry("required".to_string())
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .expect("required initialized as array");
+                for item in source {
+                    if !destination.contains(item) {
+                        destination.push(item.clone());
+                    }
+                }
+            }
+            "title" | "description" => {
+                target.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            _ => {
+                if let Some(previous) = target.get(key) {
+                    if previous != value {
+                        return Err(schema_error(
+                            &format!("{path}.{key}"),
+                            "conflicting allOf constraints cannot be represented safely",
+                        ));
+                    }
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_nullable_type(
+    schema: &mut serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), UpstreamFailure> {
+    if let Some(kind) = schema.get_mut("type") {
+        match kind {
+            Value::String(existing) if existing != "null" => {
+                *kind = json!([existing.clone(), "null"]);
+                return Ok(());
+            }
+            Value::Array(types) => {
+                if !types.iter().any(|value| value.as_str() == Some("null")) {
+                    types.push(json!("null"));
+                }
+                return Ok(());
+            }
+            Value::String(_) => return Ok(()),
+            _ => {
+                return Err(schema_error(
+                    path,
+                    "nullable requires a string or array type",
+                ))
+            }
+        }
+    }
+
+    if let Some(any_of) = schema.get_mut("anyOf").and_then(Value::as_array_mut) {
+        if !any_of
+            .iter()
+            .any(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
+        {
+            any_of.push(json!({ "type": "null" }));
+        }
+        return Ok(());
+    }
+
+    Err(schema_error(
+        path,
+        "nullable without type or anyOf cannot be normalized safely",
+    ))
+}
+
+/// Normalize JSON Schema to Gemini's documented `parametersJsonSchema` subset.
+///
+/// Supported keywords are explicitly enumerated. Safe compatibility transforms:
+/// - legacy `definitions` -> `$defs` and matching local refs
+/// - `const` -> singleton `enum`
+/// - `oneOf` -> `anyOf` (Gemini treats them equivalently)
+/// - draft-07 tuple `items: []` -> `prefixItems`
+/// - OpenAPI `nullable` -> JSON Schema null type
+/// - lossless object-style `allOf` merges
+///
+/// Unknown validation keywords fail closed instead of being forwarded to Google
+/// or silently discarded.
+fn sanitize_schema(schema: &Value, root_path: &str) -> Result<Value, UpstreamFailure> {
+    sanitize_schema_node(schema, root_path)
+}
+
+fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailure> {
+    let map = node
+        .as_object()
+        .ok_or_else(|| schema_error(path, "schema nodes must be JSON objects"))?;
+    let mut out = serde_json::Map::new();
+    let mut nullable = false;
+    let mut const_value: Option<Value> = None;
+    let mut all_of: Option<&Value> = None;
+
+    for (key, value) in map {
+        match key.as_str() {
+            "$schema" | "$comment" | "strict" | "default" | "examples" | "example"
+            | "deprecated" | "readOnly" | "writeOnly" => {}
+
+            "definitions" | "$defs" => {
+                let definitions = value
+                    .as_object()
+                    .ok_or_else(|| schema_error(&format!("{path}.{key}"), "must be an object"))?;
+                let mut sanitized = serde_json::Map::new();
+                for (name, schema) in definitions {
+                    sanitized.insert(
+                        name.clone(),
+                        sanitize_schema_node(schema, &format!("{path}.{key}.{name}"))?,
+                    );
+                }
+                let incoming =
+                    serde_json::Map::from_iter([("$defs".to_string(), Value::Object(sanitized))]);
+                merge_schema_maps(&mut out, &incoming, path)?;
+            }
+
+            "$ref" => {
+                let reference = value
+                    .as_str()
+                    .ok_or_else(|| schema_error(&format!("{path}.$ref"), "must be a string"))?;
+                let reference = reference
+                    .strip_prefix("#/definitions/")
+                    .map(|suffix| format!("#/$defs/{suffix}"))
+                    .unwrap_or_else(|| reference.to_string());
+                out.insert("$ref".to_string(), json!(reference));
+            }
+
+            "properties" => {
+                let properties = value.as_object().ok_or_else(|| {
+                    schema_error(&format!("{path}.properties"), "must be an object")
+                })?;
+                let mut sanitized = serde_json::Map::new();
+                for (name, schema) in properties {
+                    sanitized.insert(
+                        name.clone(),
+                        sanitize_schema_node(schema, &format!("{path}.properties.{name}"))?,
+                    );
+                }
+                out.insert("properties".to_string(), Value::Object(sanitized));
+            }
+
+            "items" => {
+                if let Some(items) = value.as_array() {
+                    let sanitized: Result<Vec<_>, _> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, schema)| {
+                            sanitize_schema_node(schema, &format!("{path}.items[{index}]"))
+                        })
+                        .collect();
+                    out.insert("prefixItems".to_string(), Value::Array(sanitized?));
+                } else {
+                    out.insert(
+                        "items".to_string(),
+                        sanitize_schema_node(value, &format!("{path}.items"))?,
+                    );
+                }
+            }
+
+            "prefixItems" | "anyOf" => {
+                out.insert(
+                    key.clone(),
+                    Value::Array(sanitize_schema_list(value, &format!("{path}.{key}"))?),
+                );
+            }
+
+            "oneOf" => {
+                if out.contains_key("anyOf") {
+                    return Err(schema_error(
+                        &format!("{path}.oneOf"),
+                        "cannot combine oneOf and anyOf safely",
+                    ));
+                }
+                out.insert(
+                    "anyOf".to_string(),
+                    Value::Array(sanitize_schema_list(value, &format!("{path}.oneOf"))?),
+                );
+            }
+
+            "allOf" => all_of = Some(value),
+            "const" => const_value = Some(value.clone()),
+
+            "additionalProperties" => {
+                let normalized = match value {
+                    Value::Bool(_) => value.clone(),
+                    Value::Object(_) => {
+                        sanitize_schema_node(value, &format!("{path}.additionalProperties"))?
+                    }
+                    _ => {
+                        return Err(schema_error(
+                            &format!("{path}.additionalProperties"),
+                            "must be a boolean or schema object",
+                        ))
+                    }
+                };
+                out.insert("additionalProperties".to_string(), normalized);
+            }
+
+            "nullable" => {
+                nullable = value.as_bool().ok_or_else(|| {
+                    schema_error(&format!("{path}.nullable"), "must be a boolean")
+                })?;
+            }
+
+            "$id" | "$anchor" | "type" | "format" | "title" | "description" | "enum"
+            | "minItems" | "maxItems" | "minimum" | "maximum" | "required" | "propertyOrdering" => {
+                out.insert(key.clone(), value.clone());
+            }
+
+            other => {
+                return Err(schema_error(
+                    &format!("{path}.{other}"),
+                    format!("unsupported JSON Schema keyword '{other}'"),
+                ));
+            }
+        }
+    }
+
+    if let Some(value) = const_value {
+        if let Some(existing) = out.get("enum").and_then(Value::as_array) {
+            if !existing.contains(&value) {
+                return Err(schema_error(
+                    &format!("{path}.const"),
+                    "const conflicts with enum",
+                ));
+            }
+        }
+        out.insert("enum".to_string(), Value::Array(vec![value]));
+    }
+
+    if let Some(branches) = all_of {
+        let sanitized = sanitize_schema_list(branches, &format!("{path}.allOf"))?;
+        let mut merged = serde_json::Map::new();
+        for (index, branch) in sanitized.iter().enumerate() {
+            let branch = branch.as_object().ok_or_else(|| {
+                schema_error(
+                    &format!("{path}.allOf[{index}]"),
+                    "allOf branch must be an object schema",
+                )
+            })?;
+            merge_schema_maps(&mut merged, branch, &format!("{path}.allOf[{index}]"))?;
+        }
+        merge_schema_maps(&mut out, &merged, path)?;
+    }
 
     if nullable {
-        out.insert("nullable".to_string(), Value::Bool(true));
-    }
-    if non_null.len() == 1 {
-        out.insert("type".to_string(), json!(non_null[0]));
-    } else if !non_null.is_empty() {
-        out.insert(
-            "anyOf".to_string(),
-            Value::Array(
-                non_null
-                    .iter()
-                    .map(|kind| json!({ "type": kind }))
-                    .collect(),
-            ),
-        );
-    }
-    out
-}
-
-/// Normalize JSON Schema to the subset accepted by Gemini.
-///
-/// Local references are resolved first; then unsupported syntax is converted
-/// without leaving dangling references. `oneOf` becomes Gemini-supported
-/// `anyOf`, compatible `allOf` object branches are merged, nullable type
-/// unions become `nullable`, tuple items become an `anyOf` item schema, and
-/// `required` is filtered to surviving properties.
-fn sanitize_schema(schema: &Value) -> Value {
-    fn sanitize(node: &Value) -> Value {
-        match node {
-            Value::Object(original) => {
-                let normalized_type;
-                let map = if let Some(types) = original.get("type").and_then(Value::as_array) {
-                    normalized_type = normalize_type_array(types, original);
-                    &normalized_type
-                } else {
-                    original
-                };
-
-                let mut out = serde_json::Map::new();
-                for (key, value) in map {
-                    match key.as_str() {
-                        "additionalProperties"
-                        | "$schema"
-                        | "definitions"
-                        | "$defs"
-                        | "$ref"
-                        | "strict" => {}
-                        "prefixItems" => {
-                            if let Some(branches) = value.as_array() {
-                                out.entry("items".to_string()).or_insert_with(|| {
-                                    json!({
-                                        "anyOf": branches.iter().map(sanitize).collect::<Vec<_>>()
-                                    })
-                                });
-                            }
-                        }
-                        "const" => {
-                            out.insert("enum".to_string(), json!([sanitize(value)]));
-                        }
-                        "oneOf" => {
-                            if let Some(branches) = value.as_array() {
-                                out.insert(
-                                    "anyOf".to_string(),
-                                    Value::Array(branches.iter().map(sanitize).collect()),
-                                );
-                            }
-                        }
-                        "allOf" => {
-                            if let Some(branches) = value.as_array() {
-                                let sanitized: Vec<Value> = branches.iter().map(sanitize).collect();
-                                let merged = merge_all_of(&sanitized);
-                                if let Some(merged_obj) = merged.as_object() {
-                                    for (merged_key, merged_value) in merged_obj {
-                                        out.insert(merged_key.clone(), merged_value.clone());
-                                    }
-                                }
-                            }
-                        }
-                        "items" if value.is_array() => {
-                            let branches = value.as_array().unwrap();
-                            out.insert(
-                                "items".to_string(),
-                                json!({
-                                    "anyOf": branches.iter().map(sanitize).collect::<Vec<_>>()
-                                }),
-                            );
-                        }
-                        _ => {
-                            out.insert(key.clone(), sanitize(value));
-                        }
-                    }
-                }
-
-                if let Some(required) = out.get("required").and_then(Value::as_array).cloned() {
-                    if let Some(properties) = out.get("properties").and_then(Value::as_object) {
-                        let filtered: Vec<Value> = required
-                            .into_iter()
-                            .filter(|value| {
-                                value
-                                    .as_str()
-                                    .map(|name| properties.contains_key(name))
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-                        if filtered.is_empty() {
-                            out.remove("required");
-                        } else {
-                            out.insert("required".to_string(), Value::Array(filtered));
-                        }
-                    }
-                }
-
-                Value::Object(out)
-            }
-            Value::Array(values) => Value::Array(values.iter().map(sanitize).collect()),
-            other => other.clone(),
-        }
+        add_nullable_type(&mut out, path)?;
     }
 
-    sanitize(&resolve_local_refs(schema))
+    if out.contains_key("$ref") && out.keys().any(|key| !key.starts_with('$')) {
+        return Err(schema_error(
+            path,
+            "$ref cannot be combined with non-$ sibling constraints",
+        ));
+    }
+
+    Ok(Value::Object(out))
 }
 
 #[async_trait]
@@ -556,7 +654,7 @@ impl Adapter for GeminiAdapter {
             body.insert("generationConfig".to_string(), gen_cfg);
         }
 
-        if let Some(tools) = Self::build_tools(req) {
+        if let Some(tools) = Self::build_tools(req)? {
             body.insert("tools".to_string(), tools);
         }
         if let Some(tc) = Self::build_tool_config(req) {
@@ -940,15 +1038,17 @@ mod schema_tests {
     }
 
     #[test]
-    fn sanitize_schema_resolves_nested_local_refs_before_stripping_defs() {
+    fn sanitize_schema_preserves_supported_refs_and_defs() {
         let input = json!({
-            "$ref": "#/$defs/Envelope",
-            "$defs": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": "#/definitions/Envelope",
+            "definitions": {
                 "Envelope": {
                     "type": "object",
-                    "required": ["payload", "removed"],
+                    "additionalProperties": false,
+                    "required": ["payload"],
                     "properties": {
-                        "payload": { "$ref": "#/$defs/Payload" }
+                        "payload": { "$ref": "#/definitions/Payload" }
                     }
                 },
                 "Payload": {
@@ -960,34 +1060,43 @@ mod schema_tests {
                 }
             }
         });
-        let got = sanitize_schema(&input);
-        assert!(got.get("$ref").is_none());
-        assert!(got.get("$defs").is_none());
+        let got = sanitize_schema(&input, "tool 'read'").unwrap();
+
+        assert!(got.get("$schema").is_none());
+        assert_eq!(got["$ref"], "#/$defs/Envelope");
         assert_eq!(
-            got.pointer("/properties/payload/properties/kind/enum"),
+            got.pointer("/$defs/Envelope/properties/payload/$ref"),
+            Some(&json!("#/$defs/Payload"))
+        );
+        assert_eq!(
+            got.pointer("/$defs/Payload/properties/kind/enum"),
             Some(&json!(["ok"]))
         );
-        assert_eq!(got["required"], json!(["payload"]));
+        assert_eq!(
+            got.pointer("/$defs/Envelope/additionalProperties"),
+            Some(&json!(false))
+        );
     }
 
     #[test]
-    fn sanitize_schema_normalizes_unions_and_tuple_items() {
+    fn sanitize_schema_normalizes_legacy_unions_and_tuple_items() {
         let input = json!({
             "type": "object",
             "properties": {
                 "value": { "type": ["string", "null"] },
                 "choice": { "oneOf": [{"type":"string"}, {"type":"number"}] },
-                "tuple": { "type":"array", "items":[{"type":"string"},{"type":"integer"}] }
+                "tuple": {
+                    "type":"array",
+                    "items":[{"type":"string"},{"type":"integer"}]
+                },
+                "legacy_nullable": { "type": "string", "nullable": true }
             }
         });
-        let got = sanitize_schema(&input);
+        let got = sanitize_schema(&input, "tool 'edit'").unwrap();
+
         assert_eq!(
             got.pointer("/properties/value/type"),
-            Some(&json!("string"))
-        );
-        assert_eq!(
-            got.pointer("/properties/value/nullable"),
-            Some(&json!(true))
+            Some(&json!(["string", "null"]))
         );
         assert!(got.pointer("/properties/choice/oneOf").is_none());
         assert_eq!(
@@ -995,61 +1104,151 @@ mod schema_tests {
             Some(&json!("number"))
         );
         assert_eq!(
-            got.pointer("/properties/tuple/items/anyOf/0/type"),
+            got.pointer("/properties/tuple/prefixItems/0/type"),
             Some(&json!("string"))
         );
-
-        let prefix = sanitize_schema(&json!({
-            "type": "array",
-            "prefixItems": [{"type":"string"}, {"type":"integer"}]
-        }));
         assert_eq!(
-            prefix.pointer("/items/anyOf/1/type"),
-            Some(&json!("integer"))
+            got.pointer("/properties/legacy_nullable/type"),
+            Some(&json!(["string", "null"]))
         );
-        assert!(prefix.get("prefixItems").is_none());
     }
 
     #[test]
-    fn sanitize_schema_recurses_and_preserves_const_semantics() {
+    fn sanitize_schema_keeps_supported_nested_constraints() {
         let input = json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
+            "strict": true,
             "additionalProperties": false,
             "properties": {
                 "config": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "mode": { "const": "fast" },
+                        "mode": { "const": "fast", "description": "execution mode" },
                         "items": {
                             "type": "array",
+                            "minItems": 1,
+                            "maxItems": 8,
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "properties": { "kind": { "const": "x" } }
+                                "properties": {
+                                    "count": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 10
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         });
-        let got = sanitize_schema(&input);
-        assert!(got.get("$schema").is_none());
-        assert!(got.get("additionalProperties").is_none());
+        let got = sanitize_schema(&input, "tool 'batch'").unwrap();
+
+        assert!(got.get("strict").is_none());
+        assert_eq!(got["additionalProperties"], false);
         assert_eq!(
             got.pointer("/properties/config/properties/mode/enum"),
             Some(&json!(["fast"]))
         );
-        assert!(got
-            .pointer("/properties/config/additionalProperties")
-            .is_none());
-        assert!(got
-            .pointer("/properties/config/properties/items/items/additionalProperties")
-            .is_none());
         assert_eq!(
-            got.pointer("/properties/config/properties/items/items/properties/kind/enum"),
-            Some(&json!(["x"]))
+            got.pointer("/properties/config/properties/items/minItems"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            got.pointer("/properties/config/properties/items/items/properties/count/maximum"),
+            Some(&json!(10))
+        );
+    }
+
+    #[test]
+    fn sanitize_schema_rejects_unsupported_validation_keywords() {
+        for (keyword, value) in [
+            ("exclusiveMinimum", json!(0)),
+            ("exclusiveMaximum", json!(10)),
+            ("propertyNames", json!({"pattern":"^[a-z]+$"})),
+            ("pattern", json!("^[a-z]+$")),
+            ("uniqueItems", json!(true)),
+        ] {
+            let mut value_schema = json!({ "type": "string" });
+            value_schema
+                .as_object_mut()
+                .unwrap()
+                .insert(keyword.to_string(), value);
+            let input = json!({
+                "type": "object",
+                "properties": { "value": value_schema }
+            });
+            let err = sanitize_schema(&input, "tool 'agent'").unwrap_err();
+            assert_eq!(err.kind, FailureKind::BadRequest);
+            assert!(
+                err.message.contains(keyword),
+                "expected {keyword} in: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_schema_rejects_ref_siblings_and_lossy_all_of() {
+        let ref_sibling = json!({
+            "$ref": "#/$defs/Value",
+            "description": "not allowed beside ref",
+            "$defs": {
+                "Value": { "type": "string" }
+            }
+        });
+        assert!(sanitize_schema(&ref_sibling, "tool 'agent'").is_err());
+
+        let conflicting = json!({
+            "allOf": [
+                {"type":"object","properties":{"x":{"type":"string"}}},
+                {"type":"object","properties":{"x":{"type":"integer"}}}
+            ]
+        });
+        assert!(sanitize_schema(&conflicting, "tool 'agent'").is_err());
+    }
+
+    #[test]
+    fn build_tools_uses_parameters_json_schema() {
+        let req = InternalRequest {
+            requested_model: "gemini".into(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![crate::types::ToolDef {
+                name: "read".into(),
+                description: Some("read a file".into()),
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }),
+            }],
+            tool_choice: None,
+            tool_choice_name: None,
+            params: Default::default(),
+            stream: true,
+            include_usage: false,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        };
+
+        let tools = GeminiAdapter::build_tools(&req).unwrap().unwrap();
+        let declaration = &tools[0]["functionDeclarations"][0];
+        assert!(declaration.get("parameters").is_none());
+        assert_eq!(
+            declaration["parametersJsonSchema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            declaration["parametersJsonSchema"]["required"],
+            json!(["path"])
         );
     }
 }
