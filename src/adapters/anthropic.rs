@@ -778,3 +778,28 @@ mod tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod error_scope_tests {
+    use super::*;
+    use crate::adapters::Adapter;
+
+    #[test]
+    fn forbidden_entitlement_does_not_poison_anthropic_credential() {
+        let adapter = AnthropicAdapter::new();
+        let forbidden = adapter.classify_error(
+            403,
+            r#"{"error":{"type":"permission_error","message":"model entitlement missing"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(forbidden.kind, FailureKind::TargetError);
+
+        let unauthorized = adapter.classify_error(
+            401,
+            r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(unauthorized.kind, FailureKind::AuthError);
+    }
+}
