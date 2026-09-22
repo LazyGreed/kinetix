@@ -19,9 +19,11 @@ Aliases point at either a single model (`target_type = "model"`) or a Route
 
 ## Targets
 
-Each Route target is an `(account, model)` pair. If a target omits the account,
-Kinetix uses the lowest-priority non-disabled account of the model's provider.
-Targets may span providers and wire formats (FR-12.2/12.5/12.10).
+Each Route target names a model and may optionally pin one account. If the
+account is omitted, the target owns the provider's executable account pool:
+Kinetix applies account health, priority, and weight, then tries eligible sibling
+accounts before advancing to the next logical Route target. Targets may span
+providers and wire formats (FR-12.2/12.5/12.10).
 
 ## Selection strategies
 
