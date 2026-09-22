@@ -116,6 +116,233 @@ impl RequestMeta {
 }
 
 /// The result of a successful upstream connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenCountResult {
+    pub input_tokens: u64,
+    pub exact: bool,
+}
+
+fn estimated_input_tokens(req: &InternalRequest) -> u64 {
+    let mut tokens = req.approx_input_tokens();
+    let tool_chars: u64 = req
+        .tools
+        .iter()
+        .map(|tool| {
+            tool.name.len() as u64
+                + tool.description.as_deref().map(str::len).unwrap_or(0) as u64
+                + tool.parameters.to_string().len() as u64
+                + 32
+        })
+        .sum();
+    tokens = tokens.saturating_add(tool_chars.div_ceil(4));
+    tokens.max(1)
+}
+
+fn token_count_exact_target(
+    state: &AppState,
+    key: &db::VirtualKeyRow,
+    req: &InternalRequest,
+) -> Result<Option<ResolvedTarget>, ProxyError> {
+    let snap = state.registry.snapshot();
+    let resolved = crate::registry::Registry::resolve_in(&snap, &req.requested_model).ok_or_else(
+        || {
+            ProxyError::not_found(format!(
+                "model '{}' is not configured. Use GET /v1/models to list available models.",
+                req.requested_model
+            ))
+        },
+    )?;
+    let needs = req.capability_needs();
+    let allowed_providers = key.allowed_providers();
+
+    let eligible = |target: &ResolvedTarget| {
+        (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
+            && (!target.provider.strict() || target.model.caps().satisfies(&needs))
+    };
+
+    match resolved {
+        Resolved::Single {
+            provider_id,
+            model_id,
+        } => {
+            let model = snap
+                .models
+                .get(&model_id)
+                .cloned()
+                .ok_or_else(|| ProxyError::not_found("model not found"))?;
+            let provider = snap
+                .providers
+                .get(&provider_id)
+                .cloned()
+                .ok_or_else(|| ProxyError::not_found("provider not found"))?;
+            if !allowed_providers.is_empty() && !allowed_providers.contains(&provider.id) {
+                return Err(ProxyError::new(
+                    crate::types::ErrorKind::Forbidden,
+                    "this key is not allowed to use the resolved provider",
+                ));
+            }
+            if provider.strict() && !model.caps().satisfies(&needs) {
+                return Err(ProxyError::unsupported(
+                    "resolved model cannot satisfy this token-count request",
+                ));
+            }
+
+            let account = select_accounts(&snap, &provider_id, None)?
+                .into_iter()
+                .find(|account| {
+                    matches!(pool::effective_status(account), pool::AccountStatus::Healthy)
+                });
+            Ok(account.map(|account| ResolvedTarget {
+                account,
+                model,
+                provider,
+                route_target_id: None,
+                priority: 1,
+                weight: 1,
+                predicate: TargetPredicate::default(),
+                param_overrides: Value::Null,
+            }))
+        }
+        Resolved::Route { targets, .. } => {
+            let mut targets: Vec<_> = targets.into_iter().filter(eligible).collect();
+            if targets.is_empty() {
+                return Err(ProxyError::unsupported(
+                    "no configured target can satisfy this token-count request",
+                ));
+            }
+
+            // Counting must not advance round-robin/weighted route state. Exact
+            // upstream counting is therefore safe only when every eligible
+            // route candidate shares the same tokenizer/model. Heterogeneous
+            // routes use the documented local estimate.
+            let first_provider = targets[0].provider.id.clone();
+            let first_model = targets[0].model.id.clone();
+            if targets.iter().any(|target| {
+                target.provider.id != first_provider || target.model.id != first_model
+            }) {
+                return Ok(None);
+            }
+
+            targets.sort_by_key(|target| target.account.priority);
+            Ok(targets.into_iter().find(|target| {
+                matches!(
+                    pool::effective_status(&target.account),
+                    pool::AccountStatus::Healthy
+                )
+            }))
+        }
+    }
+}
+
+pub async fn count_tokens(
+    state: &AppState,
+    key: &db::VirtualKeyRow,
+    req: &InternalRequest,
+    request_id: &str,
+    protocol_headers: &[(String, String)],
+) -> Result<TokenCountResult, ProxyError> {
+    let estimate = || TokenCountResult {
+        input_tokens: estimated_input_tokens(req),
+        exact: false,
+    };
+
+    let Some(target) = token_count_exact_target(state, key, req)? else {
+        return Ok(estimate());
+    };
+    let adapter = state.adapters.for_provider(&target.provider);
+    let credential = state
+        .credential_for(&target.provider, &target.account)
+        .await
+        .map_err(|_| ProxyError::internal("credential unavailable"))?
+        .secret;
+    let ctx = UpstreamContext {
+        provider: &target.provider,
+        model: &target.model,
+        account_id: Some(target.account.id.as_str()),
+        credential,
+    };
+    let Some(url) = adapter.count_tokens_url(&ctx)? else {
+        return Ok(estimate());
+    };
+    let url = url::Url::parse(&url)
+        .map_err(|error| ProxyError::internal(format!("invalid token-count URL: {error}")))?;
+
+    let raw = req
+        .raw_body
+        .as_deref()
+        .ok_or_else(|| ProxyError::internal("token-count request body unavailable"))?;
+    let mut body: Value = serde_json::from_str(raw)
+        .map_err(|error| ProxyError::bad_request(format!("invalid JSON body: {error}")))?;
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::bad_request("request body must be a JSON object"))?;
+    object.insert("model".into(), serde_json::json!(target.model.upstream_id));
+
+    let response = crate::outbound::send_provider_request(
+        &state.outbound_clients,
+        state.config.allow_private_upstreams,
+        state.config.allow_insecure_tls,
+        &adapter,
+        &ctx,
+        crate::outbound::ProviderRequest {
+            method: reqwest::Method::POST,
+            url,
+            json_body: Some(body),
+            accept_event_stream: false,
+            request_id: Some(request_id.to_string()),
+            headers: if adapter.wire_format() == "anthropic" {
+                protocol_headers.to_vec()
+            } else {
+                Vec::new()
+            },
+            total_timeout: Some(provider_phase_timeout(&target.provider)),
+        },
+    )
+    .await
+    .map_err(|error| {
+        if let Some(failure) = error.adapter_failure {
+            failure_to_error(&failure, &target)
+        } else if error.timeout {
+            ProxyError::upstream("upstream token-count request timed out")
+        } else {
+            ProxyError::upstream(error.message)
+        }
+    })?;
+
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| ProxyError::upstream(classify_reqwest(&error)))?;
+    if !(200..300).contains(&status) {
+        let native = adapter.classify_error(status, &text, &headers);
+        let failure =
+            apply_provider_failure_rules(&target.provider, status, &text, native);
+        return Err(preserve_anthropic_error(
+            failure_to_error(&failure, &target),
+            FrontendFormat::Anthropic,
+            adapter.as_ref(),
+            &failure,
+            status,
+            &headers,
+            Some(&text),
+        ));
+    }
+
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|error| ProxyError::upstream(format!("invalid token-count response: {error}")))?;
+    let input_tokens = parsed
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProxyError::upstream("token-count response missing input_tokens"))?;
+
+    Ok(TokenCountResult {
+        input_tokens,
+        exact: true,
+    })
+}
+
 struct Attempt {
     target: ResolvedTarget,
     upstream_request_id: Option<String>,
