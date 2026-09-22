@@ -388,6 +388,7 @@ pub async fn overview(State(state): State<AppState>, _auth: AdminAuth) -> ApiRes
         "total_tokens": summary["input_tokens"].as_i64().unwrap_or(0) + summary["output_tokens"].as_i64().unwrap_or(0),
         "total_spend_usd": summary["cost_usd"],
         "cached_tokens": summary["cached_tokens"],
+        "cache_write_tokens": summary["cache_write_tokens"],
         "thinking_tokens": summary["thinking_tokens"],
         "fallback_rate": fallback_rate,
         "avg_latency_ms": summary["avg_latency_ms"],
@@ -2607,6 +2608,7 @@ fn usage_json(u: &db::UsageLogRow) -> Value {
         "input_tokens": u.input_tokens,
         "output_tokens": u.output_tokens,
         "cached_tokens": u.cached_tokens,
+        "cache_write_tokens": u.cache_write_tokens,
         "thinking_tokens": u.thinking_tokens,
         "cost_usd": u.cost_usd,
         "cost_known": u.cost_known != 0,
@@ -3002,6 +3004,14 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
     body.push_str(&format!(
         "kinetix_cached_tokens_total {}\n",
         summary["cached_tokens"].as_i64().unwrap_or(0)
+    ));
+    body.push_str(
+        "# HELP kinetix_cache_write_tokens_total Provider-reported cache-write prompt tokens\n",
+    );
+    body.push_str("# TYPE kinetix_cache_write_tokens_total counter\n");
+    body.push_str(&format!(
+        "kinetix_cache_write_tokens_total {}\n",
+        summary["cache_write_tokens"].as_i64().unwrap_or(0)
     ));
     // Accounting confidence (FR-6.8, NFR-4.2): usage rows whose tokens were not
     // provider-reported. Unknown/estimated rows must never be read as exact.
