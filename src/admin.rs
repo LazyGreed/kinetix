@@ -2034,7 +2034,6 @@ pub async fn list_routes(State(state): State<AppState>, _auth: AdminAuth) -> Api
             "description": c.description,
             "strategy": c.strategy,
             "fallback_triggers": serde_json::from_str::<Value>(&c.fallback_triggers).unwrap_or(json!({})),
-            "continuity_policy": c.continuity_policy,
             "portability_policy": c.portability_policy,
             "sticky_routing": c.sticky_routing != 0,
             "cache_affinity": c.cache_affinity != 0,
@@ -2055,8 +2054,6 @@ pub struct RouteBody {
     pub strategy: String,
     #[serde(default)]
     pub fallback_triggers: Value,
-    #[serde(default = "strip_policy")]
-    pub continuity_policy: String,
     /// FR-2.11: reject | strip_with_warning.
     #[serde(default = "portability_default")]
     pub portability_policy: String,
@@ -2073,9 +2070,6 @@ pub struct RouteBody {
 fn priority_strategy() -> String {
     "priority".into()
 }
-fn strip_policy() -> String {
-    "strip".into()
-}
 fn portability_default() -> String {
     "strip_with_warning".into()
 }
@@ -2086,11 +2080,6 @@ fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
         "priority" | "round-robin" | "weighted" | "least-used"
     ) {
         return Err(ApiError::bad("invalid route strategy"));
-    }
-    if !matches!(body.continuity_policy.as_str(), "strip" | "error") {
-        return Err(ApiError::bad(
-            "continuity_policy must be 'strip' or 'error'",
-        ));
     }
     if !matches!(
         body.portability_policy.as_str(),
@@ -2157,7 +2146,6 @@ pub async fn create_route(
             } else {
                 body.fallback_triggers.clone()
             },
-            continuity_policy: &body.continuity_policy,
             portability_policy: &body.portability_policy,
             sticky_routing: body.sticky_routing,
             cache_affinity: body.cache_affinity,
@@ -2198,7 +2186,6 @@ pub async fn update_route(
         &body.description,
         &body.strategy,
         body.fallback_triggers.clone(),
-        &body.continuity_policy,
         &body.portability_policy,
         body.sticky_routing,
         body.cache_affinity,
@@ -3313,7 +3300,6 @@ pub async fn export_config(
             "description": r.description,
             "strategy": r.strategy,
             "fallback_triggers": serde_json::from_str::<Value>(&r.fallback_triggers).unwrap_or(json!({})),
-            "continuity_policy": r.continuity_policy,
             "portability_policy": r.portability_policy,
             "sticky_routing": r.sticky_routing != 0,
             "cache_affinity": r.cache_affinity != 0,
@@ -3630,18 +3616,19 @@ pub async fn import_config(
     // Routes (upsert by name) + targets.
     for r in routes {
         let name = r["name"].as_str().unwrap_or("");
+        let legacy_reject = r["continuity_policy"].as_str() == Some("error");
         let body = RouteBody {
             name: name.to_string(),
             description: r["description"].as_str().unwrap_or("").to_string(),
             strategy: r["strategy"].as_str().unwrap_or("priority").to_string(),
             fallback_triggers: r["fallback_triggers"].clone(),
-            continuity_policy: r["continuity_policy"]
-                .as_str()
-                .unwrap_or("strip")
-                .to_string(),
             portability_policy: r["portability_policy"]
                 .as_str()
-                .unwrap_or("strip_with_warning")
+                .unwrap_or(if legacy_reject {
+                    "reject"
+                } else {
+                    "strip_with_warning"
+                })
                 .to_string(),
             sticky_routing: r["sticky_routing"].as_bool().unwrap_or(false),
             cache_affinity: r["cache_affinity"].as_bool().unwrap_or(false),
@@ -3676,7 +3663,6 @@ pub async fn import_config(
                     &body.description,
                     &body.strategy,
                     body.fallback_triggers.clone(),
-                    &body.continuity_policy,
                     &body.portability_policy,
                     body.sticky_routing,
                     body.cache_affinity,
@@ -3702,7 +3688,6 @@ pub async fn import_config(
                         } else {
                             body.fallback_triggers.clone()
                         },
-                        continuity_policy: &body.continuity_policy,
                         portability_policy: &body.portability_policy,
                         sticky_routing: body.sticky_routing,
                         cache_affinity: body.cache_affinity,

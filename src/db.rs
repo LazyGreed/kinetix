@@ -1008,6 +1008,7 @@ pub struct RouteRow {
     pub description: String,
     pub strategy: String,
     pub fallback_triggers: String,
+    /// Deprecated storage retained for database compatibility only.
     pub continuity_policy: String,
     pub portability_policy: String,
     pub sticky_routing: i64,
@@ -1021,13 +1022,9 @@ impl RouteRow {
     /// The configured policy for non-portable opaque state (FR-2.11).
     /// Accepts `reject` or `strip_with_warning`.
     pub fn portability(&self) -> &str {
-        // continuity_policy is the legacy predecessor of portability_policy.
-        // Preserve existing persisted routes: legacy "error" means reject;
-        // every other legacy value degrades to the explicit warning path.
-        if self.portability_policy == "reject" || self.continuity_policy == "error" {
-            "reject"
-        } else {
-            "strip_with_warning"
+        match self.portability_policy.as_str() {
+            "reject" => "reject",
+            _ => "strip_with_warning",
         }
     }
 }
@@ -1084,7 +1081,6 @@ pub struct NewRoute<'a> {
     pub description: &'a str,
     pub strategy: &'a str,
     pub fallback_triggers: Value,
-    pub continuity_policy: &'a str,
     pub portability_policy: &'a str,
     pub sticky_routing: bool,
     pub cache_affinity: bool,
@@ -1095,14 +1091,13 @@ pub async fn insert_route(pool: &Pool, c: &NewRoute<'_>) -> Result<String> {
     let id = format!("route_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO routes (id, name, description, strategy, fallback_triggers, continuity_policy, portability_policy, sticky_routing, cache_affinity, max_attempts, enabled, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,1,?)",
+         VALUES (?,?,?,?,?,'strip',?,?,?,?,1,?)",
     )
     .bind(&id)
     .bind(c.name)
     .bind(c.description)
     .bind(c.strategy)
     .bind(c.fallback_triggers.to_string())
-    .bind(c.continuity_policy)
     .bind(c.portability_policy)
     .bind(c.sticky_routing as i64)
     .bind(c.cache_affinity as i64)
@@ -1119,19 +1114,17 @@ pub async fn update_route(
     description: &str,
     strategy: &str,
     fallback_triggers: Value,
-    continuity_policy: &str,
     portability_policy: &str,
     sticky_routing: bool,
     cache_affinity: bool,
     max_attempts: Option<i64>,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE routes SET description=?, strategy=?, fallback_triggers=?, continuity_policy=?, portability_policy=?, sticky_routing=?, cache_affinity=?, max_attempts=? WHERE id=?",
+        "UPDATE routes SET description=?, strategy=?, fallback_triggers=?, continuity_policy='strip', portability_policy=?, sticky_routing=?, cache_affinity=?, max_attempts=? WHERE id=?",
     )
     .bind(description)
     .bind(strategy)
     .bind(fallback_triggers.to_string())
-    .bind(continuity_policy)
     .bind(portability_policy)
     .bind(sticky_routing as i64)
     .bind(cache_affinity as i64)

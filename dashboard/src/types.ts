@@ -129,7 +129,6 @@ export interface Route {
     onTimeout: boolean;
   };
   targets: RouteTarget[];
-  continuityPolicy: 'strip' | 'error';
   portabilityPolicy: 'reject' | 'strip_with_warning';
   cacheAffinity: boolean;
   stickyRouting: boolean;

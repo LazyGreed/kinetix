@@ -19,9 +19,11 @@ Aliases point at either a single model (`target_type = "model"`) or a Route
 
 ## Targets
 
-Each Route target is an `(account, model)` pair. If a target omits the account,
-Kinetix uses the lowest-priority non-disabled account of the model's provider.
-Targets may span providers and wire formats (FR-12.2/12.5/12.10).
+Each Route target names a model and may optionally pin one account. If the
+account is omitted, the target owns the provider's executable account pool:
+Kinetix applies account health, priority, and weight, then tries eligible sibling
+accounts before advancing to the next logical Route target. Targets may span
+providers and wire formats (FR-12.2/12.5/12.10).
 
 ## Selection strategies
 
@@ -118,10 +120,11 @@ signatures) cannot travel. The Route's `portability_policy` decides:
 
 ## Prompt-cache affinity (FR-7.3/7.5)
 
-When a Route has `cache_affinity` and the request carries an explicit session
-header, Kinetix remembers the last successful target for that session and prefers
-it if still eligible, improving upstream prompt-cache hits. Session identity is
-taken **only** from an explicit header — never guessed:
+When a Route has `cache_affinity` or `sticky_routing` and the request carries
+an explicit session header, Kinetix remembers the last successful target for that
+session and prefers it while still eligible. `cache_affinity` is intended for
+prompt-cache locality; `sticky_routing` is the general session-affinity switch.
+Session identity is taken **only** from an explicit header — never guessed:
 
 ```
 X-Kinetix-Session | X-Session-Id | X-Conversation-Id | X-Session-Affinity | Session-Id

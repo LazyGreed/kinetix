@@ -10,6 +10,12 @@ use crate::crypto::{self, Crypto};
 use crate::db::{self, Pool};
 use crate::types::{AuthScheme, Capabilities, Prices, WireFormat};
 
+fn toml_json(value: Option<&toml::Value>) -> serde_json::Value {
+    value
+        .and_then(|v| serde_json::to_value(v).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
 /// Seed the database if it has no providers yet. Returns the number of
 /// virtual keys created, and any generated key values to log once.
 pub async fn seed_if_empty(
@@ -60,10 +66,10 @@ pub async fn seed_if_empty(
                 timeout_ms: p.timeout_ms as i64,
                 capability_mode: &p.capability_mode,
                 models_path: p.models_path.as_deref(),
-                rate_limit_rules: json!({}),
-                follow_redirects: false,
-                credential_hosts: "",
-                allow_insecure_tls: false,
+                rate_limit_rules: toml_json(p.rate_limit_rules.as_ref()),
+                follow_redirects: p.follow_redirects,
+                credential_hosts: &p.credential_hosts,
+                allow_insecure_tls: p.allow_insecure_tls,
                 wire_plugin: p.wire_plugin.as_deref().unwrap_or(""),
                 credential_plugin: p.credential_plugin.as_deref().unwrap_or(""),
                 model_source_plugin: p.model_source_plugin.as_deref().unwrap_or(""),
@@ -82,11 +88,18 @@ pub async fn seed_if_empty(
                 &enc,
                 &crypto::mask_secret(&a.api_key),
                 a.priority,
-                1,
+                a.weight,
                 a.soft_quota_usd,
                 &a.quota_type,
             )
             .await?;
+            if let Some(window) = a.quota_window_s {
+                sqlx::query("UPDATE accounts SET quota_window_s=? WHERE id=?")
+                    .bind(window)
+                    .bind(&acc_id)
+                    .execute(pool)
+                    .await?;
+            }
             account_ids.insert(a.label.clone(), acc_id);
         }
 
@@ -110,9 +123,9 @@ pub async fn seed_if_empty(
                     max_output_tokens: m.max_output_tokens,
                     capabilities: serde_json::to_value(&caps).unwrap(),
                     prices: serde_json::to_value(&prices).unwrap(),
-                    parameters: json!({}),
-                    thinking_map: json!({}),
-                    extra_request: json!({}),
+                    parameters: toml_json(m.parameters.as_ref()),
+                    thinking_map: toml_json(m.thinking_map.as_ref()),
+                    extra_request: toml_json(m.extra_request.as_ref()),
                     discovery: json!({}),
                 },
             )
@@ -133,9 +146,20 @@ pub async fn seed_if_empty(
                 name: &c.name,
                 description: &c.description,
                 strategy: if c.strategy.is_empty() { "priority" } else { &c.strategy },
-                fallback_triggers: json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true}),
-                continuity_policy: if c.continuity_policy.is_empty() { "strip" } else { &c.continuity_policy },
-                portability_policy: if c.portability_policy.is_empty() { "strip_with_warning" } else { &c.portability_policy },
+                fallback_triggers: c
+                    .fallback_triggers
+                    .as_ref()
+                    .map(|v| toml_json(Some(v)))
+                    .unwrap_or_else(|| json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true})),
+                portability_policy: if c.portability_policy.is_empty() {
+                    if c.continuity_policy.as_deref() == Some("error") {
+                        "reject"
+                    } else {
+                        "strip_with_warning"
+                    }
+                } else {
+                    &c.portability_policy
+                },
                 sticky_routing: c.sticky_routing,
                 cache_affinity: c.cache_affinity,
                 max_attempts: c.max_attempts,
@@ -143,14 +167,20 @@ pub async fn seed_if_empty(
         )
         .await?;
         for t in &c.targets {
-            let account_id = account_ids.get(&t.account).cloned();
+            let account_id = match t.account.as_deref() {
+                Some(label) => Some(account_ids.get(label).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "route '{}' target references unknown account '{}'",
+                        c.name,
+                        label
+                    )
+                })?),
+                None => None,
+            };
             let model_id = model_ids.get(&t.model).cloned();
             if let Some(model_id) = model_id {
-                let predicate = t
-                    .predicate
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "{}".into());
+                let predicate = toml_json(t.predicate.as_ref()).to_string();
+                let overrides = toml_json(t.param_overrides.as_ref()).to_string();
                 db::insert_route_target(
                     pool,
                     &route_id,
@@ -159,7 +189,7 @@ pub async fn seed_if_empty(
                     t.priority,
                     t.weight.unwrap_or(1),
                     &predicate,
-                    "{}",
+                    &overrides,
                 )
                 .await?;
             } else {
@@ -209,15 +239,15 @@ pub async fn seed_if_empty(
             owner: k.owner.clone(),
             tag: k.tag.clone(),
             allowed_models: serde_json::to_string(&k.allowed_models).unwrap(),
-            allowed_providers: "[]".into(),
+            allowed_providers: serde_json::to_string(&k.allowed_providers).unwrap(),
             rpm_limit: k.rpm_limit.map(|v| v as i64),
             tpm_limit: k.tpm_limit.map(|v| v as i64),
             daily_budget: k.daily_budget,
             monthly_budget: k.monthly_budget,
-            expires_at: None,
+            expires_at: k.expires_at.clone(),
             status: "active".into(),
-            allowed_ips: "[]".into(),
-            body_logging: 0,
+            allowed_ips: serde_json::to_string(&k.allowed_ips).unwrap(),
+            body_logging: k.body_logging as i64,
             created_at: db::now_iso(),
             revoked_at: None,
         };

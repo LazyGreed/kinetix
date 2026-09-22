@@ -457,6 +457,14 @@ pub struct BootstrapKey {
     #[serde(default = "default_wildcard")]
     pub allowed_models: Vec<String>,
     #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub body_logging: bool,
+    #[serde(default)]
     pub rpm_limit: Option<u32>,
     #[serde(default)]
     pub tpm_limit: Option<u32>,
@@ -504,6 +512,15 @@ pub struct BootstrapProvider {
     /// Model-list endpoint path override for discovery.
     #[serde(default)]
     pub models_path: Option<String>,
+    /// Provider-specific error classification rules.
+    #[serde(default)]
+    pub rate_limit_rules: Option<toml::Value>,
+    #[serde(default)]
+    pub follow_redirects: bool,
+    #[serde(default)]
+    pub credential_hosts: String,
+    #[serde(default)]
+    pub allow_insecure_tls: bool,
 }
 
 fn default_bearer() -> String {
@@ -522,10 +539,14 @@ pub struct BootstrapAccount {
     pub api_key: String,
     #[serde(default = "default_priority")]
     pub priority: i64,
+    #[serde(default = "default_priority")]
+    pub weight: i64,
     #[serde(default)]
     pub soft_quota_usd: Option<f64>,
     #[serde(default = "default_quota_type")]
     pub quota_type: String,
+    #[serde(default)]
+    pub quota_window_s: Option<i64>,
 }
 
 fn default_priority() -> i64 {
@@ -550,6 +571,12 @@ pub struct BootstrapModel {
     pub capabilities: Option<Vec<String>>,
     #[serde(default)]
     pub prices: Option<BootstrapPrices>,
+    #[serde(default)]
+    pub parameters: Option<toml::Value>,
+    #[serde(default)]
+    pub thinking_map: Option<toml::Value>,
+    #[serde(default)]
+    pub extra_request: Option<toml::Value>,
 }
 
 fn default_true() -> bool {
@@ -583,11 +610,15 @@ pub struct BootstrapRoute {
     pub description: String,
     #[serde(default = "default_priority_strategy")]
     pub strategy: String,
+    /// Deprecated compatibility input. "error" is migrated to
+    /// portability_policy="reject"; all other values are ignored.
     #[serde(default)]
-    pub continuity_policy: String,
+    pub continuity_policy: Option<String>,
     /// FR-2.11: reject | strip_with_warning.
     #[serde(default)]
     pub portability_policy: String,
+    #[serde(default)]
+    pub fallback_triggers: Option<toml::Value>,
     /// FR-7.3: cache-aware sticky routing.
     #[serde(default)]
     pub cache_affinity: bool,
@@ -599,14 +630,28 @@ pub struct BootstrapRoute {
     pub targets: Vec<BootstrapRouteTarget>,
 }
 
+impl BootstrapRoute {
+    pub fn effective_portability_policy(&self) -> &str {
+        if !self.portability_policy.is_empty() {
+            &self.portability_policy
+        } else if self.continuity_policy.as_deref() == Some("error") {
+            "reject"
+        } else {
+            "strip_with_warning"
+        }
+    }
+}
+
 fn default_priority_strategy() -> String {
     "priority".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BootstrapRouteTarget {
-    /// Account label (must be unique across providers).
-    pub account: String,
+    /// Optional account label. Omit to use the provider's executable account
+    /// pool instead of pinning one credential.
+    #[serde(default)]
+    pub account: Option<String>,
     /// `provider/model-id`
     pub model: String,
     #[serde(default = "default_priority")]
@@ -616,6 +661,9 @@ pub struct BootstrapRouteTarget {
     /// Typed eligibility predicate (FR-12.3), as an inline TOML/JSON value.
     #[serde(default)]
     pub predicate: Option<toml::Value>,
+    /// Per-target canonical/provider parameter overrides.
+    #[serde(default)]
+    pub param_overrides: Option<toml::Value>,
 }
 
 pub fn load_bootstrap(path: &std::path::Path) -> Result<BootstrapConfig> {
@@ -624,4 +672,81 @@ pub fn load_bootstrap(path: &std::path::Path) -> Result<BootstrapConfig> {
     let cfg: BootstrapConfig = toml::from_str(&text)
         .with_context(|| format!("parsing bootstrap config {}", path.display()))?;
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod bootstrap_config_tests {
+    use super::*;
+
+    #[test]
+    fn parses_executable_bootstrap_controls() {
+        let cfg: BootstrapConfig = toml::from_str(
+            r#"
+[[virtual_keys]]
+name = "dev"
+owner = "admin"
+allowed_models = ["*"]
+allowed_providers = ["provider-1"]
+allowed_ips = ["127.0.0.1/32"]
+body_logging = true
+
+[[providers]]
+name = "Provider"
+base_url = "https://api.example.com"
+wire_format = "openai"
+follow_redirects = true
+credential_hosts = "auth.example.com"
+rate_limit_rules = { target = { statuses = [403, 404] } }
+
+  [[providers.accounts]]
+  label = "primary"
+  api_key = "secret"
+  priority = 1
+  weight = 4
+  quota_type = "rolling"
+  quota_window_s = 3600
+
+  [[providers.models]]
+  upstream_id = "model"
+  parameters = { temperature = { supported = true } }
+  thinking_map = { levels = { high = "high" } }
+  extra_request = { service_tier = "auto" }
+
+[[routes]]
+name = "route"
+fallback_triggers = { on429 = false, onQuota = true, on5xx = true, onTimeout = false }
+portability_policy = "reject"
+
+  [[routes.targets]]
+  model = "Provider/model"
+  weight = 2
+  param_overrides = { temperature = 0.2 }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.virtual_keys[0].allowed_providers, vec!["provider-1"]);
+        assert!(cfg.virtual_keys[0].body_logging);
+        assert!(cfg.providers[0].follow_redirects);
+        assert_eq!(cfg.providers[0].accounts[0].weight, 4);
+        assert_eq!(cfg.providers[0].accounts[0].quota_window_s, Some(3600));
+        assert_eq!(cfg.routes[0].effective_portability_policy(), "reject");
+        assert!(cfg.routes[0].fallback_triggers.is_some());
+        assert!(cfg.routes[0].targets[0].account.is_none());
+        assert!(cfg.routes[0].targets[0].param_overrides.is_some());
+    }
+
+    #[test]
+    fn legacy_continuity_error_maps_to_reject() {
+        let cfg: BootstrapConfig = toml::from_str(
+            r#"
+[[routes]]
+name = "legacy"
+continuity_policy = "error"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.routes[0].effective_portability_policy(), "reject");
+    }
 }

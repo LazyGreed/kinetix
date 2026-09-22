@@ -62,6 +62,8 @@ database has no providers**; afterwards the database is authoritative. A
 documented example is
 [`config.toml.example`](https://github.com/PrightCord/kinetix/blob/main/config.toml.example).
 
+Bootstrap accepts the same executable controls as the database: provider failure/security settings, account priority/weight/quota window, model parameter/thinking/extra-request policy, route fallback triggers, unpinned provider-pool targets, target predicates/overrides, and virtual-key provider/IP/logging restrictions. Legacy `continuity_policy = "error"` is accepted only for compatibility and maps to `portability_policy = "reject"`; new configuration should use `portability_policy` only.
+
 ```toml
 [[virtual_keys]]
 name = "Local Dev Key"

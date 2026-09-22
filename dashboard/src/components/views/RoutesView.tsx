@@ -144,7 +144,6 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
         onTimeout: true,
       },
       targets: [],
-      continuityPolicy: 'strip',
       portabilityPolicy: 'strip_with_warning',
       cacheAffinity: true,
       stickyRouting: sticky,
@@ -581,25 +580,6 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       />
                       <span>Sticky routing (Preserves prompt cache while target healthy)</span>
                     </label>
-
-                    <div className="pt-1">
-                      <span className="text-xs font-mono text-[var(--ink)]/70 block mb-1">
-                        Cross-Provider Content Policy:
-                      </span>
-                      <select
-                        value={activeRoute.continuityPolicy}
-                        onChange={(e) =>
-                          onUpdateRoute({
-                            ...activeRoute,
-                            continuityPolicy: e.target.value as any,
-                          })
-                        }
-                        className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-xs font-mono rounded w-full"
-                      >
-                        <option value="strip">Strip proprietary thinking tokens / vendor signatures</option>
-                        <option value="error">Error on non-portable conversation turn</option>
-                      </select>
-                    </div>
 
                     <div className="pt-1">
                       <span className="text-xs font-mono text-[var(--ink)]/70 block mb-1">

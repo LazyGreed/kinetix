@@ -14,6 +14,9 @@ name = "Local Dev Key"
 owner = "Admin"
 tag = "dev"
 allowed_models = ["*"]        # "*", exact names, or prefixes like "gemini-*"
+allowed_providers = []         # empty = any configured provider
+allowed_ips = []               # CIDRs; empty = any client IP
+body_logging = false           # opt-in short-retention request/response logging
 rpm_limit = 600               # requests per minute (omit for unlimited)
 tpm_limit = 1000000           # tokens per minute
 daily_budget = 50.0           # USD
@@ -29,13 +32,19 @@ custom_header_name = "x-goog-api-key"
 timeout_ms = 120000
 capability_mode = "permissive" # permissive | strict
 models_path = "/models"        # for model discovery (optional)
+follow_redirects = false
+credential_hosts = ""          # comma-separated auth hosts; empty = base_url host
+allow_insecure_tls = false
+# rate_limit_rules = { target = { statuses = [403, 404] } }
 
   # One or more upstream credentials ("accounts") for this provider.
   [[providers.accounts]]
   label = "Gemini Key 1"
   api_key = "REPLACE_WITH_REAL_KEY"
   priority = 1
+  weight = 1
   quota_type = "none"         # none | daily | monthly | rolling
+  # quota_window_s = 3600     # used by rolling quotas
 
   # Models this provider exposes. Add more as needed.
   [[providers.models]]
@@ -46,6 +55,9 @@ models_path = "/models"        # for model discovery (optional)
   max_output_tokens = 65536
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   # prices = { input_per_1m = 0.10, output_per_1m = 0.40 }  # optional
+  # parameters = { temperature = { supported = true } }
+  # thinking_map = { levels = { high = "high" } }
+  # extra_request = { service_tier = "auto" }
 
 # --- Aliases (stable client-facing model names) ----------------------------
 [[aliases]]
@@ -58,14 +70,17 @@ target = "Google Gemini/gemini-3.6-flash"
 # name = "smart"
 # description = "Primary then fallback"
 # strategy = "priority"                # priority | round-robin | weighted | least-used
-# continuity_policy = "strip"          # strip | error (cross-provider state handling)
-# portability_policy = "strip_with_warning"  # reject | strip_with_warning (r4 FR-2.11)
+# fallback_triggers = { on429 = true, onQuota = true, on5xx = true, onTimeout = true }
+# portability_policy = "strip_with_warning"  # reject | strip_with_warning (FR-2.11)
 # cache_affinity = false               # FR-7.3 prompt-cache-aware sticky routing
 # sticky_routing = false               # FR-7.5 prefer the same target per session
 # max_attempts = 3
 # [[routes.targets]]
 # model = "Google Gemini/gemini-3.6-flash"
+# # account = "Gemini Key 1"            # omit to use the provider account pool
 # priority = 1
+# weight = 1
+# param_overrides = { temperature = 0.2 }
 # # Optional typed eligibility predicate (FR-12.3). Facts: has_tools,
 # # has_images, has_reasoning, frontend, requested_model, requested_route,
 # # key_tag, input_tokens, target_capability, target_context_window, ...
