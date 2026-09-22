@@ -110,10 +110,12 @@ fn openai_parallel_tool_calls_and_tool_result() {
     match &req.messages[1].parts[0] {
         Part::ToolResult {
             tool_call_id,
+            name,
             content,
             ..
         } => {
             assert_eq!(tool_call_id, "call_a");
+            assert_eq!(name.as_deref(), Some("get_weather"));
             assert_eq!(content, "18C");
         }
         other => panic!("expected tool result, got {other:?}"),
@@ -162,6 +164,60 @@ fn openai_reasoning_effort_maps_to_thinking_level() {
     );
     // Absent reasoning control means no thinking request (nothing invented).
     assert_eq!(openai(r#"{"model":"m","messages":[]}"#).thinking, None);
+}
+
+#[test]
+fn openai_assistant_reasoning_history_is_retained_as_opaque_state() {
+    let req = openai(
+        r#"{
+          "model":"m",
+          "messages":[{
+            "role":"assistant",
+            "content":"answer",
+            "reasoning_content":"private chain state",
+            "reasoning_signature":"sig-r"
+          }]
+        }"#,
+    );
+    assert!(req.messages[0].parts.iter().any(|part| matches!(
+        part,
+        Part::Thinking { text, signature }
+            if text == "private chain state" && signature.as_deref() == Some("sig-r")
+    )));
+}
+
+#[test]
+fn unsupported_nested_content_is_marked_for_translation_rejection() {
+    let openai_file = openai(
+        r#"{
+          "model":"m",
+          "messages":[{"role":"user","content":[{"type":"file","file_id":"file_1"}]}]
+        }"#,
+    );
+    assert!(frontends::translation_unsupported(&openai_file.extra).is_some());
+
+    let anthropic_tool_image = anthropic(
+        r#"{
+          "model":"m",
+          "messages":[{
+            "role":"user",
+            "content":[{
+              "type":"tool_result",
+              "tool_use_id":"toolu_1",
+              "content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]
+            }]
+          }]
+        }"#,
+    );
+    assert!(frontends::translation_unsupported(&anthropic_tool_image.extra).is_some());
+
+    let responses_file = responses(
+        r#"{
+          "model":"m",
+          "input":[{"type":"file_search_call","id":"fs_1"}]
+        }"#,
+    );
+    assert!(frontends::translation_unsupported(&responses_file.extra).is_some());
 }
 
 #[test]
@@ -293,10 +349,12 @@ fn responses_multi_turn_with_function_call_and_output() {
     match &req.messages[2].parts[0] {
         Part::ToolResult {
             tool_call_id,
+            name,
             content,
             ..
         } => {
             assert_eq!(tool_call_id, "call_berlin");
+            assert_eq!(name.as_deref(), Some("get_weather"));
             assert_eq!(content, "{\"temp\":\"15C\"}");
         }
         other => panic!("expected ToolResult, got {other:?}"),

@@ -25,6 +25,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         .and_then(|m| m.as_array())
         .ok_or_else(|| ProxyError::bad_request("missing required field 'messages'"))?;
 
+    let mut translation_issues = nested_translation_issues(obj);
     let mut system = Vec::new();
     match obj.get("system") {
         Some(Value::String(s)) => system.push(s.clone()),
@@ -107,6 +108,10 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
             extra.insert(k.clone(), v.clone());
         }
     }
+    translation_issues.extend(crate::frontends::resolve_tool_result_names(
+        &mut out_messages,
+    ));
+    crate::frontends::attach_translation_issues(&mut extra, translation_issues);
 
     Ok(InternalRequest {
         requested_model: model,
@@ -122,6 +127,97 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         extra,
         raw_body: None,
     })
+}
+
+fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if let Some(Value::Array(blocks)) = obj.get("system") {
+        for (index, block) in blocks.iter().enumerate() {
+            let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind != "text" {
+                issues.push(format!(
+                    "system[{index}] type '{kind}' has no canonical cross-format representation"
+                ));
+            }
+        }
+    }
+
+    if let Some(messages) = obj.get("messages").and_then(Value::as_array) {
+        for (message_index, message) in messages.iter().enumerate() {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            if !matches!(role, "user" | "assistant") {
+                issues.push(format!(
+                    "messages[{message_index}] has unsupported role '{role}'"
+                ));
+            }
+
+            match message.get("content") {
+                Some(Value::Array(blocks)) => {
+                    for (block_index, block) in blocks.iter().enumerate() {
+                        let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+                        let path = format!("messages[{message_index}].content[{block_index}]");
+                        match kind {
+                            "text" | "tool_use" | "thinking" => {}
+                            "image" => {
+                                let source_type = block
+                                    .get("source")
+                                    .and_then(|source| source.get("type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                if !matches!(source_type, "base64" | "url") {
+                                    issues.push(format!(
+                                        "{path} image source type '{source_type}' is not translatable"
+                                    ));
+                                }
+                            }
+                            "tool_result" => {
+                                if let Some(Value::Array(result_blocks)) = block.get("content") {
+                                    for (result_index, result_block) in
+                                        result_blocks.iter().enumerate()
+                                    {
+                                        let result_type = result_block
+                                            .get("type")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("");
+                                        if result_type != "text" {
+                                            issues.push(format!(
+                                                "{path}.content[{result_index}] type '{result_type}' would be dropped during translation"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => issues.push(format!(
+                                "{path} type '{kind}' has no canonical cross-format representation"
+                            )),
+                        }
+                    }
+                }
+                Some(Value::String(_)) | None => {}
+                Some(_) => issues.push(format!(
+                    "messages[{message_index}].content has unsupported nested structure"
+                )),
+            }
+        }
+    }
+
+    if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
+        for (tool_index, tool) in tools.iter().enumerate() {
+            if let Some(kind) = tool.get("type").and_then(Value::as_str) {
+                if kind != "custom" {
+                    issues.push(format!(
+                        "tools[{tool_index}] server-tool type '{kind}' has no canonical cross-format representation"
+                    ));
+                }
+            }
+        }
+    }
+
+    issues
 }
 
 fn decode_content(content: Option<&Value>) -> Vec<Part> {

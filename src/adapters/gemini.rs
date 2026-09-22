@@ -32,11 +32,15 @@ impl GeminiAdapter {
         for p in parts {
             match p {
                 Part::Text(t) => out.push(json!({ "text": t })),
-                Part::Thinking { text, .. } => {
-                    // Preserve thinking as a thought part so multi-turn history
-                    // stays valid for the same provider (FR-12.10).
-                    if !text.is_empty() {
-                        out.push(json!({ "text": text, "thought": true }));
+                Part::Thinking { text, signature } => {
+                    // Preserve Gemini reasoning state when the target can carry
+                    // it. Signature-only parts are valid continuation state.
+                    if !text.is_empty() || signature.is_some() {
+                        let mut part = json!({ "text": text, "thought": true });
+                        if let Some(sig) = signature {
+                            part["thoughtSignature"] = json!(sig);
+                        }
+                        out.push(part);
                     }
                 }
                 Part::Image(img) => match img {
@@ -839,6 +843,21 @@ pub fn message_has_tool_result(m: &Message) -> bool {
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    #[test]
+    fn thinking_signature_round_trips_into_gemini_history() {
+        let mut out = Vec::new();
+        GeminiAdapter::encode_parts(
+            &[Part::Thinking {
+                text: String::new(),
+                signature: Some("sig-thinking".into()),
+            }],
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["thought"], true);
+        assert_eq!(out[0]["thoughtSignature"], "sig-thinking");
+    }
 
     #[test]
     fn generation_config_uses_canonical_policy_keys_for_gemini_wire_names() {

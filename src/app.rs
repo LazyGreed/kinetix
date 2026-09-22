@@ -37,8 +37,8 @@ pub struct AppState {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Diagnostic flight recorder (FR-13).
     pub flight: Arc<FlightRecorder>,
-    /// Prompt-cache-affinity sticky routing (FR-7.3): session id -> route target
-    /// key. Bounded in time by a periodic sweep.
+    /// Session id -> last successful route target. Used for optional
+    /// sticky/cache affinity and FR-2.11 opaque-state provenance. TTL-bounded.
     sticky: Arc<DashMap<String, StickyEntry>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicU64>>>,
     /// Before-commit / after-commit failure counters (FR-4.9).
@@ -255,7 +255,7 @@ impl AppState {
             .clone()
     }
 
-    /// Remember the target a session was served by (FR-7.3).
+    /// Remember the last successful target for affinity and state provenance.
     pub fn sticky_remember(&self, session: &str, target_key: String) {
         self.sticky.insert(
             session.to_string(),

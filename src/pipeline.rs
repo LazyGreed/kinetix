@@ -444,27 +444,40 @@ pub async fn run(
         .min(5)
         .max(1);
 
+    // Session target provenance is retained even when sticky/cache affinity is
+    // disabled. It lets the portability layer identify a first-attempt provider
+    // boundary for opaque continuation state.
+    let session_origin_key = session
+        .as_deref()
+        .and_then(|session| state.sticky_lookup(session, STICKY_TTL));
+    let session_origin_provider = route.as_ref().and_then(|route| {
+        session_origin_key.as_ref().and_then(|key| {
+            targets
+                .iter()
+                .find(|target| target_key(route, target) == *key)
+                .map(|target| target.provider.id.clone())
+        })
+    });
+
     // Sticky routing and prompt-cache affinity share the same bounded session
     // mapping: both prefer the last successful target while still allowing
     // ordinary health/fallback logic to move away from it.
-    if let (Some(route), Some(session)) = (&route, &session) {
+    if let (Some(route), Some(sticky_key)) = (&route, session_origin_key.as_ref()) {
         if route.cache_affinity != 0 || route.sticky_routing != 0 {
-            if let Some(sticky_key) = state.sticky_lookup(session, STICKY_TTL) {
-                if let Some(pos) = targets
-                    .iter()
-                    .position(|t| target_key(route, t) == sticky_key)
-                {
-                    targets.rotate_left(pos);
-                    trace.step(
-                        "candidate",
-                        Some(targets[0].account.label.clone()),
-                        if route.sticky_routing != 0 {
-                            "sticky-routing: previous session target promoted (FR-7.5)"
-                        } else {
-                            "cache-affinity: session target promoted (FR-7.3)"
-                        },
-                    );
-                }
+            if let Some(pos) = targets
+                .iter()
+                .position(|t| target_key(route, t) == *sticky_key)
+            {
+                targets.rotate_left(pos);
+                trace.step(
+                    "candidate",
+                    Some(targets[0].account.label.clone()),
+                    if route.sticky_routing != 0 {
+                        "sticky-routing: previous session target promoted (FR-7.5)"
+                    } else {
+                        "cache-affinity: session target promoted (FR-7.3)"
+                    },
+                );
             }
         }
     }
@@ -591,16 +604,28 @@ pub async fn run(
         // continuity transforms must never leak into a later fallback target.
         let mut target_req = req.clone();
 
-        // Continuity / portability applies only when this attempt crosses
-        // provider boundaries. Switching credentials inside one provider pool
-        // must not strip conversation state.
+        // Portability applies on cross-format translation, on fallback across
+        // providers, and on the first attempt when session provenance shows the
+        // previous turn came from a different provider.
         let cross_provider = previous_provider_id
             .as_deref()
+            .or_else(|| {
+                if attempts_done == 0 {
+                    session_origin_provider.as_deref()
+                } else {
+                    None
+                }
+            })
             .map(|id| id != target.provider.id)
             .unwrap_or(false);
-        if cross_provider {
+        let cross_format = !passthrough::is_passthrough(format, target.provider.wire());
+        if cross_provider || cross_format {
             if let Some(route) = &route {
                 apply_continuity(&mut target_req, route, target, &mut trace)?;
+            } else if request_has_opaque_state(&target_req) {
+                return Err(ProxyError::unsupported(
+                    "non-portable reasoning state cannot be sent to a direct cross-format target",
+                ));
             }
         }
         apply_target_overrides(&mut target_req, &target.param_overrides)?;
@@ -1828,27 +1853,61 @@ async fn order_route_targets(
 /// * `strip_with_warning` — remove the non-portable state, record it in the
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
+fn request_has_opaque_state(req: &InternalRequest) -> bool {
+    req.messages.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(part, crate::types::Part::Thinking { .. })
+                || matches!(
+                    part,
+                    crate::types::Part::ToolCall {
+                        signature: Some(_),
+                        ..
+                    }
+                )
+        })
+    })
+}
+
+fn strip_opaque_raw_body(req: &mut InternalRequest) {
+    let Some(raw) = req.raw_body.as_deref() else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        req.raw_body = None;
+        return;
+    };
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        if let Some(object) = message.as_object_mut() {
+            object.remove("reasoning_content");
+            object.remove("reasoning_signature");
+            if object.get("reasoning").is_some_and(Value::is_string) {
+                object.remove("reasoning");
+            }
+        }
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("thinking"));
+        for part in parts {
+            if let Some(object) = part.as_object_mut() {
+                object.remove("signature");
+                object.remove("thoughtSignature");
+            }
+        }
+    }
+    req.raw_body = serde_json::to_string(&value).ok();
+}
+
 fn apply_continuity(
     req: &mut InternalRequest,
     route: &db::RouteRow,
     target: &ResolvedTarget,
     trace: &mut RouteTrace,
 ) -> Result<(), ProxyError> {
-    // Identify non-portable opaque state: vendor thinking signatures and
-    // provider-specific reasoning blocks (FR-2.1).
-    let mut has_opaque = false;
-    for msg in &req.messages {
-        for p in &msg.parts {
-            match p {
-                crate::types::Part::Thinking { .. } => has_opaque = true,
-                crate::types::Part::ToolCall { signature, .. } if signature.is_some() => {
-                    has_opaque = true
-                }
-                _ => {}
-            }
-        }
-    }
-    if !has_opaque {
+    if !request_has_opaque_state(req) {
         return Ok(());
     }
 
@@ -1869,6 +1928,7 @@ fn apply_continuity(
             }
         }
     }
+    strip_opaque_raw_body(req);
     let warning = format!(
         "non-portable provider state (reasoning/thinking signatures) was removed to fall back to '{}'",
         target.model.display_name
@@ -2092,6 +2152,74 @@ async fn stream_response(
     }
 }
 
+#[derive(Default)]
+struct ToolStreamState {
+    next_index: u32,
+    upstream_indexes: std::collections::HashMap<u32, u32>,
+    ids: std::collections::HashMap<String, u32>,
+    request_id: String,
+}
+
+impl ToolStreamState {
+    fn new(request_id: &str) -> Self {
+        Self {
+            request_id: request_id.replace(['-', '_'], ""),
+            ..Default::default()
+        }
+    }
+
+    fn normalize(&mut self, events: Vec<StreamEvent>) -> Vec<StreamEvent> {
+        events
+            .into_iter()
+            .map(|event| match event {
+                StreamEvent::ToolCallStart {
+                    index,
+                    id,
+                    name,
+                    signature,
+                } => {
+                    let canonical = id
+                        .as_ref()
+                        .and_then(|id| self.ids.get(id).copied())
+                        .unwrap_or_else(|| {
+                            let next = self.next_index;
+                            self.next_index += 1;
+                            next
+                        });
+                    self.upstream_indexes.insert(index, canonical);
+
+                    let id = match id.filter(|id| !id.is_empty()) {
+                        Some(id) => {
+                            self.ids.entry(id.clone()).or_insert(canonical);
+                            Some(id)
+                        }
+                        None => {
+                            let generated = format!("call_{}_{}", self.request_id, canonical);
+                            self.ids.insert(generated.clone(), canonical);
+                            Some(generated)
+                        }
+                    };
+
+                    StreamEvent::ToolCallStart {
+                        index: canonical,
+                        id,
+                        name,
+                        signature,
+                    }
+                }
+                StreamEvent::ToolCallArgsDelta { index, args } => {
+                    let canonical = self.upstream_indexes.get(&index).copied().unwrap_or(index);
+                    StreamEvent::ToolCallArgsDelta {
+                        index: canonical,
+                        args,
+                    }
+                }
+                other => other,
+            })
+            .collect()
+    }
+}
+
 /// Emit normalized events to a streaming client. Returns false when the client
 /// disconnected while writing.
 #[allow(clippy::too_many_arguments)]
@@ -2187,6 +2315,7 @@ async fn drive_stream(
 ) {
     let mut encoder = Encoder::new(format, encoder_ctx);
     encoder.set_include_usage(req.include_usage);
+    let mut tool_stream = ToolStreamState::new(&meta.request_id);
     let mut usage = TokenUsage::default();
     let mut ttft_ms: Option<i64> = None;
     let mut status = "success";
@@ -2199,6 +2328,7 @@ async fn drive_stream(
 
     // A normal JSON response is already complete and validated before commit.
     if let Some(events) = attempt.full_events.take() {
+        let events = tool_stream.normalize(events);
         if !emit_translated_events(
             events,
             &mut encoder,
@@ -2337,6 +2467,7 @@ async fn drive_stream(
                             if payload_is_terminal(&payload, &events) {
                                 terminal_seen = true;
                             }
+                            let events = tool_stream.normalize(events);
                             if !emit_translated_events(
                                 events,
                                 &mut encoder,
@@ -2719,6 +2850,7 @@ async fn drive_aggregate(
 ) -> AggregateResult {
     let adapter = attempt.adapter.clone();
     let mut events: Vec<StreamEvent> = Vec::new();
+    let mut tool_stream = ToolStreamState::new(&encoder_ctx.request_id);
     let mut usage = TokenUsage::default();
     let mut status = "success";
     let mut status_code = 200i64;
@@ -2726,7 +2858,7 @@ async fn drive_aggregate(
     let mut committed = false;
 
     if let Some(full_events) = attempt.full_events.take() {
-        for event in full_events {
+        for event in tool_stream.normalize(full_events) {
             if let StreamEvent::Usage(value) = &event {
                 usage.merge(value);
             }
@@ -2787,7 +2919,7 @@ async fn drive_aggregate(
                                 if payload_is_terminal(&payload, &parsed) {
                                     terminal_seen = true;
                                 }
-                                for event in parsed {
+                                for event in tool_stream.normalize(parsed) {
                                     if let StreamEvent::Usage(value) = &event {
                                         usage.merge(value);
                                     }
@@ -2912,18 +3044,18 @@ async fn finalize_log(
         "unknown"
     };
 
-    // Persist prompt-cache-affinity mapping for the next turn (FR-7.3).
+    // Persist the successful session target for both affinity and opaque-state
+    // provenance. Affinity only changes routing when its route switch is enabled;
+    // provenance is read by FR-2.11 to identify first-attempt provider changes.
     if let (Some(session), Some(route_id)) = (&meta.session, &meta.route_id) {
-        if let Some(route) = snap.routes.get(route_id) {
-            if (route.cache_affinity != 0 || route.sticky_routing != 0) && status == "success" {
-                state.sticky_remember(
-                    session,
-                    format!(
-                        "{}|{}|{}",
-                        route_id, attempt.target.account.id, attempt.target.model.id
-                    ),
-                );
-            }
+        if snap.routes.contains_key(route_id) && status == "success" {
+            state.sticky_remember(
+                session,
+                format!(
+                    "{}|{}|{}",
+                    route_id, attempt.target.account.id, attempt.target.model.id
+                ),
+            );
         }
     }
 
@@ -3325,6 +3457,145 @@ mod route_policy_tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             opaque_state_plugin: String::new(),
         }
+    }
+
+    fn account() -> db::AccountRow {
+        db::AccountRow {
+            id: "acc_test".into(),
+            provider_id: "prov_test".into(),
+            label: "test".into(),
+            secret_enc: String::new(),
+            key_mask: String::new(),
+            status: "healthy".into(),
+            cooldown_until: None,
+            quota_reset_at: None,
+            quota_type: "none".into(),
+            quota_window_s: None,
+            soft_quota_usd: None,
+            priority: 1,
+            weight: 1,
+            last_error: None,
+            last_probe_at: None,
+            circuit_open_until: None,
+            consecutive_failures: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn target() -> ResolvedTarget {
+        ResolvedTarget {
+            account: account(),
+            model: model(serde_json::json!({})),
+            provider: provider(serde_json::json!({})),
+            route_target_id: Some("rt_test".into()),
+            priority: 1,
+            weight: 1,
+            predicate: TargetPredicate::default(),
+            param_overrides: Value::Null,
+        }
+    }
+
+    #[test]
+    fn tool_stream_indexes_are_canonical_across_chunk_local_resets() {
+        let mut state = ToolStreamState::new("req_test");
+        let first = state.normalize(vec![
+            StreamEvent::TextDelta("a".into()),
+            StreamEvent::ToolCallStart {
+                index: 3,
+                id: Some("call_a".into()),
+                name: "alpha".into(),
+                signature: None,
+            },
+            StreamEvent::ToolCallArgsDelta {
+                index: 3,
+                args: "{}".into(),
+            },
+        ]);
+        let second = state.normalize(vec![
+            StreamEvent::TextDelta("b".into()),
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: None,
+                name: "beta".into(),
+                signature: None,
+            },
+            StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                args: "{\"x\":1}".into(),
+            },
+        ]);
+
+        assert!(matches!(
+            &first[1],
+            StreamEvent::ToolCallStart { index: 0, id: Some(id), .. } if id == "call_a"
+        ));
+        assert!(matches!(
+            &first[2],
+            StreamEvent::ToolCallArgsDelta { index: 0, .. }
+        ));
+        assert!(matches!(
+            &second[1],
+            StreamEvent::ToolCallStart { index: 1, id: Some(id), .. }
+                if id == "call_reqtest_1"
+        ));
+        assert!(matches!(
+            &second[2],
+            StreamEvent::ToolCallArgsDelta { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn portability_strip_updates_canonical_and_raw_request_state() {
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![
+                crate::types::Part::Thinking {
+                    text: "hidden".into(),
+                    signature: Some("sig".into()),
+                },
+                crate::types::Part::Text("answer".into()),
+            ],
+        }];
+        req.raw_body = Some(
+            serde_json::json!({
+                "model":"route",
+                "messages":[{
+                    "role":"assistant",
+                    "content":[
+                        {"type":"thinking","thinking":"hidden","signature":"sig"},
+                        {"type":"text","text":"answer"}
+                    ]
+                }]
+            })
+            .to_string(),
+        );
+
+        let route = route(serde_json::json!({}));
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        apply_continuity(&mut req, &route, &target, &mut trace).unwrap();
+
+        assert!(!request_has_opaque_state(&req));
+        let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(raw["messages"][0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(raw["messages"][0]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn portability_reject_refuses_opaque_state() {
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![crate::types::Part::Thinking {
+                text: "hidden".into(),
+                signature: Some("sig".into()),
+            }],
+        }];
+        let mut route = route(serde_json::json!({}));
+        route.portability_policy = "reject".into();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        assert!(apply_continuity(&mut req, &route, &target(), &mut trace).is_err());
     }
 
     #[test]
