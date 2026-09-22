@@ -3300,7 +3300,6 @@ pub async fn export_config(
             "description": r.description,
             "strategy": r.strategy,
             "fallback_triggers": serde_json::from_str::<Value>(&r.fallback_triggers).unwrap_or(json!({})),
-            "continuity_policy": r.continuity_policy,
             "portability_policy": r.portability_policy,
             "sticky_routing": r.sticky_routing != 0,
             "cache_affinity": r.cache_affinity != 0,
@@ -3617,18 +3616,19 @@ pub async fn import_config(
     // Routes (upsert by name) + targets.
     for r in routes {
         let name = r["name"].as_str().unwrap_or("");
+        let legacy_reject = r["continuity_policy"].as_str() == Some("error");
         let body = RouteBody {
             name: name.to_string(),
             description: r["description"].as_str().unwrap_or("").to_string(),
             strategy: r["strategy"].as_str().unwrap_or("priority").to_string(),
             fallback_triggers: r["fallback_triggers"].clone(),
-            continuity_policy: r["continuity_policy"]
-                .as_str()
-                .unwrap_or("strip")
-                .to_string(),
             portability_policy: r["portability_policy"]
                 .as_str()
-                .unwrap_or("strip_with_warning")
+                .unwrap_or(if legacy_reject {
+                    "reject"
+                } else {
+                    "strip_with_warning"
+                })
                 .to_string(),
             sticky_routing: r["sticky_routing"].as_bool().unwrap_or(false),
             cache_affinity: r["cache_affinity"].as_bool().unwrap_or(false),
@@ -3663,7 +3663,6 @@ pub async fn import_config(
                     &body.description,
                     &body.strategy,
                     body.fallback_triggers.clone(),
-                    &body.continuity_policy,
                     &body.portability_policy,
                     body.sticky_routing,
                     body.cache_affinity,
@@ -3689,7 +3688,6 @@ pub async fn import_config(
                         } else {
                             body.fallback_triggers.clone()
                         },
-                        continuity_policy: &body.continuity_policy,
                         portability_policy: &body.portability_policy,
                         sticky_routing: body.sticky_routing,
                         cache_affinity: body.cache_affinity,
