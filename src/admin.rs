@@ -1241,6 +1241,7 @@ async fn discover_models_native(
     let ctx = UpstreamContext {
         provider,
         model: &dummy_model,
+        account_id: Some(account.id.as_str()),
         credential,
     };
     let parsed_url =
@@ -1355,6 +1356,7 @@ pub async fn test_provider(
     let ctx = UpstreamContext {
         provider: &provider,
         model: &model,
+        account_id: Some(account.id.as_str()),
         credential,
     };
     let mut internal = crate::types::InternalRequest {
