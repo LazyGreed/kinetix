@@ -650,7 +650,7 @@ pub async fn run(
                     format!("request uses a feature that cannot be translated: {msg}"),
                 ));
             }
-            if let Err(error) = check_thinking_translation(&target, &target_req) {
+            if let Err(error) = check_thinking_translation(&target.model, &target_req) {
                 trace.finish("rejected");
                 state
                     .live
@@ -1890,7 +1890,7 @@ fn thinking_level_key(level: crate::types::ThinkingLevel) -> &'static str {
 }
 
 fn check_thinking_translation(
-    target: &ResolvedTarget,
+    model: &db::ModelRow,
     req: &InternalRequest,
 ) -> Result<(), ProxyError> {
     let Some(level) = req.thinking else {
@@ -1900,12 +1900,12 @@ fn check_thinking_translation(
         return Ok(());
     }
     let key = thinking_level_key(level);
-    if target.model.thinking().levels.contains_key(key) {
+    if model.thinking().levels.contains_key(key) {
         return Ok(());
     }
     Err(ProxyError::unsupported(format!(
         "thinking level '{key}' has no configured mapping for model '{}'",
-        target.model.display_name
+        model.display_name
     )))
 }
 
@@ -3305,6 +3305,39 @@ mod route_policy_tests {
             extra: Default::default(),
             raw_body: Some(r#"{"model":"route","temperature":0.1}"#.into()),
         }
+    }
+
+    fn model(thinking_map: Value) -> db::ModelRow {
+        db::ModelRow {
+            id: "model_test".into(),
+            provider_id: "prov_test".into(),
+            upstream_id: "upstream".into(),
+            display_name: "Model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: thinking_map.to_string(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
+    #[test]
+    fn translated_thinking_requires_an_explicit_model_mapping() {
+        let mut req = request();
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+
+        assert!(check_thinking_translation(&model(json!({})), &req).is_err());
+        assert!(check_thinking_translation(
+            &model(json!({"levels":{"high":{"reasoning_effort":"high"}}})),
+            &req,
+        )
+        .is_ok());
     }
 
     #[test]
