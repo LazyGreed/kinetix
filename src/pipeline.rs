@@ -444,27 +444,40 @@ pub async fn run(
         .min(5)
         .max(1);
 
+    // Session target provenance is retained even when sticky/cache affinity is
+    // disabled. It lets the portability layer identify a first-attempt provider
+    // boundary for opaque continuation state.
+    let session_origin_key = session
+        .as_deref()
+        .and_then(|session| state.sticky_lookup(session, STICKY_TTL));
+    let session_origin_provider = route.as_ref().and_then(|route| {
+        session_origin_key.as_ref().and_then(|key| {
+            targets
+                .iter()
+                .find(|target| target_key(route, target) == *key)
+                .map(|target| target.provider.id.clone())
+        })
+    });
+
     // Sticky routing and prompt-cache affinity share the same bounded session
     // mapping: both prefer the last successful target while still allowing
     // ordinary health/fallback logic to move away from it.
-    if let (Some(route), Some(session)) = (&route, &session) {
+    if let (Some(route), Some(sticky_key)) = (&route, session_origin_key.as_ref()) {
         if route.cache_affinity != 0 || route.sticky_routing != 0 {
-            if let Some(sticky_key) = state.sticky_lookup(session, STICKY_TTL) {
-                if let Some(pos) = targets
-                    .iter()
-                    .position(|t| target_key(route, t) == sticky_key)
-                {
-                    targets.rotate_left(pos);
-                    trace.step(
-                        "candidate",
-                        Some(targets[0].account.label.clone()),
-                        if route.sticky_routing != 0 {
-                            "sticky-routing: previous session target promoted (FR-7.5)"
-                        } else {
-                            "cache-affinity: session target promoted (FR-7.3)"
-                        },
-                    );
-                }
+            if let Some(pos) = targets
+                .iter()
+                .position(|t| target_key(route, t) == *sticky_key)
+            {
+                targets.rotate_left(pos);
+                trace.step(
+                    "candidate",
+                    Some(targets[0].account.label.clone()),
+                    if route.sticky_routing != 0 {
+                        "sticky-routing: previous session target promoted (FR-7.5)"
+                    } else {
+                        "cache-affinity: session target promoted (FR-7.3)"
+                    },
+                );
             }
         }
     }
@@ -591,16 +604,28 @@ pub async fn run(
         // continuity transforms must never leak into a later fallback target.
         let mut target_req = req.clone();
 
-        // Continuity / portability applies only when this attempt crosses
-        // provider boundaries. Switching credentials inside one provider pool
-        // must not strip conversation state.
+        // Portability applies on cross-format translation, on fallback across
+        // providers, and on the first attempt when session provenance shows the
+        // previous turn came from a different provider.
         let cross_provider = previous_provider_id
             .as_deref()
+            .or_else(|| {
+                if attempts_done == 0 {
+                    session_origin_provider.as_deref()
+                } else {
+                    None
+                }
+            })
             .map(|id| id != target.provider.id)
             .unwrap_or(false);
-        if cross_provider {
+        let cross_format = !passthrough::is_passthrough(format, target.provider.wire());
+        if cross_provider || cross_format {
             if let Some(route) = &route {
                 apply_continuity(&mut target_req, route, target, &mut trace)?;
+            } else if request_has_opaque_state(&target_req) {
+                return Err(ProxyError::unsupported(
+                    "non-portable reasoning state cannot be sent to a direct cross-format target",
+                ));
             }
         }
         apply_target_overrides(&mut target_req, &target.param_overrides)?;
@@ -1828,27 +1853,54 @@ async fn order_route_targets(
 /// * `strip_with_warning` — remove the non-portable state, record it in the
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
+fn request_has_opaque_state(req: &InternalRequest) -> bool {
+    req.messages.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(part, crate::types::Part::Thinking { .. })
+                || matches!(
+                    part,
+                    crate::types::Part::ToolCall {
+                        signature: Some(_),
+                        ..
+                    }
+                )
+        })
+    })
+}
+
+fn strip_opaque_raw_body(req: &mut InternalRequest) {
+    let Some(raw) = req.raw_body.as_deref() else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        req.raw_body = None;
+        return;
+    };
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("thinking"));
+        for part in parts {
+            if let Some(object) = part.as_object_mut() {
+                object.remove("signature");
+                object.remove("thoughtSignature");
+            }
+        }
+    }
+    req.raw_body = serde_json::to_string(&value).ok();
+}
+
 fn apply_continuity(
     req: &mut InternalRequest,
     route: &db::RouteRow,
     target: &ResolvedTarget,
     trace: &mut RouteTrace,
 ) -> Result<(), ProxyError> {
-    // Identify non-portable opaque state: vendor thinking signatures and
-    // provider-specific reasoning blocks (FR-2.1).
-    let mut has_opaque = false;
-    for msg in &req.messages {
-        for p in &msg.parts {
-            match p {
-                crate::types::Part::Thinking { .. } => has_opaque = true,
-                crate::types::Part::ToolCall { signature, .. } if signature.is_some() => {
-                    has_opaque = true
-                }
-                _ => {}
-            }
-        }
-    }
-    if !has_opaque {
+    if !request_has_opaque_state(req) {
         return Ok(());
     }
 
@@ -1869,6 +1921,7 @@ fn apply_continuity(
             }
         }
     }
+    strip_opaque_raw_body(req);
     let warning = format!(
         "non-portable provider state (reasoning/thinking signatures) was removed to fall back to '{}'",
         target.model.display_name
@@ -2989,18 +3042,18 @@ async fn finalize_log(
         "unknown"
     };
 
-    // Persist prompt-cache-affinity mapping for the next turn (FR-7.3).
+    // Persist the successful session target for both affinity and opaque-state
+    // provenance. Affinity only changes routing when its route switch is enabled;
+    // provenance is read by FR-2.11 to identify first-attempt provider changes.
     if let (Some(session), Some(route_id)) = (&meta.session, &meta.route_id) {
-        if let Some(route) = snap.routes.get(route_id) {
-            if (route.cache_affinity != 0 || route.sticky_routing != 0) && status == "success" {
-                state.sticky_remember(
-                    session,
-                    format!(
-                        "{}|{}|{}",
-                        route_id, attempt.target.account.id, attempt.target.model.id
-                    ),
-                );
-            }
+        if snap.routes.contains_key(route_id) && status == "success" {
+            state.sticky_remember(
+                session,
+                format!(
+                    "{}|{}|{}",
+                    route_id, attempt.target.account.id, attempt.target.model.id
+                ),
+            );
         }
     }
 
