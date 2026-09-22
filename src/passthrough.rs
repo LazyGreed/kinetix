@@ -39,6 +39,7 @@ pub fn rewrite_model(
     raw: &str,
     upstream_id: &str,
     force_stream: bool,
+    force_usage: bool,
     wire: WireFormat,
 ) -> Option<String> {
     let mut v: Value = serde_json::from_str(raw).ok()?;
@@ -46,12 +47,21 @@ pub fn rewrite_model(
     obj.insert("model".to_string(), Value::String(upstream_id.to_string()));
     if force_stream {
         obj.insert("stream".to_string(), Value::Bool(true));
-        // stream_options is OpenAI-specific. Anthropic rejects it, so only add
-        // the usage request on the wire format that defines the field.
-        if wire == WireFormat::Openai {
-            obj.entry("stream_options".to_string())
-                .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+    }
+    // OpenAI-compatible upstream usage is an internal accounting concern.
+    // Deep-set include_usage=true even when the client explicitly sent false;
+    // the response path filters that internal override from client output.
+    if force_usage && wire == WireFormat::Openai {
+        let stream_options = obj
+            .entry("stream_options".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !stream_options.is_object() {
+            *stream_options = serde_json::json!({});
         }
+        stream_options
+            .as_object_mut()
+            .unwrap()
+            .insert("include_usage".to_string(), Value::Bool(true));
     }
     serde_json::to_string(&v).ok()
 }
@@ -85,7 +95,7 @@ mod tests {
             "vendor_extension": {"keep": [1, 2, 3]}
         })
         .to_string();
-        let out = rewrite_model(&raw, "gemini-3.6-flash", false, WireFormat::Openai).unwrap();
+        let out = rewrite_model(&raw, "gemini-3.6-flash", false, false, WireFormat::Openai).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["model"], "gemini-3.6-flash");
         assert_eq!(v["vendor_extension"]["keep"][2], 3);
@@ -99,11 +109,26 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         })
         .to_string();
-        let out = rewrite_model(&raw, "mimo-v2.5-free", true, WireFormat::Openai).unwrap();
+        let out = rewrite_model(&raw, "mimo-v2.5-free", true, true, WireFormat::Openai).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["stream"], true);
         assert_eq!(v["stream_options"]["include_usage"], true);
     }
+    #[test]
+    fn force_usage_overrides_explicit_false_without_changing_client_intent() {
+        let raw = json!({
+            "model": "free",
+            "stream": true,
+            "stream_options": { "include_usage": false, "other": "keep" },
+            "messages": []
+        })
+        .to_string();
+        let out = rewrite_model(&raw, "upstream", false, true, WireFormat::Openai).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert_eq!(v["stream_options"]["other"], "keep");
+    }
+
     #[test]
     fn anthropic_force_stream_does_not_add_openai_stream_options() {
         let raw = json!({
@@ -112,7 +137,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         })
         .to_string();
-        let out = rewrite_model(&raw, "claude-upstream", true, WireFormat::Anthropic).unwrap();
+        let out = rewrite_model(&raw, "claude-upstream", true, true, WireFormat::Anthropic).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["stream"], true);
         assert!(v.get("stream_options").is_none());
