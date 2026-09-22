@@ -592,6 +592,8 @@ pub struct BootstrapPrices {
     #[serde(default)]
     pub cached_per_1m: Option<f64>,
     #[serde(default)]
+    pub cache_write_per_1m: Option<f64>,
+    #[serde(default)]
     pub thinking_per_1m: Option<f64>,
 }
 
