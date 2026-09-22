@@ -33,6 +33,44 @@ models_path = "/models"
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { levels = { low = { "reasoning_effort" = "low" }, medium = { "reasoning_effort" = "medium" }, high = { "reasoning_effort" = "high" } } }
 
+  [[providers.models]]
+  upstream_id = "syn-openai-a"
+  display_name = "Synthetic OpenAI A"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+  [[providers.models]]
+  upstream_id = "syn-openai-b"
+  display_name = "Synthetic OpenAI B"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+[[providers]]
+name = "Synth OpenAI Truncated"
+base_url = "http://127.0.0.1:9199/openai/v1"
+wire_format = "openai"
+auth_scheme = "bearer"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-openai-truncated"
+  api_key = "smoke-openai-truncated-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-truncated-openai"
+  display_name = "Synthetic Truncated OpenAI"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
 [[providers]]
 name = "Synth Gemini"
 base_url = "http://127.0.0.1:9199/gemini/v1beta"
@@ -107,6 +145,22 @@ capability_mode = "permissive"
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { budget_field = "thinking.budget_tokens", levels = { low = 512, medium = 2048, high = 4096 } }
 
+  [[providers.models]]
+  upstream_id = "syn-anthropic-a"
+  display_name = "Synthetic Anthropic A"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
+  [[providers.models]]
+  upstream_id = "syn-anthropic-b"
+  display_name = "Synthetic Anthropic B"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "tool_calling"]
+
 [[providers]]
 name = "Synth Malformed"
 base_url = "http://127.0.0.1:9199/anthropic/v1"
@@ -152,6 +206,38 @@ capability_mode = "permissive"
   context_window = 200000
   max_output_tokens = 8192
   capabilities = ["text", "tool_calling"]
+
+[[routes]]
+name = "syn-sticky-openai"
+strategy = "round-robin"
+sticky_routing = true
+max_attempts = 2
+
+  [[routes.targets]]
+  model = "Synth OpenAI/syn-openai-a"
+  priority = 1
+  weight = 1
+
+  [[routes.targets]]
+  model = "Synth OpenAI/syn-openai-b"
+  priority = 1
+  weight = 1
+
+[[routes]]
+name = "syn-sticky-anthropic"
+strategy = "round-robin"
+sticky_routing = true
+max_attempts = 2
+
+  [[routes.targets]]
+  model = "Synth Anthropic/syn-anthropic-a"
+  priority = 1
+  weight = 1
+
+  [[routes.targets]]
+  model = "Synth Anthropic/syn-anthropic-b"
+  priority = 1
+  weight = 1
 
 [[routes]]
 name = "syn-fallback"
