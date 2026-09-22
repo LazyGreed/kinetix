@@ -107,6 +107,21 @@ capability_mode = "permissive"
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { budget_field = "thinking.budget_tokens", levels = { low = 512, medium = 2048, high = 4096 } }
 
+[[providers]]
+name = "Synth Malformed"
+base_url = "http://127.0.0.1:9199/anthropic/v1"
+wire_format = "anthropic"
+auth_scheme = "custom_header"
+custom_header_name = "x-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-malformed"
+  api_key = "smoke-malformed-key"
+  priority = 1
+  quota_type = "none"
+
   [[providers.models]]
   upstream_id = "syn-malformed"
   display_name = "Synthetic Malformed Anthropic"
@@ -114,6 +129,21 @@ capability_mode = "permissive"
   context_window = 200000
   max_output_tokens = 8192
   capabilities = ["text", "tool_calling"]
+
+[[providers]]
+name = "Synth Truncated"
+base_url = "http://127.0.0.1:9199/anthropic/v1"
+wire_format = "anthropic"
+auth_scheme = "custom_header"
+custom_header_name = "x-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-truncated"
+  api_key = "smoke-truncated-key"
+  priority = 1
+  quota_type = "none"
 
   [[providers.models]]
   upstream_id = "syn-truncated"
