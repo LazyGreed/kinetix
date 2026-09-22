@@ -1021,9 +1021,13 @@ impl RouteRow {
     /// The configured policy for non-portable opaque state (FR-2.11).
     /// Accepts `reject` or `strip_with_warning`.
     pub fn portability(&self) -> &str {
-        match self.portability_policy.as_str() {
-            "reject" => "reject",
-            _ => "strip_with_warning",
+        // continuity_policy is the legacy predecessor of portability_policy.
+        // Preserve existing persisted routes: legacy "error" means reject;
+        // every other legacy value degrades to the explicit warning path.
+        if self.portability_policy == "reject" || self.continuity_policy == "error" {
+            "reject"
+        } else {
+            "strip_with_warning"
         }
     }
 }
