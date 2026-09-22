@@ -36,6 +36,16 @@ def record_result(client, upstream, capability, passed, detail="", duration_ms=0
     print(f"  [{status}] {client:<24} | {upstream:<14} | {capability:<18} ({duration_ms}ms) {detail}")
 
 
+def urlopen(req, timeout=15):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"HTTP {error.code} {req.full_url}: {body}"
+        ) from error
+
+
 def read_sse_events(response):
     """Parse raw SSE stream into a list of (event_type, data_dict_or_str)."""
     events = []
@@ -96,7 +106,7 @@ def test_pi_plain_stream(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     # Check for text chunks and [DONE]
@@ -138,7 +148,7 @@ def test_pi_tool_use(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     # Reassemble tool calls
@@ -188,7 +198,7 @@ def test_pi_multi_turn(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     has_chunks = any(isinstance(e[1], dict) and e[1].get("choices") for e in events)
@@ -217,7 +227,7 @@ def test_pi_session_affinity(upstream_model):
             "X-Session-Affinity": session_id,
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     passed = any(isinstance(e[1], dict) and e[1].get("choices") for e in events)
@@ -242,7 +252,7 @@ def test_pi_sync_aggregation(upstream_model):
             "User-Agent": "pi (linux; x86_64)",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
     passed = data.get("object") == "chat.completion" and len(data.get("choices", [])) > 0
@@ -272,7 +282,7 @@ def test_responses_plain_stream(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -310,7 +320,7 @@ def test_responses_tool_use(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -340,7 +350,7 @@ def test_responses_multi_turn(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -368,7 +378,7 @@ def test_responses_session_affinity(upstream_model):
             "X-Kinetix-Session": session_id,
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     passed = any(e[0] == "response.completed" for e in events)
@@ -393,7 +403,7 @@ def test_responses_sync_aggregation(upstream_model):
             "User-Agent": "codex-cli/0.125.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
     passed = data.get("object") == "response" and data.get("status") == "completed" and "output" in data
@@ -436,7 +446,7 @@ def test_anthropic_count_tokens(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
         mode = resp.headers.get("x-kinetix-token-count")
 
@@ -475,7 +485,7 @@ def test_anthropic_plain_stream(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -516,7 +526,7 @@ def test_anthropic_tool_use(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -558,7 +568,7 @@ def test_anthropic_multi_turn(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     event_names = [e[0] for e in events if e[0]]
@@ -589,7 +599,7 @@ def test_anthropic_session_affinity(upstream_model):
             "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
 
     passed = any(e[0] == "message_stop" for e in events)
@@ -616,7 +626,7 @@ def test_anthropic_sync_aggregation(upstream_model):
             "User-Agent": "claude-code/0.2.0",
         }
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
     passed = data.get("type") == "message" and data.get("role") == "assistant" and len(data.get("content", [])) > 0
@@ -652,7 +662,7 @@ def test_pi_openrouter_affinity(upstream_model):
             "X-Session-Id": session_id,
         },
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
     passed = data.get("object") == "chat.completion"
     record_result("Pi (OpenAI Chat)", upstream_model, "affinity_openrouter", passed, session_id, int((time.time()-t0)*1000))
@@ -674,7 +684,7 @@ def test_pi_parallel_tools(upstream_model):
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
     names = set()
     for _, ev in events:
@@ -706,7 +716,7 @@ def test_pi_vision(upstream_model):
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
     passed = bool(data.get("choices"))
     record_result("Pi (OpenAI Chat)", upstream_model, "vision", passed, "data-url image", int((time.time()-t0)*1000))
@@ -725,7 +735,7 @@ def test_pi_thinking(upstream_model):
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
     passed = bool(data.get("choices"))
     record_result("Pi (OpenAI Chat)", upstream_model, "reasoning_control", passed, "reasoning_effort=high", int((time.time()-t0)*1000))
@@ -744,7 +754,7 @@ def test_unknown_client_field_is_dropped(upstream_model):
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
     passed = bool(data.get("choices"))
     record_result("Pi (OpenAI Chat)", upstream_model, "unknown_fields", passed, "not leaked to Gemini", int((time.time()-t0)*1000))
@@ -758,7 +768,7 @@ def test_route_fallback():
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
         fallback = resp.headers.get("x-kinetix-fallback")
     passed = bool(data.get("choices")) and fallback == "1"
@@ -791,7 +801,7 @@ def test_claude_native_protocol():
         data=json.dumps(payload).encode(),
         headers=_claude_headers("claude-protocol-session"),
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
     passed = data.get("type") == "message"
     record_result("Claude Code", "syn-anthropic", "protocol_headers", passed, "version+beta+session", int((time.time()-t0)*1000))
@@ -808,7 +818,7 @@ def test_claude_exact_count_tokens():
         data=json.dumps(payload).encode(),
         headers=_claude_headers("claude-count-session"),
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
         mode = resp.headers.get("x-kinetix-token-count")
     passed = data.get("input_tokens") == 123 and mode == "exact"
@@ -832,7 +842,7 @@ def test_claude_parallel_tools():
         data=json.dumps(payload).encode(),
         headers=_claude_headers("claude-tools-session"),
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
     names = {
         ev.get("content_block", {}).get("name")
@@ -865,7 +875,7 @@ def test_claude_vision_and_thinking():
         data=json.dumps(payload).encode(),
         headers=_claude_headers("claude-vision-session"),
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
     passed = data.get("type") == "message"
     record_result("Claude Code", "syn-anthropic", "vision+thinking", passed, "native blocks", int((time.time()-t0)*1000))
@@ -884,7 +894,7 @@ def test_anthropic_broken_stream(model, capability):
         data=json.dumps(payload).encode(),
         headers=_claude_headers("claude-broken-session"),
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urlopen(req, timeout=15) as resp:
         events = read_sse_events(resp)
     passed = any(name == "error" for name, _ in events)
     record_result("Claude Code", model, capability, passed, f"events={len(events)}", int((time.time()-t0)*1000))
