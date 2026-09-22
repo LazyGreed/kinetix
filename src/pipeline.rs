@@ -478,9 +478,10 @@ pub async fn run(
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
     for target in targets.iter() {
-        if let (Some(skip), Some(target_id)) =
-            (skip_logical_target.as_deref(), target.route_target_id.as_deref())
-        {
+        if let (Some(skip), Some(target_id)) = (
+            skip_logical_target.as_deref(),
+            target.route_target_id.as_deref(),
+        ) {
             if skip == target_id {
                 trace.step(
                     "skip",
@@ -553,10 +554,7 @@ pub async fn run(
                     None,
                 );
                 let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(ProxyError::rate_limited(
-                    "account soft quota reached",
-                    None,
-                ));
+                return Err(ProxyError::rate_limited("account soft quota reached", None));
             }
             continue;
         }
@@ -606,7 +604,11 @@ pub async fn run(
             }
         }
         apply_target_overrides(&mut target_req, &target.param_overrides)?;
-        if target.param_overrides.as_object().is_some_and(|obj| !obj.is_empty()) {
+        if target
+            .param_overrides
+            .as_object()
+            .is_some_and(|obj| !obj.is_empty())
+        {
             trace.step(
                 "candidate",
                 Some(target.account.label.clone()),
@@ -860,10 +862,7 @@ pub async fn run(
                     trace.step(
                         "attempt",
                         Some(target.account.label.clone()),
-                        format!(
-                            "HTTP {status}; fallback disabled for {:?}",
-                            failure.kind
-                        ),
+                        format!("HTTP {status}; fallback disabled for {:?}", failure.kind),
                     );
                     trace.finish("failed");
                     state.live.finish(
@@ -1089,10 +1088,7 @@ pub(crate) fn apply_provider_failure_rules(
     failure
 }
 
-fn apply_target_overrides(
-    req: &mut InternalRequest,
-    overrides: &Value,
-) -> Result<(), ProxyError> {
+fn apply_target_overrides(req: &mut InternalRequest, overrides: &Value) -> Result<(), ProxyError> {
     let Some(obj) = overrides.as_object() else {
         if overrides.is_null() {
             return Ok(());
@@ -1144,7 +1140,9 @@ fn apply_target_overrides(
         let mut parsed: Value = serde_json::from_str(raw)
             .map_err(|_| ProxyError::bad_request("client request body is not valid JSON"))?;
         let Some(raw_obj) = parsed.as_object_mut() else {
-            return Err(ProxyError::bad_request("client request body must be a JSON object"));
+            return Err(ProxyError::bad_request(
+                "client request body must be a JSON object",
+            ));
         };
         for (key, value) in obj {
             raw_obj.insert(key.clone(), value.clone());
@@ -1552,7 +1550,9 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             target.provider.name
         )),
         FailureKind::TargetError => match failure.status {
-            Some(403) => ProxyError::new(crate::types::ErrorKind::Forbidden, failure.message.clone()),
+            Some(403) => {
+                ProxyError::new(crate::types::ErrorKind::Forbidden, failure.message.clone())
+            }
             Some(404) => ProxyError::not_found(failure.message.clone()),
             _ => ProxyError::upstream(failure.message.clone()),
         },
@@ -2872,9 +2872,7 @@ async fn finalize_log(
     // Persist prompt-cache-affinity mapping for the next turn (FR-7.3).
     if let (Some(session), Some(route_id)) = (&meta.session, &meta.route_id) {
         if let Some(route) = snap.routes.get(route_id) {
-            if (route.cache_affinity != 0 || route.sticky_routing != 0)
-                && status == "success"
-            {
+            if (route.cache_affinity != 0 || route.sticky_routing != 0) && status == "success" {
                 state.sticky_remember(
                     session,
                     format!(
@@ -3381,4 +3379,3 @@ mod route_policy_tests {
         assert_eq!(classified.kind, FailureKind::RateLimit);
     }
 }
-
