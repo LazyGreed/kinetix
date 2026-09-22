@@ -859,9 +859,7 @@ fn events_from_gemini(v: &Value) -> Vec<StreamEvent> {
         events.push(StreamEvent::Usage(TokenUsage {
             input: usage.get("promptTokenCount").and_then(Value::as_u64),
             output,
-            cached: usage
-                .get("cachedContentTokenCount")
-                .and_then(Value::as_u64),
+            cached: usage.get("cachedContentTokenCount").and_then(Value::as_u64),
             cache_write: None,
             thinking,
         }));
