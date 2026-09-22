@@ -113,7 +113,9 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
             extra.insert(k.clone(), v.clone());
         }
     }
-    translation_issues.extend(crate::frontends::resolve_tool_result_names(&mut out_messages));
+    translation_issues.extend(crate::frontends::resolve_tool_result_names(
+        &mut out_messages,
+    ));
     crate::frontends::attach_translation_issues(&mut extra, translation_issues);
 
     Ok(InternalRequest {
@@ -132,12 +134,13 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     })
 }
 
-fn nested_translation_issues(
-    obj: &serde_json::Map<String, Value>,
-) -> Vec<String> {
+fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String> {
     let mut issues = Vec::new();
 
-    if obj.get("instructions").is_some_and(|value| !value.is_string()) {
+    if obj
+        .get("instructions")
+        .is_some_and(|value| !value.is_string())
+    {
         issues.push("instructions has a non-text structure that cannot be translated".to_string());
     }
 
@@ -149,9 +152,7 @@ fn nested_translation_issues(
                 "" | "message" => {
                     let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                     if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
-                        issues.push(format!(
-                            "input[{item_index}] has unsupported role '{role}'"
-                        ));
+                        issues.push(format!("input[{item_index}] has unsupported role '{role}'"));
                     }
                     inspect_responses_content(
                         &format!("input[{item_index}].content"),
@@ -169,7 +170,10 @@ fn nested_translation_issues(
 
     if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
         for (tool_index, tool) in tools.iter().enumerate() {
-            let kind = tool.get("type").and_then(Value::as_str).unwrap_or("function");
+            let kind = tool
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("function");
             if kind != "function" {
                 issues.push(format!(
                     "tools[{tool_index}] type '{kind}' has no canonical cross-format representation"
