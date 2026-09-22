@@ -54,6 +54,22 @@ fn openai_plain_chat_and_system_hoist() {
 }
 
 #[test]
+fn openai_stream_options_include_usage_is_preserved() {
+    let requested = openai(
+        r#"{"model":"m","stream":true,"stream_options":{"include_usage":true},"messages":[]}"#,
+    );
+    assert!(requested.include_usage);
+
+    let defaulted = openai(r#"{"model":"m","stream":true,"messages":[]}"#);
+    assert!(!defaulted.include_usage);
+
+    let explicit_false = openai(
+        r#"{"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]}"#,
+    );
+    assert!(!explicit_false.include_usage);
+}
+
+#[test]
 fn openai_parallel_tool_calls_and_tool_result() {
     let req = openai(
         r#"{
