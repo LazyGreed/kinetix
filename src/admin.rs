@@ -1411,7 +1411,9 @@ pub async fn test_provider(
             let latency = started.elapsed().as_millis() as i64;
             if !(200..300).contains(&status) {
                 let text = resp.text().await.unwrap_or_default();
-                let failure = adapter.classify_error(status, &text, &axum::http::HeaderMap::new());
+                let native = adapter.classify_error(status, &text, &axum::http::HeaderMap::new());
+                let failure =
+                    crate::pipeline::apply_provider_failure_rules(&provider, status, &text, native);
                 return Ok(Json(json!({
                     "ok": false, "status": status, "latency_ms": latency,
                     "error": failure.message,
