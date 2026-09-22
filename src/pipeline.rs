@@ -2092,6 +2092,79 @@ async fn stream_response(
     }
 }
 
+#[derive(Default)]
+struct ToolStreamState {
+    next_index: u32,
+    upstream_indexes: std::collections::HashMap<u32, u32>,
+    ids: std::collections::HashMap<String, u32>,
+    request_id: String,
+}
+
+impl ToolStreamState {
+    fn new(request_id: &str) -> Self {
+        Self {
+            request_id: request_id.replace(['-', '_'], ""),
+            ..Default::default()
+        }
+    }
+
+    fn normalize(&mut self, events: Vec<StreamEvent>) -> Vec<StreamEvent> {
+        events
+            .into_iter()
+            .map(|event| match event {
+                StreamEvent::ToolCallStart {
+                    index,
+                    id,
+                    name,
+                    signature,
+                } => {
+                    let canonical = id
+                        .as_ref()
+                        .and_then(|id| self.ids.get(id).copied())
+                        .unwrap_or_else(|| {
+                            let next = self.next_index;
+                            self.next_index += 1;
+                            next
+                        });
+                    self.upstream_indexes.insert(index, canonical);
+
+                    let id = match id.filter(|id| !id.is_empty()) {
+                        Some(id) => {
+                            self.ids.entry(id.clone()).or_insert(canonical);
+                            Some(id)
+                        }
+                        None => {
+                            let generated =
+                                format!("call_{}_{}", self.request_id, canonical);
+                            self.ids.insert(generated.clone(), canonical);
+                            Some(generated)
+                        }
+                    };
+
+                    StreamEvent::ToolCallStart {
+                        index: canonical,
+                        id,
+                        name,
+                        signature,
+                    }
+                }
+                StreamEvent::ToolCallArgsDelta { index, args } => {
+                    let canonical = self
+                        .upstream_indexes
+                        .get(&index)
+                        .copied()
+                        .unwrap_or(index);
+                    StreamEvent::ToolCallArgsDelta {
+                        index: canonical,
+                        args,
+                    }
+                }
+                other => other,
+            })
+            .collect()
+    }
+}
+
 /// Emit normalized events to a streaming client. Returns false when the client
 /// disconnected while writing.
 #[allow(clippy::too_many_arguments)]
@@ -2187,6 +2260,7 @@ async fn drive_stream(
 ) {
     let mut encoder = Encoder::new(format, encoder_ctx);
     encoder.set_include_usage(req.include_usage);
+    let mut tool_stream = ToolStreamState::new(&meta.request_id);
     let mut usage = TokenUsage::default();
     let mut ttft_ms: Option<i64> = None;
     let mut status = "success";
@@ -2199,6 +2273,7 @@ async fn drive_stream(
 
     // A normal JSON response is already complete and validated before commit.
     if let Some(events) = attempt.full_events.take() {
+        let events = tool_stream.normalize(events);
         if !emit_translated_events(
             events,
             &mut encoder,
@@ -2337,6 +2412,7 @@ async fn drive_stream(
                             if payload_is_terminal(&payload, &events) {
                                 terminal_seen = true;
                             }
+                            let events = tool_stream.normalize(events);
                             if !emit_translated_events(
                                 events,
                                 &mut encoder,
@@ -2719,6 +2795,7 @@ async fn drive_aggregate(
 ) -> AggregateResult {
     let adapter = attempt.adapter.clone();
     let mut events: Vec<StreamEvent> = Vec::new();
+    let mut tool_stream = ToolStreamState::new(&encoder_ctx.request_id);
     let mut usage = TokenUsage::default();
     let mut status = "success";
     let mut status_code = 200i64;
@@ -2726,7 +2803,7 @@ async fn drive_aggregate(
     let mut committed = false;
 
     if let Some(full_events) = attempt.full_events.take() {
-        for event in full_events {
+        for event in tool_stream.normalize(full_events) {
             if let StreamEvent::Usage(value) = &event {
                 usage.merge(value);
             }
@@ -2787,7 +2864,7 @@ async fn drive_aggregate(
                                 if payload_is_terminal(&payload, &parsed) {
                                     terminal_seen = true;
                                 }
-                                for event in parsed {
+                                for event in tool_stream.normalize(parsed) {
                                     if let StreamEvent::Usage(value) = &event {
                                         usage.merge(value);
                                     }
