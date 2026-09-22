@@ -69,6 +69,48 @@ impl PluginAdapter {
     fn plugin_err(e: PluginFault) -> ProxyError {
         ProxyError::upstream(format!("plugin adapter: {}", e.message()))
     }
+
+    fn plugin_failure(stage: &str, fault: PluginFault) -> UpstreamFailure {
+        let kind = match &fault {
+            PluginFault::Timeout => FailureKind::Timeout,
+            PluginFault::PluginError {
+                code, retryable, ..
+            } => match code.as_str() {
+                "bad_request" | "invalid_request" | "unsupported" => FailureKind::BadRequest,
+                "auth_error" | "unauthorized" => FailureKind::AuthError,
+                "target_error" => FailureKind::TargetError,
+                "rate_limit" => FailureKind::RateLimit,
+                "quota_exhausted" => FailureKind::QuotaExhausted,
+                "timeout" => FailureKind::Timeout,
+                "connection_error" => FailureKind::ConnectionError,
+                "server_error" | "protocol_error" | "plugin_internal" => FailureKind::ServerError,
+                _ if *retryable => FailureKind::ServerError,
+                _ => FailureKind::BadRequest,
+            },
+            PluginFault::Trap(_)
+            | PluginFault::PermissionDenied(_)
+            | PluginFault::InvalidResult(_)
+            | PluginFault::Internal(_) => FailureKind::ServerError,
+            PluginFault::Cancelled => FailureKind::ConnectionError,
+        };
+        UpstreamFailure {
+            kind,
+            status: None,
+            retry_after_secs: None,
+            message: format!("plugin adapter {stage}: {}", fault.message()),
+            quota_reset_at: None,
+        }
+    }
+
+    fn protocol_failure(stage: &str, message: impl Into<String>) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: FailureKind::ServerError,
+            status: None,
+            retry_after_secs: None,
+            message: format!("plugin adapter {stage}: {}", message.into()),
+            quota_reset_at: None,
+        }
+    }
 }
 
 #[async_trait]
@@ -87,44 +129,53 @@ impl Adapter for PluginAdapter {
         &self,
         ctx: &UpstreamContext<'_>,
         req: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         let p = Self::provider_json(ctx);
-        // The credential has already been resolved by core and is passed to the
-        // guest so it can build the header list (never leaked to the client).
         let credential = ctx.credential.clone();
-        let headers_json = match self.block(self.manager.adapter_apply_auth(
-            &self.plugin_id,
-            &p,
-            &credential,
-        )) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(plugin = %self.plugin_id, error = %e.message(), "plugin adapter apply_auth failed");
-                return req;
-            }
-        };
-        let headers: Vec<(String, String)> =
-            serde_json::from_str(&headers_json).unwrap_or_default();
+        let headers_json = self
+            .block(
+                self.manager
+                    .adapter_apply_auth(&self.plugin_id, &p, &credential),
+            )
+            .map_err(|e| Self::plugin_failure("apply_auth", e))?;
+        let headers: Vec<(String, String)> = serde_json::from_str(&headers_json)
+            .map_err(|e| Self::protocol_failure("apply_auth", format!("invalid header JSON: {e}")))?;
+
         let mut req = req;
         for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                Self::protocol_failure("apply_auth", format!("invalid header name: {e}"))
+            })?;
+            let value = reqwest::header::HeaderValue::from_str(&value).map_err(|e| {
+                Self::protocol_failure("apply_auth", format!("invalid header value: {e}"))
+            })?;
             req = req.header(name, value);
         }
-        req
+        Ok(req)
     }
 
-    fn build_body(&self, ctx: &UpstreamContext<'_>, req: &InternalRequest) -> Value {
+    fn build_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+    ) -> Result<Value, UpstreamFailure> {
         let request_json = request_to_json(req);
         let (p, m) = (Self::provider_json(ctx), Self::model_json(ctx));
-        match self.block(
-            self.manager
-                .adapter_build_body(&self.plugin_id, &request_json, &p, &m),
-        ) {
-            Ok(body) => serde_json::from_str(&body).unwrap_or(Value::Null),
-            Err(e) => {
-                tracing::warn!(plugin = %self.plugin_id, error = %e.message(), "plugin adapter build_body failed");
-                Value::Null
-            }
+        let body = self
+            .block(
+                self.manager
+                    .adapter_build_body(&self.plugin_id, &request_json, &p, &m),
+            )
+            .map_err(|e| Self::plugin_failure("build_body", e))?;
+        let body: Value = serde_json::from_str(&body)
+            .map_err(|e| Self::protocol_failure("build_body", format!("invalid JSON: {e}")))?;
+        if body.is_null() {
+            return Err(Self::protocol_failure(
+                "build_body",
+                "plugin returned a null request body",
+            ));
         }
+        Ok(body)
     }
 
     fn classify_error(
@@ -243,19 +294,43 @@ pub fn request_to_json(req: &InternalRequest) -> String {
             |t| json!({ "name": t.name, "description": t.description, "parameters": t.parameters }),
         )
         .collect();
+    let tool_choice = {
+        let (mode, name) = match req.tool_choice {
+            Some(crate::types::ToolChoice::None) => ("none", None),
+            Some(crate::types::ToolChoice::Required) => ("required", None),
+            Some(crate::types::ToolChoice::Specific) => ("specific", req.tool_choice_name.as_deref()),
+            Some(crate::types::ToolChoice::Auto) | None => ("auto", None),
+        };
+        json!({ "mode": mode, "name": name })
+    };
+    let thinking = req.thinking.map(|level| {
+        let level = match level {
+            crate::types::ThinkingLevel::Off => "off",
+            crate::types::ThinkingLevel::Low => "low",
+            crate::types::ThinkingLevel::Medium => "medium",
+            crate::types::ThinkingLevel::High => "high",
+        };
+        json!({ "level": level })
+    });
     let value = json!({
+        "schema": "kinetix.plugin.request",
+        "schema_version": 1,
         "requested_model": req.requested_model,
         "system": req.system,
         "messages": messages,
         "tools": tools,
-        "tool_choice": req.tool_choice_name,
+        "tool_choice": tool_choice,
         "stream": req.stream,
+        "include_usage": req.include_usage,
         "temperature": req.params.temperature,
         "top_p": req.params.top_p,
         "top_k": req.params.top_k,
         "max_tokens": req.params.max_tokens,
         "stop": req.params.stop,
         "seed": req.params.seed,
+        "presence_penalty": req.params.presence_penalty,
+        "frequency_penalty": req.params.frequency_penalty,
+        "thinking": thinking,
         "extra": req.extra,
     });
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
