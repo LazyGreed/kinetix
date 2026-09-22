@@ -630,6 +630,35 @@ mod tests {
     }
 
     #[test]
+    fn translated_body_preserves_top_k_mapped_thinking_and_internal_usage() {
+        let p = provider();
+        let mut m = model();
+        m.parameters = serde_json::json!({
+            "top_k": { "supported": true, "policy": "forward" }
+        })
+        .to_string();
+        m.thinking_map = serde_json::json!({
+            "levels": {
+                "high": { "reasoning_effort": "high" }
+            }
+        })
+        .to_string();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            credential: "k".into(),
+        };
+        let mut req = base_request();
+        req.params.top_k = Some(42.0);
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+
+        let body = OpenAiAdapter.build_body(&ctx, &req);
+        assert_eq!(body["top_k"], 42.0);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
     fn wire_format_is_openai() {
         assert_eq!(OpenAiAdapter.wire_format(), "openai");
         let _ = AuthScheme::Bearer;
