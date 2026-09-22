@@ -534,8 +534,15 @@ impl OpenAiEncoder {
             "completion_tokens": u.output.unwrap_or(0),
             "total_tokens": u.input.unwrap_or(0) + u.output.unwrap_or(0),
         });
-        if let Some(c) = u.cached {
-            usage["prompt_tokens_details"] = json!({ "cached_tokens": c });
+        let mut prompt_details = serde_json::Map::new();
+        if let Some(cached) = u.cached {
+            prompt_details.insert("cached_tokens".into(), json!(cached));
+        }
+        if let Some(cache_write) = u.cache_write {
+            prompt_details.insert("cache_write_tokens".into(), json!(cache_write));
+        }
+        if !prompt_details.is_empty() {
+            usage["prompt_tokens_details"] = Value::Object(prompt_details);
         }
         if let Some(t) = u.thinking {
             usage["completion_tokens_details"] = json!({ "reasoning_tokens": t });
