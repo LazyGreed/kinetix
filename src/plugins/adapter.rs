@@ -386,7 +386,7 @@ fn event_to_value(ev: &StreamEvent) -> Value {
         }
         StreamEvent::Usage(u) => json!({
             "type": "usage", "input": u.input, "output": u.output,
-            "cached": u.cached, "thinking": u.thinking
+            "cached": u.cached, "cache_write": u.cache_write, "thinking": u.thinking
         }),
         StreamEvent::Finish(r) => json!({ "type": "finish", "reason": r.as_str() }),
     }
