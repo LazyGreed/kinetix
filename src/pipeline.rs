@@ -395,9 +395,9 @@ pub async fn run(
     let started = Instant::now();
     let snap = state.registry.snapshot();
     let admission = match &key {
-        Some(key) => Some(
-            crate::limits::reserve(&state.admission, &state.pool, &snap, key, &req).await?,
-        ),
+        Some(key) => {
+            Some(crate::limits::reserve(&state.admission, &state.pool, &snap, key, &req).await?)
+        }
         None => None,
     };
     let mut trace = RouteTrace::new(request_id.clone(), req.requested_model.clone());
