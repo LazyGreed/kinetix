@@ -392,9 +392,19 @@ impl Adapter for GeminiAdapter {
         // hint indicates a daily/quota reset and stays an exhaustion.
         let short_retry = retry_after_secs.map(|s| s <= 90).unwrap_or(false);
 
+        let lower = message.to_ascii_lowercase();
+        let credential_error = status == 401
+            || gstatus == "UNAUTHENTICATED"
+            || lower.contains("api key not valid")
+            || lower.contains("invalid api key")
+            || lower.contains("invalid authentication credentials");
+
         let kind = match status {
-            400 | 404 | 422 => FailureKind::BadRequest,
-            401 | 403 => FailureKind::AuthError,
+            400 if credential_error => FailureKind::AuthError,
+            400 | 422 => FailureKind::BadRequest,
+            401 => FailureKind::AuthError,
+            403 if credential_error => FailureKind::AuthError,
+            403 | 404 => FailureKind::TargetError,
             429 if short_retry => FailureKind::RateLimit,
             429 => classify_429(gstatus, &message),
             s if s >= 500 => FailureKind::ServerError,
@@ -672,5 +682,29 @@ mod schema_tests {
             got.pointer("/properties/config/properties/items/items/properties/kind/enum"),
             Some(&json!(["x"]))
         );
+    }
+}
+
+#[cfg(test)]
+mod error_scope_tests {
+    use super::*;
+    use crate::adapters::Adapter;
+
+    #[test]
+    fn permission_denied_does_not_poison_gemini_credential() {
+        let adapter = GeminiAdapter::new();
+        let forbidden = adapter.classify_error(
+            403,
+            r#"{"error":{"status":"PERMISSION_DENIED","message":"project is not allowed to use this model"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(forbidden.kind, FailureKind::TargetError);
+
+        let invalid_key = adapter.classify_error(
+            400,
+            r#"{"error":{"status":"INVALID_ARGUMENT","message":"API key not valid. Please pass a valid API key."}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(invalid_key.kind, FailureKind::AuthError);
     }
 }

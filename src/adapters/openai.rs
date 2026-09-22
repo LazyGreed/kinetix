@@ -308,11 +308,28 @@ impl Adapter for OpenAiAdapter {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
 
+        let lower_message = message.to_ascii_lowercase();
+        let lower_code = code.to_ascii_lowercase();
+        let error_type = parsed
+            .pointer("/error/type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let credential_error = status == 401
+            || lower_code.contains("invalid_api_key")
+            || lower_code.contains("invalid_auth")
+            || error_type.contains("authentication")
+            || lower_message.contains("invalid api key")
+            || lower_message.contains("incorrect api key")
+            || lower_message.contains("authentication token");
+
         let kind = match status {
-            400 | 404 | 422 => FailureKind::BadRequest,
-            401 | 403 => FailureKind::AuthError,
+            400 | 422 => FailureKind::BadRequest,
+            401 => FailureKind::AuthError,
+            403 if credential_error => FailureKind::AuthError,
+            403 | 404 => FailureKind::TargetError,
             429 => {
-                if code.contains("insufficient_quota") || message.to_lowercase().contains("quota") {
+                if lower_code.contains("insufficient_quota") || lower_message.contains("quota") {
                     FailureKind::QuotaExhausted
                 } else {
                     FailureKind::RateLimit
@@ -653,5 +670,29 @@ mod param_default_tests {
         let adapter = OpenAiAdapter;
         let body = adapter.build_body(&ctx, &req);
         assert_eq!(body.get("temperature").and_then(|v| v.as_f64()), Some(0.9));
+    }
+}
+
+#[cfg(test)]
+mod error_scope_tests {
+    use super::*;
+    use crate::adapters::Adapter;
+
+    #[test]
+    fn forbidden_model_scope_does_not_poison_openai_credential() {
+        let adapter = OpenAiAdapter::new();
+        let forbidden = adapter.classify_error(
+            403,
+            r#"{"error":{"message":"model access denied","code":"model_not_allowed"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(forbidden.kind, FailureKind::TargetError);
+
+        let unauthorized = adapter.classify_error(
+            401,
+            r#"{"error":{"message":"invalid api key","code":"invalid_api_key"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(unauthorized.kind, FailureKind::AuthError);
     }
 }

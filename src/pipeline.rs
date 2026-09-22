@@ -151,7 +151,7 @@ pub async fn run(
     state: &AppState,
     format: FrontendFormat,
     key: Option<db::VirtualKeyRow>,
-    mut req: InternalRequest,
+    req: InternalRequest,
     request_id: String,
     allow_fallback: bool,
     session: Option<String>,
@@ -444,9 +444,11 @@ pub async fn run(
         .min(5)
         .max(1);
 
-    // Prompt-cache affinity: reorder so a previously-served target leads.
+    // Sticky routing and prompt-cache affinity share the same bounded session
+    // mapping: both prefer the last successful target while still allowing
+    // ordinary health/fallback logic to move away from it.
     if let (Some(route), Some(session)) = (&route, &session) {
-        if route.cache_affinity != 0 {
+        if route.cache_affinity != 0 || route.sticky_routing != 0 {
             if let Some(sticky_key) = state.sticky_lookup(session, STICKY_TTL) {
                 if let Some(pos) = targets
                     .iter()
@@ -456,7 +458,11 @@ pub async fn run(
                     trace.step(
                         "candidate",
                         Some(targets[0].account.label.clone()),
-                        "cache-affinity: session sticky target promoted (FR-7.3)",
+                        if route.sticky_routing != 0 {
+                            "sticky-routing: previous session target promoted (FR-7.5)"
+                        } else {
+                            "cache-affinity: session target promoted (FR-7.3)"
+                        },
                     );
                 }
             }
@@ -467,9 +473,24 @@ pub async fn run(
     let mut last_error: Option<ProxyError> = None;
     let mut all_accounts: Vec<db::AccountRow> = Vec::new();
     let mut attempts_done = 0usize;
+    let mut previous_provider_id: Option<String> = None;
+    let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
     for target in targets.iter() {
+        if let (Some(skip), Some(target_id)) = (
+            skip_logical_target.as_deref(),
+            target.route_target_id.as_deref(),
+        ) {
+            if skip == target_id {
+                trace.step(
+                    "skip",
+                    Some(target.account.label.clone()),
+                    "same logical target skipped after target-local failure",
+                );
+                continue;
+            }
+        }
         if attempts_done >= max_attempts || Instant::now() >= deadline {
             if Instant::now() >= deadline {
                 trace.step("skip", None, "pre-commit deadline exceeded");
@@ -521,6 +542,20 @@ pub async fn run(
                 "soft quota reached",
             );
             state.record_skip();
+            if !allow_fallback
+                || !route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted)
+            {
+                trace.finish("failed");
+                state.live.finish(
+                    &meta.request_id,
+                    "failed",
+                    started.elapsed().as_millis() as u64,
+                    None,
+                    None,
+                );
+                let _ = db::insert_route_trace(&state.pool, &trace).await;
+                return Err(ProxyError::rate_limited("account soft quota reached", None));
+            }
             continue;
         }
 
@@ -552,14 +587,33 @@ pub async fn run(
         // bound-but-unavailable plugin adapter fails closed.
         let adapter = state.adapters.for_provider(&target.provider);
 
-        // Continuity / portability policy on cross-provider fallback (FR-2.11).
-        if attempts_done > 0 {
+        // Every target gets an isolated request view. Target overrides and
+        // continuity transforms must never leak into a later fallback target.
+        let mut target_req = req.clone();
+
+        // Continuity / portability applies only when this attempt crosses
+        // provider boundaries. Switching credentials inside one provider pool
+        // must not strip conversation state.
+        let cross_provider = previous_provider_id
+            .as_deref()
+            .map(|id| id != target.provider.id)
+            .unwrap_or(false);
+        if cross_provider {
             if let Some(route) = &route {
-                match apply_continuity(&mut req, route, target, &mut trace) {
-                    Ok(()) => {}
-                    Err(e) => return Err(e),
-                }
+                apply_continuity(&mut target_req, route, target, &mut trace)?;
             }
+        }
+        apply_target_overrides(&mut target_req, &target.param_overrides)?;
+        if target
+            .param_overrides
+            .as_object()
+            .is_some_and(|obj| !obj.is_empty())
+        {
+            trace.step(
+                "candidate",
+                Some(target.account.label.clone()),
+                "applied target parameter overrides",
+            );
         }
 
         let ctx = UpstreamContext {
@@ -569,7 +623,7 @@ pub async fn run(
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
-        if let Err(e) = check_param_policy(&target, &req) {
+        if let Err(e) = check_param_policy(&target, &target_req) {
             trace.finish("rejected");
             state
                 .live
@@ -579,13 +633,13 @@ pub async fn run(
         }
 
         // Same-format passthrough (FR-2.7).
-        let use_passthrough =
-            req.raw_body.is_some() && passthrough::is_passthrough(format, target.provider.wire());
+        let use_passthrough = target_req.raw_body.is_some()
+            && passthrough::is_passthrough(format, target.provider.wire());
 
         // Never silently drop behaviorally significant client fields on a
         // translating path (FR-2.8). A request-level failure; never retried.
         if !use_passthrough {
-            if let Some(msg) = crate::frontends::translation_unsupported(&req.extra) {
+            if let Some(msg) = crate::frontends::translation_unsupported(&target_req.extra) {
                 trace.finish("rejected");
                 state
                     .live
@@ -605,6 +659,7 @@ pub async fn run(
             tokio::time::sleep(Duration::from_millis(exp.min(BACKOFF_CAP_MS))).await;
         }
         attempts_done += 1;
+        previous_provider_id = Some(target.provider.id.clone());
         state.live.set_fallback_hops(
             &meta.request_id,
             (attempts_done - 1) as u32,
@@ -647,7 +702,7 @@ pub async fn run(
                 state,
                 &adapter,
                 &ctx,
-                &req,
+                &target_req,
                 use_passthrough,
                 &meta.request_id,
             ),
@@ -692,11 +747,18 @@ pub async fn run(
                                 "upstream_precommit_invalid",
                                 failure.message.clone(),
                             );
-                            if !failure.kind.is_key_level() || !allow_fallback {
+                            handle_key_failure(state, target, &failure, &mut meta, &mut trace)
+                                .await;
+                            let can_fallback = allow_fallback
+                                && route_allows_fallback(route.as_ref(), failure.kind);
+                            if !can_fallback {
                                 trace.step(
                                     "attempt",
                                     Some(target.account.label.clone()),
-                                    format!("HTTP 2xx invalid before commit: {}", failure.message),
+                                    format!(
+                                        "HTTP 2xx invalid before commit; fallback disabled for {:?}",
+                                        failure.kind
+                                    ),
                                 );
                                 trace.finish("failed");
                                 state.live.finish(
@@ -709,8 +771,9 @@ pub async fn run(
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(failure_to_error(&failure, target));
                             }
-                            handle_key_failure(state, target, &failure, &mut meta, &mut trace)
-                                .await;
+                            if failure.kind == FailureKind::TargetError {
+                                skip_logical_target = target.route_target_id.clone();
+                            }
                             last_error = Some(failure_to_error(&failure, target));
                             continue;
                         }
@@ -751,7 +814,7 @@ pub async fn run(
                         passthrough: use_passthrough && prepared.is_sse,
                     };
                     return Ok(stream_response(
-                        state, snap, format, meta, req, attempt, started, key, trace,
+                        state, snap, format, meta, target_req, attempt, started, key, trace,
                     )
                     .await);
                 }
@@ -765,7 +828,10 @@ pub async fn run(
                     timeout_failure("upstream timed out while reading error response")
                 } else {
                     match tokio::time::timeout(error_body_remaining, resp.text()).await {
-                        Ok(Ok(body)) => adapter.classify_error(status, &body, &headers),
+                        Ok(Ok(body)) => {
+                            let native = adapter.classify_error(status, &body, &headers);
+                            apply_provider_failure_rules(&target.provider, status, &body, native)
+                        }
                         Ok(Err(error)) => UpstreamFailure {
                             kind: if error.is_timeout() {
                                 FailureKind::Timeout
@@ -789,11 +855,14 @@ pub async fn run(
                     format!("HTTP {status} {:?}", failure.kind),
                 );
 
-                if !failure.kind.is_key_level() || !allow_fallback {
+                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                let can_fallback =
+                    allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                if !can_fallback {
                     trace.step(
                         "attempt",
                         Some(target.account.label.clone()),
-                        format!("HTTP {status} (not retryable)"),
+                        format!("HTTP {status}; fallback disabled for {:?}", failure.kind),
                     );
                     trace.finish("failed");
                     state.live.finish(
@@ -806,8 +875,9 @@ pub async fn run(
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(failure_to_error(&failure, &target));
                 }
-
-                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                if failure.kind == FailureKind::TargetError {
+                    skip_logical_target = target.route_target_id.clone();
+                }
                 last_error = Some(failure_to_error(&failure, &target));
                 continue;
             }
@@ -818,7 +888,15 @@ pub async fn run(
                     "upstream_connect_failed",
                     format!("{:?}", failure.kind),
                 );
-                if !allow_fallback {
+                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                let can_fallback =
+                    allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                if !can_fallback {
+                    trace.step(
+                        "attempt",
+                        Some(target.account.label.clone()),
+                        format!("fallback disabled for {:?}", failure.kind),
+                    );
                     trace.finish("failed");
                     state.live.finish(
                         &meta.request_id,
@@ -830,7 +908,6 @@ pub async fn run(
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(failure_to_error(&failure, &target));
                 }
-                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
                 last_error = Some(failure_to_error(&failure, &target));
                 continue;
             }
@@ -885,6 +962,195 @@ pub async fn run(
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
     format!("{}|{}|{}", route.id, t.account.id, t.model.id)
+}
+
+fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> bool {
+    if !kind.is_retryable() {
+        return false;
+    }
+    let Some(route) = route else {
+        // A target-local model/project failure cannot be repaired by trying a
+        // different credential for the same direct provider/model.
+        return kind != FailureKind::TargetError;
+    };
+    let triggers: Value =
+        serde_json::from_str(&route.fallback_triggers).unwrap_or_else(|_| serde_json::json!({}));
+    let enabled = |name: &str| triggers.get(name).and_then(Value::as_bool).unwrap_or(true);
+    match kind {
+        FailureKind::RateLimit => enabled("on429"),
+        FailureKind::QuotaExhausted => enabled("onQuota"),
+        FailureKind::ServerError | FailureKind::ConnectionError => enabled("on5xx"),
+        FailureKind::Timeout => enabled("onTimeout"),
+        // Credential-global failures should try another account. Target-local
+        // failures should try another logical route target.
+        FailureKind::AuthError | FailureKind::TargetError => true,
+        FailureKind::BadRequest => false,
+    }
+}
+
+fn failure_rule_matches(rule: &Value, status: u16, code: &str, message: &str) -> bool {
+    let Some(obj) = rule.as_object() else {
+        return false;
+    };
+    let mut constrained = false;
+
+    if let Some(statuses) = obj.get("statuses").and_then(Value::as_array) {
+        constrained = true;
+        if !statuses.iter().any(|v| v.as_u64() == Some(status as u64)) {
+            return false;
+        }
+    }
+    if let Some(single) = obj.get("status").and_then(Value::as_u64) {
+        constrained = true;
+        if single != status as u64 {
+            return false;
+        }
+    }
+    if let Some(codes) = obj.get("codes").and_then(Value::as_array) {
+        constrained = true;
+        let lower = code.to_ascii_lowercase();
+        if !codes
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|candidate| candidate.eq_ignore_ascii_case(&lower))
+        {
+            return false;
+        }
+    }
+    if let Some(needles) = obj.get("message_contains").and_then(Value::as_array) {
+        constrained = true;
+        let lower = message.to_ascii_lowercase();
+        if !needles
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+        {
+            return false;
+        }
+    }
+
+    constrained
+}
+
+/// Apply admin-configured provider classification rules after the native
+/// adapter has extracted the provider's normal status/code/message semantics.
+///
+/// Supported keys: `auth`, `quota`, `rate_limit`, `target`,
+/// `bad_request`. Each rule may contain `status`/`statuses`, `codes`,
+/// and/or `message_contains`.
+pub(crate) fn apply_provider_failure_rules(
+    provider: &db::ProviderRow,
+    status: u16,
+    body: &str,
+    mut failure: UpstreamFailure,
+) -> UpstreamFailure {
+    let rules: Value =
+        serde_json::from_str(&provider.rate_limit_rules).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(obj) = rules.as_object() else {
+        return failure;
+    };
+    if obj.is_empty() {
+        return failure;
+    }
+
+    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let code = parsed
+        .pointer("/error/code")
+        .or_else(|| parsed.pointer("/error/status"))
+        .or_else(|| parsed.pointer("/error/type"))
+        .or_else(|| parsed.get("code"))
+        .or_else(|| parsed.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let message = parsed
+        .pointer("/error/message")
+        .or_else(|| parsed.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or(&failure.message);
+
+    let ordered = [
+        ("auth", FailureKind::AuthError),
+        ("quota", FailureKind::QuotaExhausted),
+        ("rate_limit", FailureKind::RateLimit),
+        ("target", FailureKind::TargetError),
+        ("bad_request", FailureKind::BadRequest),
+    ];
+    for (name, kind) in ordered {
+        if obj
+            .get(name)
+            .map(|rule| failure_rule_matches(rule, status, code, message))
+            .unwrap_or(false)
+        {
+            failure.kind = kind;
+            break;
+        }
+    }
+    failure
+}
+
+fn apply_target_overrides(req: &mut InternalRequest, overrides: &Value) -> Result<(), ProxyError> {
+    let Some(obj) = overrides.as_object() else {
+        if overrides.is_null() {
+            return Ok(());
+        }
+        return Err(ProxyError::internal(
+            "route target param_overrides must be a JSON object",
+        ));
+    };
+    if obj.is_empty() {
+        return Ok(());
+    }
+
+    for (key, value) in obj {
+        match key.as_str() {
+            "temperature" => req.params.temperature = value.as_f64(),
+            "top_p" => req.params.top_p = value.as_f64(),
+            "top_k" => req.params.top_k = value.as_f64(),
+            "max_tokens" | "max_completion_tokens" => {
+                req.params.max_tokens = value.as_u64().and_then(|v| u32::try_from(v).ok())
+            }
+            "seed" => req.params.seed = value.as_i64(),
+            "presence_penalty" => req.params.presence_penalty = value.as_f64(),
+            "frequency_penalty" => req.params.frequency_penalty = value.as_f64(),
+            "stop" => {
+                req.params.stop = match value {
+                    Value::String(v) => vec![v.clone()],
+                    Value::Array(values) => values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    Value::Null => Vec::new(),
+                    _ => {
+                        return Err(ProxyError::bad_request(
+                            "route target override 'stop' must be a string or array",
+                        ))
+                    }
+                }
+            }
+            _ => {
+                req.extra.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    // Same-format passthrough must observe the exact same target overrides as
+    // translated requests.
+    if let Some(raw) = req.raw_body.as_mut() {
+        let mut parsed: Value = serde_json::from_str(raw)
+            .map_err(|_| ProxyError::bad_request("client request body is not valid JSON"))?;
+        let Some(raw_obj) = parsed.as_object_mut() else {
+            return Err(ProxyError::bad_request(
+                "client request body must be a JSON object",
+            ));
+        };
+        for (key, value) in obj {
+            raw_obj.insert(key.clone(), value.clone());
+        }
+        *raw = parsed.to_string();
+    }
+
+    Ok(())
 }
 
 fn default_quota_window(account: &db::AccountRow) -> i64 {
@@ -1176,7 +1442,8 @@ fn extract_upstream_request_id(resp: &reqwest::Response) -> Option<String> {
         .map(String::from)
 }
 
-/// React to a key-level failure: cooldown / exhaustion / disable / circuit.
+/// Record the state consequence of a classified upstream failure. Target-local
+/// and request-local failures are traced but never mutate account health.
 async fn handle_key_failure(
     state: &AppState,
     target: &ResolvedTarget,
@@ -1232,21 +1499,32 @@ async fn handle_key_failure(
                 Some(&failure.message),
             )
             .await;
-            let d = format!("{label}:5xx(cooldown 10s)");
+            let d = format!("{label}:transient(cooldown 10s)");
+            meta.fallback_path.push(d.clone());
+            d
+        }
+        FailureKind::TargetError => {
+            let d = format!("{label}:target_error");
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::BadRequest => format!("{label}:bad_request"),
     };
-    // Circuit breaker (FR-4.7).
-    let n = pool::record_failure(
-        &state.pool,
-        account_id,
-        CIRCUIT_THRESHOLD,
-        CIRCUIT_OPEN_SECS,
-    )
-    .await
-    .unwrap_or(0);
+
+    let n = if failure.kind.affects_account() {
+        // Circuit breaker (FR-4.7) tracks failures attributable to the selected
+        // account/upstream path, never model-local permission/not-found errors.
+        pool::record_failure(
+            &state.pool,
+            account_id,
+            CIRCUIT_THRESHOLD,
+            CIRCUIT_OPEN_SECS,
+        )
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
     trace.step("attempt", Some(label), detail);
     if n >= CIRCUIT_THRESHOLD {
         trace.step(
@@ -1255,8 +1533,10 @@ async fn handle_key_failure(
             format!("circuit opened for account after {n} consecutive failures"),
         );
     }
-    // Refresh the registry snapshot so later requests see the new status.
-    let _ = state.registry.reload(&state.pool).await;
+    if failure.kind.affects_account() {
+        // Refresh the registry snapshot so later requests see the new status.
+        let _ = state.registry.reload(&state.pool).await;
+    }
 }
 
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
@@ -1269,6 +1549,13 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             "upstream authentication failed for provider '{}'",
             target.provider.name
         )),
+        FailureKind::TargetError => match failure.status {
+            Some(403) => {
+                ProxyError::new(crate::types::ErrorKind::Forbidden, failure.message.clone())
+            }
+            Some(404) => ProxyError::not_found(failure.message.clone()),
+            _ => ProxyError::upstream(failure.message.clone()),
+        },
         FailureKind::Timeout => ProxyError::upstream("upstream request timed out".to_string()),
         FailureKind::ConnectionError | FailureKind::ServerError => {
             ProxyError::upstream(failure.message.clone())
@@ -1556,14 +1843,20 @@ fn apply_continuity(
         return Ok(());
     }
 
-    if route.portability() == "reject" {
+    if route.continuity_policy == "error" || route.portability() == "reject" {
         return Err(ProxyError::unsupported(format!(
-            "route '{}' uses portability policy 'reject': the conversation carries provider-specific state that target '{}' cannot accept",
+            "route '{}' forbids cross-provider fallback with non-portable conversation state for target '{}'",
+            route.name, target.model.display_name
+        )));
+    }
+    if route.continuity_policy == "convert" {
+        return Err(ProxyError::unsupported(format!(
+            "route '{}' requested continuity conversion, but opaque reasoning/tool signatures cannot be converted safely for target '{}'",
             route.name, target.model.display_name
         )));
     }
 
-    // strip_with_warning
+    // continuity=strip / portability=strip_with_warning
     for msg in &mut req.messages {
         msg.parts
             .retain(|p| !matches!(p, crate::types::Part::Thinking { .. }));
@@ -2579,7 +2872,7 @@ async fn finalize_log(
     // Persist prompt-cache-affinity mapping for the next turn (FR-7.3).
     if let (Some(session), Some(route_id)) = (&meta.session, &meta.route_id) {
         if let Some(route) = snap.routes.get(route_id) {
-            if route.cache_affinity != 0 && status == "success" {
+            if (route.cache_affinity != 0 || route.sticky_routing != 0) && status == "success" {
                 state.sticky_remember(
                     session,
                     format!(
@@ -2906,4 +3199,183 @@ pub async fn dry_run(
         "would_select": selected,
         "note": "Dry run only: no production state was mutated and no upstream call was made.",
     }))
+}
+
+#[cfg(test)]
+mod route_policy_tests {
+    use super::*;
+
+    fn route(triggers: Value) -> db::RouteRow {
+        db::RouteRow {
+            id: "route_test".into(),
+            name: "test".into(),
+            description: String::new(),
+            strategy: "priority".into(),
+            fallback_triggers: triggers.to_string(),
+            continuity_policy: "strip".into(),
+            portability_policy: "strip_with_warning".into(),
+            sticky_routing: 0,
+            cache_affinity: 0,
+            max_attempts: None,
+            enabled: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn provider(rules: Value) -> db::ProviderRow {
+        db::ProviderRow {
+            id: "prov_test".into(),
+            name: "test".into(),
+            base_url: "https://api.example.com".into(),
+            wire_format: "openai".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: "{}".into(),
+            timeout_ms: 1000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: rules.to_string(),
+            enabled: 1,
+            follow_redirects: 0,
+            credential_hosts: String::new(),
+            allow_insecure_tls: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            wire_plugin: String::new(),
+            credential_plugin: String::new(),
+            model_source_plugin: String::new(),
+        }
+    }
+
+    fn request() -> InternalRequest {
+        InternalRequest {
+            requested_model: "route".into(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            tool_choice_name: None,
+            params: Default::default(),
+            stream: true,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: Some(r#"{"model":"route","temperature":0.1}"#.into()),
+        }
+    }
+
+    #[test]
+    fn route_fallback_triggers_are_executable() {
+        let r = route(serde_json::json!({
+            "on429": false,
+            "onQuota": false,
+            "on5xx": false,
+            "onTimeout": false
+        }));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::RateLimit));
+        assert!(!route_allows_fallback(
+            Some(&r),
+            FailureKind::QuotaExhausted
+        ));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::ServerError));
+        assert!(!route_allows_fallback(
+            Some(&r),
+            FailureKind::ConnectionError
+        ));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::Timeout));
+        assert!(route_allows_fallback(Some(&r), FailureKind::AuthError));
+        assert!(route_allows_fallback(Some(&r), FailureKind::TargetError));
+        assert!(!route_allows_fallback(Some(&r), FailureKind::BadRequest));
+    }
+
+    #[test]
+    fn missing_fallback_trigger_defaults_to_enabled() {
+        let r = route(serde_json::json!({}));
+        assert!(route_allows_fallback(Some(&r), FailureKind::RateLimit));
+        assert!(route_allows_fallback(Some(&r), FailureKind::QuotaExhausted));
+        assert!(route_allows_fallback(Some(&r), FailureKind::ServerError));
+        assert!(route_allows_fallback(Some(&r), FailureKind::Timeout));
+    }
+
+    #[test]
+    fn direct_target_error_does_not_rotate_credentials() {
+        assert!(!route_allows_fallback(None, FailureKind::TargetError));
+        assert!(route_allows_fallback(None, FailureKind::AuthError));
+    }
+
+    #[test]
+    fn target_parameter_overrides_update_canonical_and_passthrough_request() {
+        let mut req = request();
+        apply_target_overrides(
+            &mut req,
+            &serde_json::json!({
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "max_tokens": 512,
+                "stop": ["END"],
+                "provider_specific": true
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(req.params.temperature, Some(0.7));
+        assert_eq!(req.params.top_p, Some(0.8));
+        assert_eq!(req.params.max_tokens, Some(512));
+        assert_eq!(req.params.stop, vec!["END"]);
+        assert_eq!(req.extra.get("provider_specific"), Some(&Value::Bool(true)));
+
+        let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
+        assert_eq!(raw["temperature"], 0.7);
+        assert_eq!(raw["top_p"], 0.8);
+        assert_eq!(raw["max_tokens"], 512);
+        assert_eq!(raw["provider_specific"], true);
+    }
+
+    #[test]
+    fn provider_failure_rules_override_native_classification() {
+        let p = provider(serde_json::json!({
+            "quota": {
+                "statuses": [429],
+                "codes": ["billing_hard_limit"]
+            }
+        }));
+        let native = UpstreamFailure {
+            kind: FailureKind::RateLimit,
+            status: Some(429),
+            retry_after_secs: None,
+            message: "limit reached".into(),
+            quota_reset_at: None,
+        };
+        let classified = apply_provider_failure_rules(
+            &p,
+            429,
+            r#"{"error":{"code":"billing_hard_limit","message":"limit reached"}}"#,
+            native,
+        );
+        assert_eq!(classified.kind, FailureKind::QuotaExhausted);
+    }
+
+    #[test]
+    fn provider_failure_rule_requires_all_configured_selectors() {
+        let p = provider(serde_json::json!({
+            "quota": {
+                "statuses": [429],
+                "codes": ["billing_hard_limit"],
+                "message_contains": ["daily"]
+            }
+        }));
+        let native = UpstreamFailure {
+            kind: FailureKind::RateLimit,
+            status: Some(429),
+            retry_after_secs: None,
+            message: "limit reached".into(),
+            quota_reset_at: None,
+        };
+        let classified = apply_provider_failure_rules(
+            &p,
+            429,
+            r#"{"error":{"code":"billing_hard_limit","message":"per-minute limit reached"}}"#,
+            native,
+        );
+        assert_eq!(classified.kind, FailureKind::RateLimit);
+    }
 }

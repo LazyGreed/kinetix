@@ -310,12 +310,11 @@ impl Adapter for AnthropicAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        // Anthropic error type (kept for classification clarity; the message
-        // is what distinguishes quota from a plain rate limit).
-        let _etype = parsed
+        let etype = parsed
             .pointer("/error/type")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_ascii_lowercase();
 
         let retry_after_secs = headers
             .get("retry-after")
@@ -323,15 +322,23 @@ impl Adapter for AnthropicAdapter {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .or_else(|| anthropic_reset_delay(headers));
 
+        let lower = message.to_ascii_lowercase();
+        let credential_error = status == 401
+            || etype.contains("authentication")
+            || lower.contains("invalid api key")
+            || lower.contains("invalid x-api-key")
+            || lower.contains("authentication token");
+
         let kind = match status {
-            400 | 404 | 422 => FailureKind::BadRequest,
-            401 | 403 => FailureKind::AuthError,
+            400 | 422 => FailureKind::BadRequest,
+            401 => FailureKind::AuthError,
+            403 if credential_error => FailureKind::AuthError,
+            403 | 404 => FailureKind::TargetError,
             429 => {
                 // Anthropic uses `rate_limit_error` for throttling; a quota /
                 // credit exhaustion surfaces in the message. Distinguish them so
                 // a quota problem benches the account until reset while a plain
                 // rate limit only cools it down briefly (FR-12.7).
-                let lower = message.to_ascii_lowercase();
                 if lower.contains("quota") || lower.contains("credit") {
                     FailureKind::QuotaExhausted
                 } else {
@@ -769,5 +776,29 @@ mod tests {
             messages[0].get("role").and_then(|v| v.as_str()),
             Some("user")
         );
+    }
+}
+
+#[cfg(test)]
+mod error_scope_tests {
+    use super::*;
+    use crate::adapters::Adapter;
+
+    #[test]
+    fn forbidden_entitlement_does_not_poison_anthropic_credential() {
+        let adapter = AnthropicAdapter::new();
+        let forbidden = adapter.classify_error(
+            403,
+            r#"{"error":{"type":"permission_error","message":"model entitlement missing"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(forbidden.kind, FailureKind::TargetError);
+
+        let unauthorized = adapter.classify_error(
+            401,
+            r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+        assert_eq!(unauthorized.kind, FailureKind::AuthError);
     }
 }

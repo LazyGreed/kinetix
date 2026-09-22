@@ -159,7 +159,7 @@ export function mapRoute(j: any): Route {
       priority: num(x.priority, idx + 1),
       weight: num(x.weight, 1),
     })),
-    continuityPolicy: (j.continuity_policy as Route['continuityPolicy']) || 'strip',
+    continuityPolicy: j.continuity_policy === 'error' ? 'error' : 'strip',
     portabilityPolicy: (j.portability_policy as Route['portabilityPolicy']) || 'strip_with_warning',
     cacheAffinity: !!j.cache_affinity,
     stickyRouting: !!j.sticky_routing,

@@ -423,6 +423,7 @@ pub fn json_to_failure(s: &str) -> Option<UpstreamFailure> {
         "rate_limit" => FailureKind::RateLimit,
         "quota_exhausted" => FailureKind::QuotaExhausted,
         "auth_error" => FailureKind::AuthError,
+        "target_error" => FailureKind::TargetError,
         "server_error" => FailureKind::ServerError,
         "connection_error" => FailureKind::ConnectionError,
         "timeout" => FailureKind::Timeout,
@@ -451,6 +452,7 @@ fn failure_kind_str(kind: FailureKind) -> &'static str {
         FailureKind::RateLimit => "rate_limit",
         FailureKind::QuotaExhausted => "quota_exhausted",
         FailureKind::AuthError => "auth_error",
+        FailureKind::TargetError => "target_error",
         FailureKind::ServerError => "server_error",
         FailureKind::ConnectionError => "connection_error",
         FailureKind::Timeout => "timeout",
@@ -461,7 +463,8 @@ fn failure_kind_str(kind: FailureKind) -> &'static str {
 /// Status-only classification used when the guest cannot be reached.
 fn fallback_failure(status: u16) -> UpstreamFailure {
     let kind = match status {
-        401 | 403 => FailureKind::AuthError,
+        401 => FailureKind::AuthError,
+        403 | 404 => FailureKind::TargetError,
         429 => FailureKind::RateLimit,
         400..=499 => FailureKind::BadRequest,
         _ => FailureKind::ServerError,

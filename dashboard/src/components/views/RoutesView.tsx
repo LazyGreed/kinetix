@@ -597,7 +597,6 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                         className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-xs font-mono rounded w-full"
                       >
                         <option value="strip">Strip proprietary thinking tokens / vendor signatures</option>
-                        <option value="convert">Convert where target equivalent exists</option>
                         <option value="error">Error on non-portable conversation turn</option>
                       </select>
                     </div>

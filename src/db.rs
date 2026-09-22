@@ -477,6 +477,7 @@ pub async fn update_provider(
     timeout_ms: i64,
     capability_mode: &str,
     models_path: Option<&str>,
+    rate_limit_rules: Value,
     follow_redirects: bool,
     credential_hosts: &str,
     allow_insecure_tls: bool,
@@ -487,7 +488,7 @@ pub async fn update_provider(
     sqlx::query(
         "UPDATE providers SET name=?, base_url=?, wire_format=?, auth_scheme=?, custom_header_name=?,
          custom_param_name=?, extra_headers=?, timeout_ms=?, capability_mode=?, models_path=?,
-         follow_redirects=?, credential_hosts=?, allow_insecure_tls=?,
+         rate_limit_rules=?, follow_redirects=?, credential_hosts=?, allow_insecure_tls=?,
          wire_plugin=?, credential_plugin=?, model_source_plugin=? WHERE id=?",
     )
     .bind(name)
@@ -500,6 +501,7 @@ pub async fn update_provider(
     .bind(timeout_ms)
     .bind(capability_mode)
     .bind(models_path)
+    .bind(rate_limit_rules.to_string())
     .bind(follow_redirects as i64)
     .bind(credential_hosts)
     .bind(allow_insecure_tls as i64)
@@ -1019,9 +1021,13 @@ impl RouteRow {
     /// The configured policy for non-portable opaque state (FR-2.11).
     /// Accepts `reject` or `strip_with_warning`.
     pub fn portability(&self) -> &str {
-        match self.portability_policy.as_str() {
-            "reject" => "reject",
-            _ => "strip_with_warning",
+        // continuity_policy is the legacy predecessor of portability_policy.
+        // Preserve existing persisted routes: legacy "error" means reject;
+        // every other legacy value degrades to the explicit warning path.
+        if self.portability_policy == "reject" || self.continuity_policy == "error" {
+            "reject"
+        } else {
+            "strip_with_warning"
         }
     }
 }

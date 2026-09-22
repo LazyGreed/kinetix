@@ -714,6 +714,7 @@ fn provider_json(p: &db::ProviderRow) -> Value {
         "timeout_ms": p.timeout_ms,
         "capability_mode": p.capability_mode,
         "models_path": p.models_path,
+        "rate_limit_rules": serde_json::from_str::<Value>(&p.rate_limit_rules).unwrap_or(json!({})),
         "enabled": p.enabled != 0,
         "follow_redirects": p.follow_redirects != 0,
         "credential_hosts": p.credential_hosts,
@@ -741,6 +742,10 @@ pub struct ProviderBody {
     #[serde(default = "default_permissive")]
     pub capability_mode: String,
     pub models_path: Option<String>,
+    /// Optional provider-specific failure classification overrides. Rules are
+    /// matched against status/code/message before fallback state is updated.
+    #[serde(default)]
+    pub rate_limit_rules: Option<Value>,
     /// NFR-3.10: redirects are never followed unless explicitly enabled.
     #[serde(default)]
     pub follow_redirects: bool,
@@ -879,7 +884,7 @@ pub async fn create_provider(
             timeout_ms: body.timeout_ms,
             capability_mode: &body.capability_mode,
             models_path: body.models_path.as_deref(),
-            rate_limit_rules: json!({}),
+            rate_limit_rules: body.rate_limit_rules.clone().unwrap_or_else(|| json!({})),
             follow_redirects: body.follow_redirects,
             credential_hosts: &body.credential_hosts,
             allow_insecure_tls: body.allow_insecure_tls,
@@ -936,6 +941,13 @@ pub async fn update_provider(
     Json(body): Json<ProviderBody>,
 ) -> ApiResult {
     validate_outbound_url(&state, &body.base_url)?;
+    let existing = db::get_provider(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let rate_limit_rules = body.rate_limit_rules.clone().unwrap_or_else(|| {
+        serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
+    });
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -962,6 +974,7 @@ pub async fn update_provider(
         body.timeout_ms,
         &body.capability_mode,
         body.models_path.as_deref(),
+        rate_limit_rules,
         body.follow_redirects,
         &body.credential_hosts,
         body.allow_insecure_tls,
@@ -1398,7 +1411,9 @@ pub async fn test_provider(
             let latency = started.elapsed().as_millis() as i64;
             if !(200..300).contains(&status) {
                 let text = resp.text().await.unwrap_or_default();
-                let failure = adapter.classify_error(status, &text, &axum::http::HeaderMap::new());
+                let native = adapter.classify_error(status, &text, &axum::http::HeaderMap::new());
+                let failure =
+                    crate::pipeline::apply_provider_failure_rules(&provider, status, &text, native);
                 return Ok(Json(json!({
                     "ok": false, "status": status, "latency_ms": latency,
                     "error": failure.message,
@@ -2065,6 +2080,50 @@ fn portability_default() -> String {
     "strip_with_warning".into()
 }
 
+fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
+    if !matches!(
+        body.strategy.as_str(),
+        "priority" | "round-robin" | "weighted" | "least-used"
+    ) {
+        return Err(ApiError::bad("invalid route strategy"));
+    }
+    if !matches!(body.continuity_policy.as_str(), "strip" | "error") {
+        return Err(ApiError::bad(
+            "continuity_policy must be 'strip' or 'error'",
+        ));
+    }
+    if !matches!(
+        body.portability_policy.as_str(),
+        "reject" | "strip_with_warning"
+    ) {
+        return Err(ApiError::bad(
+            "portability_policy must be 'reject' or 'strip_with_warning'",
+        ));
+    }
+    if !body.fallback_triggers.is_null() {
+        let Some(triggers) = body.fallback_triggers.as_object() else {
+            return Err(ApiError::bad("fallback_triggers must be a JSON object"));
+        };
+        for key in ["on429", "onQuota", "on5xx", "onTimeout"] {
+            if let Some(value) = triggers.get(key) {
+                if !value.is_boolean() {
+                    return Err(ApiError::bad(format!(
+                        "fallback_triggers.{key} must be boolean"
+                    )));
+                }
+            }
+        }
+    }
+    for target in &body.targets {
+        if !target.param_overrides.is_null() && !target.param_overrides.is_object() {
+            return Err(ApiError::bad(
+                "route target param_overrides must be a JSON object",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct RouteTargetBody {
     pub account_id: Option<String>,
@@ -2086,6 +2145,7 @@ pub async fn create_route(
     _auth: AdminAuth,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
+    validate_route_body(&body)?;
     let id = db::insert_route(
         &state.pool,
         &db::NewRoute {
@@ -2131,6 +2191,7 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
+    validate_route_body(&body)?;
     db::update_route(
         &state.pool,
         &id,
@@ -3425,6 +3486,7 @@ pub async fn import_config(
                 timeout_ms,
                 capability_mode,
                 models_path,
+                rate_limit_rules,
                 follow_redirects,
                 credential_hosts,
                 allow_insecure_tls,
