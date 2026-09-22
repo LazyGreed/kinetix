@@ -87,6 +87,16 @@ jobs:
       - name: Tests
         run: cargo test --quiet
 
+      - name: Build compatibility binary
+        run: cargo build --quiet --bin kinetix
+
+      - name: Pi + Claude Code compatibility matrix
+        env:
+          KINETIX_BIN: target/debug/kinetix
+          SYN_TOKENS: "4"
+          SYN_DELAY_MS: "0"
+        run: bash scripts/compat-matrix.sh
+
   dependency-policy:
     name: dependency policy
     if: github.event_name == 'push'
