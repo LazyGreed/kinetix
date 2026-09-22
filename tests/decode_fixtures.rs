@@ -352,7 +352,10 @@ fn responses_rejects_stateful_hosted_and_untranslated_semantics() {
 
     for body in cases {
         let result = frontends::decode(FrontendFormat::OpenAiResponses, body);
-        assert!(result.is_err(), "unsupported Responses semantic was accepted");
+        assert!(
+            result.is_err(),
+            "unsupported Responses semantic was accepted"
+        );
     }
 }
 
