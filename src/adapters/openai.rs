@@ -362,6 +362,7 @@ impl Adapter for OpenAiAdapter {
             .to_string();
         let code = parsed
             .pointer("/error/code")
+            .or_else(|| parsed.get("code"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -386,13 +387,22 @@ impl Adapter for OpenAiAdapter {
             || lower_message.contains("incorrect api key")
             || lower_message.contains("authentication token");
 
+        let quota_exhausted = lower_code.contains("insufficient_quota")
+            || lower_code.contains("insufficient_credit")
+            || lower_code.contains("credit_insufficient")
+            || lower_message.contains("insufficient balance")
+            || lower_message.contains("credit insufficient")
+            || lower_message.contains("insufficient credit")
+            || (lower_message.contains("balance=") && lower_message.contains("required="));
+
         let kind = match status {
+            400 | 422 if quota_exhausted => FailureKind::QuotaExhausted,
             400 | 422 => FailureKind::BadRequest,
             401 => FailureKind::AuthError,
             403 if credential_error => FailureKind::AuthError,
             403 | 404 => FailureKind::TargetError,
             429 => {
-                if lower_code.contains("insufficient_quota") || lower_message.contains("quota") {
+                if quota_exhausted || lower_message.contains("quota") {
                     FailureKind::QuotaExhausted
                 } else {
                     FailureKind::RateLimit
@@ -836,5 +846,45 @@ mod error_scope_tests {
             &reqwest::header::HeaderMap::new(),
         );
         assert_eq!(unauthorized.kind, FailureKind::AuthError);
+    }
+
+    #[test]
+    fn byok_credit_exhaustion_on_400_or_422_is_quota_exhausted() {
+        let adapter = OpenAiAdapter::new();
+        let cases = [
+            (
+                400,
+                r#"{"message":"credit insufficient balance: balance=731 required=2612","type":"invalid_request_error","param":null,"code":"invalid_request_error"}"#,
+            ),
+            (
+                422,
+                r#"{"error":{"message":"insufficient balance for request","code":"invalid_request_error"}}"#,
+            ),
+            (
+                400,
+                r#"{"message":"billing limit reached","code":"insufficient_quota"}"#,
+            ),
+        ];
+
+        for (status, body) in cases {
+            let failure = adapter.classify_error(status, body, &reqwest::header::HeaderMap::new());
+            assert_eq!(failure.kind, FailureKind::QuotaExhausted);
+            assert!(failure.kind.affects_account());
+            assert!(failure.kind.is_retryable());
+        }
+    }
+
+    #[test]
+    fn ordinary_bad_request_remains_non_retryable() {
+        let adapter = OpenAiAdapter::new();
+        let failure = adapter.classify_error(
+            400,
+            r#"{"error":{"message":"invalid parameter: temperature","code":"invalid_request_error"}}"#,
+            &reqwest::header::HeaderMap::new(),
+        );
+
+        assert_eq!(failure.kind, FailureKind::BadRequest);
+        assert!(!failure.kind.affects_account());
+        assert!(!failure.kind.is_retryable());
     }
 }
