@@ -82,10 +82,14 @@ export function mapModel(j: any): ModelConfig {
     cacheWritePer1M: num(p.cache_write_per_1m),
     thinkingPer1M: num(p.thinking_per_1m),
   };
-  const thinkingMap = j.thinking_map || {};
-  const scale = (thinkingMap.levels && Object.keys(thinkingMap.levels).length
-    ? 'custom'
-    : 'off') as ModelConfig['thinkingMap']['scale'];
+  const thinkingMap =
+    j.thinking_map && typeof j.thinking_map === 'object' ? j.thinking_map : {};
+  const thinkingLevels =
+    thinkingMap.levels &&
+    typeof thinkingMap.levels === 'object' &&
+    !Array.isArray(thinkingMap.levels)
+      ? { ...thinkingMap.levels }
+      : {};
   return {
     id: str(j.id),
     providerId: str(j.provider_id),
@@ -107,9 +111,11 @@ export function mapModel(j: any): ModelConfig {
       ? j.parameters
       : {}) as ModelConfig['parameters'],
     thinkingMap: {
-      scale,
-      budgetTokens: undefined,
-      mappedField: str(thinkingMap.budget_field, ''),
+      levels: thinkingLevels,
+      budgetField:
+        typeof thinkingMap.budget_field === 'string' && thinkingMap.budget_field
+          ? thinkingMap.budget_field
+          : undefined,
     },
   };
 }

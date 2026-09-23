@@ -2303,11 +2303,11 @@ fn check_thinking_translation(
         return Ok(());
     }
     let key = thinking_level_key(level);
-    if model.thinking().levels.contains_key(key) {
+    if model.thinking().level_is_executable(key) {
         return Ok(());
     }
     Err(ProxyError::unsupported(format!(
-        "thinking level '{key}' has no configured mapping for model '{}'",
+        "thinking level '{key}' has no executable mapping for model '{}'",
         model.display_name
     )))
 }
@@ -4075,13 +4075,43 @@ mod route_policy_tests {
     fn translated_thinking_requires_an_explicit_model_mapping() {
         let mut req = request();
         req.thinking = Some(crate::types::ThinkingLevel::High);
-
         assert!(check_thinking_translation(&model(serde_json::json!({})), &req).is_err());
-        assert!(check_thinking_translation(
-            &model(serde_json::json!({"levels":{"high":{"reasoning_effort":"high"}}})),
-            &req,
-        )
-        .is_ok());
+
+        let mapped = model(serde_json::json!({
+            "levels": {
+                "low": {"reasoning_effort": "low"},
+                "medium": {"reasoning_effort": "medium"},
+                "high": {"reasoning_effort": "high"}
+            }
+        }));
+        for level in [
+            crate::types::ThinkingLevel::Low,
+            crate::types::ThinkingLevel::Medium,
+            crate::types::ThinkingLevel::High,
+        ] {
+            req.thinking = Some(level);
+            assert!(check_thinking_translation(&mapped, &req).is_ok());
+        }
+
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+        let null_mapping = model(serde_json::json!({
+            "levels": {"high": null}
+        }));
+        assert!(check_thinking_translation(&null_mapping, &req).is_err());
+
+        let scalar_without_field = model(serde_json::json!({
+            "levels": {"high": 4096}
+        }));
+        assert!(check_thinking_translation(&scalar_without_field, &req).is_err());
+
+        let scalar_with_field = model(serde_json::json!({
+            "levels": {"high": 4096},
+            "budget_field": "thinking.budget_tokens"
+        }));
+        assert!(check_thinking_translation(&scalar_with_field, &req).is_ok());
+
+        req.thinking = Some(crate::types::ThinkingLevel::Off);
+        assert!(check_thinking_translation(&model(serde_json::json!({})), &req).is_ok());
     }
 
     #[test]

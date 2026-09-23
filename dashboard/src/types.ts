@@ -101,9 +101,8 @@ export interface ModelConfig {
     top_k?: { supported: boolean; min: number; max: number; default: number; policy: 'forward' | 'clamp' | 'reject' };
   };
   thinkingMap: {
-    scale: 'off' | 'low' | 'medium' | 'high' | 'custom';
-    budgetTokens?: number;
-    mappedField: string;
+    levels: Record<string, unknown>;
+    budgetField?: string;
   };
 }
 

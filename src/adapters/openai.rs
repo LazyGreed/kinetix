@@ -674,6 +674,8 @@ mod tests {
         .to_string();
         m.thinking_map = serde_json::json!({
             "levels": {
+                "low": { "reasoning_effort": "low" },
+                "medium": { "reasoning_effort": "medium" },
                 "high": { "reasoning_effort": "high" }
             }
         })
@@ -686,12 +688,18 @@ mod tests {
         };
         let mut req = base_request();
         req.params.top_k = Some(42.0);
-        req.thinking = Some(crate::types::ThinkingLevel::High);
 
-        let body = OpenAiAdapter.build_body(&ctx, &req).unwrap();
-        assert_eq!(body["top_k"], 42.0);
-        assert_eq!(body["reasoning_effort"], "high");
-        assert_eq!(body["stream_options"]["include_usage"], true);
+        for (level, expected) in [
+            (crate::types::ThinkingLevel::Low, "low"),
+            (crate::types::ThinkingLevel::Medium, "medium"),
+            (crate::types::ThinkingLevel::High, "high"),
+        ] {
+            req.thinking = Some(level);
+            let body = OpenAiAdapter.build_body(&ctx, &req).unwrap();
+            assert_eq!(body["top_k"], 42.0);
+            assert_eq!(body["reasoning_effort"], expected);
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        }
     }
 
     #[test]

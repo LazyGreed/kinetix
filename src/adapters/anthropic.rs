@@ -13,6 +13,28 @@ use crate::types::{
 
 pub struct AnthropicAdapter;
 
+fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
+    let parts: Vec<&str> = path.split('.').collect();
+    insert_dotted_rec(obj, &parts, value);
+}
+
+fn insert_dotted_rec(obj: &mut serde_json::Map<String, Value>, path: &[&str], value: Value) {
+    if path.is_empty() {
+        return;
+    }
+    if path.len() == 1 {
+        obj.insert(path[0].to_string(), value);
+        return;
+    }
+    let entry = obj.entry(path[0].to_string()).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    if let Some(map) = entry.as_object_mut() {
+        insert_dotted_rec(map, &path[1..], value);
+    }
+}
+
 impl AnthropicAdapter {
     pub fn new() -> Self {
         AnthropicAdapter
@@ -354,8 +376,13 @@ impl Adapter for AnthropicAdapter {
                 crate::types::ThinkingLevel::High => "high",
             };
             if let Some(v) = tmap.levels.get(key) {
-                if !v.is_null() {
+                if v.is_object() {
                     body.insert("thinking".to_string(), v.clone());
+                } else if let Some(field) = tmap.budget_field.as_deref() {
+                    insert_dotted(&mut body, field, v.clone());
+                    if field == "thinking.budget_tokens" {
+                        insert_dotted(&mut body, "thinking.type", json!("enabled"));
+                    }
                 }
             }
         }
@@ -750,6 +777,34 @@ mod tests {
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn scalar_thinking_mapping_uses_budget_field() {
+        let p = provider();
+        let mut m = model();
+        m.thinking_map = serde_json::json!({
+            "levels": {"high": 4096},
+            "budget_field": "thinking.budget_tokens"
+        })
+        .to_string();
+        let mut req = base_request();
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 4096
+            })
+        );
     }
 
     #[test]

@@ -170,13 +170,80 @@ pub enum ThinkingLevel {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThinkingMap {
     /// Canonical level -> upstream request field value (opaque JSON).
     #[serde(default)]
     pub levels: std::collections::HashMap<String, serde_json::Value>,
-    /// Whether a numeric budget is also sent, and its field name.
+    /// Whether a scalar mapping is sent under an explicit upstream field.
     #[serde(default)]
     pub budget_field: Option<String>,
+}
+
+impl ThinkingMap {
+    pub fn level_is_executable(&self, level: &str) -> bool {
+        let Some(value) = self.levels.get(level) else {
+            return false;
+        };
+        match value {
+            serde_json::Value::Null | serde_json::Value::Array(_) => false,
+            serde_json::Value::Object(fields) => {
+                !fields.is_empty() && fields.keys().all(|field| !field.trim().is_empty())
+            }
+            serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => self
+                .budget_field
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|field| !field.is_empty()),
+        }
+    }
+
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let budget_field = self.budget_field.as_deref().map(str::trim);
+        if budget_field.is_some_and(str::is_empty) {
+            errors.push("thinking_map.budget_field must not be empty".to_string());
+        }
+
+        for (level, value) in &self.levels {
+            if level.trim().is_empty() {
+                errors.push("thinking_map level names must not be empty".to_string());
+                continue;
+            }
+            match value {
+                serde_json::Value::Null => {
+                    errors.push(format!("thinking_map level '{level}' must not be null"))
+                }
+                serde_json::Value::Array(_) => errors.push(format!(
+                    "thinking_map level '{level}' must be an object or scalar"
+                )),
+                serde_json::Value::Object(fields) => {
+                    if fields.is_empty() {
+                        errors.push(format!(
+                            "thinking_map level '{level}' must not be an empty object"
+                        ));
+                    } else if fields.keys().any(|field| field.trim().is_empty()) {
+                        errors.push(format!(
+                            "thinking_map level '{level}' contains an empty upstream field"
+                        ));
+                    }
+                }
+                serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_) => {
+                    if !self.level_is_executable(level) {
+                        errors.push(format!(
+                            "thinking_map level '{level}' uses a scalar mapping but budget_field is not configured"
+                        ));
+                    }
+                }
+            }
+        }
+
+        errors
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,5 +669,62 @@ mod tests {
             reasoning: false,
         };
         assert!(caps.satisfies(&vision_needed));
+    }
+
+    #[test]
+    fn thinking_map_rejects_unknown_fields() {
+        let malformed = serde_json::json!({
+            "scale": "medium",
+            "mappedField": "thinkingConfig"
+        });
+        assert!(serde_json::from_value::<ThinkingMap>(malformed).is_err());
+    }
+
+    #[test]
+    fn thinking_map_round_trips_levels_and_budget_field() {
+        let expected = serde_json::json!({
+            "levels": {
+                "low": 512,
+                "medium": {"reasoning_effort": "medium"},
+                "high": {"thinkingConfig.thinkingBudget": 4096}
+            },
+            "budget_field": "thinking.budget_tokens"
+        });
+        let parsed: ThinkingMap = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(parsed.levels.get("low"), Some(&serde_json::json!(512)));
+        assert_eq!(
+            parsed.levels.get("medium"),
+            Some(&serde_json::json!({"reasoning_effort": "medium"}))
+        );
+        assert_eq!(
+            parsed.budget_field.as_deref(),
+            Some("thinking.budget_tokens")
+        );
+        assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+    }
+
+    #[test]
+    fn thinking_map_rejects_non_executable_values() {
+        let null_mapping: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "levels": {"high": null}
+        }))
+        .unwrap();
+        assert!(!null_mapping.validation_errors().is_empty());
+        assert!(!null_mapping.level_is_executable("high"));
+
+        let scalar_without_field: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "levels": {"high": 4096}
+        }))
+        .unwrap();
+        assert!(!scalar_without_field.validation_errors().is_empty());
+        assert!(!scalar_without_field.level_is_executable("high"));
+
+        let scalar_with_field: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "levels": {"high": 4096},
+            "budget_field": "thinking.budget_tokens"
+        }))
+        .unwrap();
+        assert!(scalar_with_field.validation_errors().is_empty());
+        assert!(scalar_with_field.level_is_executable("high"));
     }
 }

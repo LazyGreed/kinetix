@@ -19,7 +19,7 @@ use crate::db::{self, Pool};
 use crate::frontends::FrontendFormat;
 use crate::limits;
 use crate::pipeline;
-use crate::types::{AuthScheme, Capabilities, Prices, WireFormat};
+use crate::types::{AuthScheme, Capabilities, Prices, ThinkingMap, WireFormat};
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
@@ -1633,13 +1633,25 @@ pub struct ModelBody {
     #[serde(default)]
     pub parameters: Value,
     #[serde(default)]
-    pub thinking_map: Value,
+    pub thinking_map: ThinkingMap,
     #[serde(default)]
     pub extra_request: Value,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn validate_thinking_map(thinking_map: &ThinkingMap) -> Result<(), ApiError> {
+    let problems = thinking_map.validation_errors();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::bad(format!(
+            "invalid thinking_map: {}",
+            problems.join("; ")
+        )))
+    }
 }
 
 pub async fn create_model(
@@ -1654,6 +1666,7 @@ pub async fn create_model(
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let caps: Capabilities = serde_json::from_value(body.capabilities.clone()).unwrap_or_default();
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
+    validate_thinking_map(&body.thinking_map)?;
 
     let id = db::insert_model(
         &state.pool,
@@ -1667,7 +1680,8 @@ pub async fn create_model(
             capabilities: serde_json::to_value(&caps).unwrap(),
             prices: serde_json::to_value(&prices).unwrap(),
             parameters: body.parameters.clone(),
-            thinking_map: body.thinking_map.clone(),
+            thinking_map: serde_json::to_value(&body.thinking_map)
+                .expect("ThinkingMap serialization is infallible"),
             extra_request: body.extra_request.clone(),
             discovery: json!({}),
         },
@@ -1703,6 +1717,7 @@ pub async fn update_model(
 ) -> ApiResult {
     let caps: Capabilities = serde_json::from_value(body.capabilities.clone()).unwrap_or_default();
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
+    validate_thinking_map(&body.thinking_map)?;
     db::update_model(
         &state.pool,
         &id,
@@ -1713,7 +1728,7 @@ pub async fn update_model(
         serde_json::to_value(&caps).unwrap(),
         serde_json::to_value(&prices).unwrap(),
         body.parameters.clone(),
-        body.thinking_map.clone(),
+        serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible"),
         body.extra_request.clone(),
     )
     .await
@@ -2393,7 +2408,7 @@ pub async fn validate_model_edit(
     _auth: AdminAuth,
     Json(body): Json<ModelBody>,
 ) -> ApiResult {
-    let out = crate::validate::validate_model(
+    let mut out = crate::validate::validate_model(
         &body.upstream_id,
         body.context_window,
         body.max_output_tokens,
@@ -2401,6 +2416,13 @@ pub async fn validate_model_edit(
         &body.prices,
         &body.parameters,
     );
+    let thinking_problems = body.thinking_map.validation_errors();
+    if !thinking_problems.is_empty() {
+        if let Some(problems) = out.get_mut("problems").and_then(Value::as_array_mut) {
+            problems.extend(thinking_problems.into_iter().map(Value::String));
+        }
+        out["valid"] = Value::Bool(false);
+    }
     Ok(Json(out))
 }
 
@@ -4697,6 +4719,68 @@ fn antigravity_loopback_redirect(bind: &str) -> Result<String, ApiError> {
     };
 
     Ok(format!("http://{callback_host}:{port}/callback"))
+}
+
+#[cfg(test)]
+mod model_body_tests {
+    use super::{validate_thinking_map, ModelBody};
+
+    #[test]
+    fn rejects_legacy_dashboard_thinking_shape() {
+        let body = serde_json::json!({
+            "upstream_id": "reasoning-model",
+            "thinking_map": {
+                "scale": "medium",
+                "mappedField": "thinkingConfig"
+            }
+        });
+        assert!(serde_json::from_value::<ModelBody>(body).is_err());
+    }
+
+    #[test]
+    fn accepts_canonical_thinking_shape() {
+        let body = serde_json::json!({
+            "upstream_id": "reasoning-model",
+            "thinking_map": {
+                "levels": {
+                    "low": {"reasoning_effort": "low"},
+                    "medium": {"reasoning_effort": "medium"},
+                    "high": {"reasoning_effort": "high"}
+                },
+                "budget_field": null
+            }
+        });
+        let parsed = serde_json::from_value::<ModelBody>(body).unwrap();
+        assert_eq!(parsed.thinking_map.levels.len(), 3);
+    }
+
+    #[test]
+    fn rejects_non_executable_thinking_mappings() {
+        for thinking_map in [
+            serde_json::json!({"levels": {"high": null}}),
+            serde_json::json!({"levels": {"high": 4096}}),
+        ] {
+            let body = serde_json::json!({
+                "upstream_id": "reasoning-model",
+                "thinking_map": thinking_map
+            });
+            let parsed = serde_json::from_value::<ModelBody>(body).unwrap();
+            assert!(validate_thinking_map(&parsed.thinking_map).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_scalar_thinking_mapping_with_budget_field() {
+        let body = serde_json::json!({
+            "upstream_id": "reasoning-model",
+            "thinking_map": {
+                "levels": {"high": 4096},
+                "budget_field": "thinking.budget_tokens"
+            }
+        });
+        let parsed = serde_json::from_value::<ModelBody>(body).unwrap();
+        assert!(validate_thinking_map(&parsed.thinking_map).is_ok());
+    }
 }
 
 #[cfg(test)]
