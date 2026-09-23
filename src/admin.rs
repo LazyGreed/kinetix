@@ -1714,8 +1714,7 @@ pub async fn update_model(
         serde_json::to_value(&caps).unwrap(),
         serde_json::to_value(&prices).unwrap(),
         body.parameters.clone(),
-        serde_json::to_value(&body.thinking_map)
-            .expect("ThinkingMap serialization is infallible"),
+        serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible"),
         body.extra_request.clone(),
     )
     .await
