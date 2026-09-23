@@ -1471,9 +1471,13 @@ aspiration. It is a living list: update it as later phases land.
   preference, and extension fields. Adapter auth/body transforms are fallible:
   malformed output or guest faults become typed attempt failures before network
   dispatch, so route fallback policy can act on the failure kind and Kinetix
-  never sends an unauthenticated or `null` degraded request. Canonical events
-  and failure evidence cross the boundary as tagged JSON. This **supersedes** the `host-http-stream`
-  design in §7.1: because core owns transport, an adapter needs no streaming
+  never sends an unauthenticated or `null` degraded request. Successful
+  response batches cross back as versioned `kinetix.plugin.response` JSON
+  (`schema_version = 1`) and are strictly validated before becoming internal
+  stream events; warning and terminal-error events use the same contract.
+  Classified non-2xx evidence from `classify_error` remains a separate
+  normalized failure object. This **supersedes** the `host-http-stream` design
+  in §7.1: because core owns transport, an adapter needs no streaming
   host capability and the buffered `host-http` import is refused to adapter
   stores. A provider bound with `wire_plugin` resolves to its plugin adapter at
   enable time (registered under both `plugin:<id>/<cap>` and the bare id).
