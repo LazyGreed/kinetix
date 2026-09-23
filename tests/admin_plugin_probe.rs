@@ -10,7 +10,6 @@ use axum::{
     Json, Router,
 };
 use kinetix::{
-    adapters::AdapterRegistry,
     admin::{self, TestBody},
     app::AppState,
     auth::AdminAuth,
@@ -24,7 +23,7 @@ use kinetix::{
 };
 use serde_json::json;
 
-async fn chat_completions(State(attempts): State<Arc<AtomicUsize>>) -> (StatusCode, Json<serde_json::Value>) {
+async fn chat_completions(\n    State(attempts): State<Arc<AtomicUsize>>,\n) -> (StatusCode, Json<serde_json::Value>) {
     attempts.fetch_add(1, Ordering::SeqCst);
     (
         StatusCode::OK,
@@ -172,10 +171,10 @@ async fn account_probe_uses_registered_plugin_adapter() {
         0,
     );
 
-    let plugin_adapter = AdapterRegistry::new().for_format(WireFormat::Openai);
+    let plugin_adapter = state.adapters.for_format(WireFormat::Openai);
     state.register_plugin_adapter(plugin_ref, plugin_adapter);
 
-    let response = admin::test_account(
+    let response = match admin::test_account(
         State(state),
         AdminAuth {
             actor: "test".into(),
@@ -188,7 +187,10 @@ async fn account_probe_uses_registered_plugin_adapter() {
         }),
     )
     .await
-    .unwrap();
+    {
+        Ok(response) => response,
+        Err(_) => panic!("plugin-backed account probe should succeed"),
+    };
 
     assert_eq!(response.0.get("ok").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(response.0.get("status").and_then(|v| v.as_u64()), Some(200));
