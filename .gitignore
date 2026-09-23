@@ -19,3 +19,6 @@ config.toml
 
 # Editor / OS
 .DS_Store
+
+# Manual release-client acceptance output
+/acceptance-artifacts

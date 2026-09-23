@@ -9,6 +9,15 @@ allowed_models = ["*"]
 rpm_limit = 100000
 tpm_limit = 100000000
 
+[[virtual_keys]]
+name = "Restricted Models Key"
+key = "sk-kinetix-compat-restricted-models"
+owner = "compat"
+tag = "models-visible"
+allowed_models = ["syn-openai", "syn-openai-alias", "syn-fallback"]
+rpm_limit = 100000
+tpm_limit = 100000000
+
 [[providers]]
 name = "Synth OpenAI"
 base_url = "http://127.0.0.1:9199/openai/v1"
@@ -254,3 +263,27 @@ max_attempts = 2
   model = "Synth Gemini/syn-gemini"
   priority = 2
   weight = 1
+
+
+# Token counting must remain local for routes whose eligible targets do not
+# share one provider/model tokenizer. This route is used only by compatibility tests.
+[[routes]]
+name = "syn-count-heterogeneous"
+strategy = "priority"
+max_attempts = 2
+
+  [[routes.targets]]
+  model = "Synth OpenAI/syn-openai"
+  priority = 1
+  weight = 1
+
+  [[routes.targets]]
+  model = "Synth Anthropic/syn-anthropic"
+  priority = 2
+  weight = 1
+
+
+[[aliases]]
+alias = "syn-openai-alias"
+target_type = "model"
+target = "Synth OpenAI/syn-openai"

@@ -67,10 +67,34 @@ scripts/run-ci.sh --skip-deps
   ```
 
 - **Coding-Agent Compatibility Matrix**:
-  Tests multi-turn streaming, tool calling, argument reassembly, and session affinity across Pi, Codex Responses, and Anthropic client profiles:
+  Tests the #75/#83 client profiles plus the v1 native/translated/fallback field contract:
   ```bash
   scripts/compat-matrix.sh 127.0.0.1:8186
+  python3 scripts/render-protocol-v1-compat.py --check
   ```
+
+- **Real-client release acceptance**:
+  Required before release candidates, but intentionally excluded from normal CI because it uses installed Pi/Claude Code/Codex clients and can consume real provider quota. Configure explicit same-format/translated/fallback/affinity selectors as documented in `docs/compatibility.md`, then run:
+  ```bash
+  KINETIX_BASE=https://kinetix.example.com \
+  KINETIX_KEY=sk-kinetix-... \
+  KINETIX_ADMIN_TOKEN='admin credential' \
+  KINETIX_ACCEPT_PI_SAME_MODEL=direct-openai \
+  KINETIX_ACCEPT_PI_TRANSLATED_MODEL=translated-non-openai \
+  KINETIX_ACCEPT_PI_FALLBACK_MODEL=forced-fallback-route \
+  KINETIX_ACCEPT_PI_AFFINITY_MODEL=sticky-route \
+  KINETIX_ACCEPT_CLAUDE_SAME_MODEL=direct-anthropic \
+  KINETIX_ACCEPT_CLAUDE_TRANSLATED_MODEL=translated-non-anthropic \
+  KINETIX_ACCEPT_CLAUDE_FALLBACK_MODEL=forced-fallback-route \
+  KINETIX_ACCEPT_CLAUDE_AFFINITY_MODEL=sticky-route \
+  KINETIX_ACCEPT_RESPONSES_OPENAI_MODEL=responses-via-openai \
+  KINETIX_ACCEPT_RESPONSES_GEMINI_MODEL=responses-via-gemini \
+  KINETIX_ACCEPT_RESPONSES_ANTHROPIC_MODEL=responses-via-anthropic \
+  KINETIX_ACCEPT_RESPONSES_FALLBACK_MODEL=forced-fallback-route \
+  KINETIX_ACCEPT_RESPONSES_AFFINITY_MODEL=sticky-route \
+    bash scripts/release-client-acceptance.sh all
+  ```
+  The runner requires multi-turn/two-tool continuation, verifies fallback headers, resolves admin-only Route Traces to prove sticky `final_target`, and probes exact Claude `count_tokens`. Set `KINETIX_PLUGIN_E2E_PACKAGE=/path/to/plugin.kxp` to include external plugin host/guest acceptance.
 
 ## Submitting Changes & Push Policy
 
@@ -82,6 +106,8 @@ scripts/run-ci.sh --skip-deps
 6. **Conserve GitHub Actions resources**: Do not push every intermediate commit. Batch commits locally and push when a cohesive milestone is ready.
 
 ## Local Release & Publishing
+
+Before cutting a release candidate, run the real-client acceptance command above and keep its `acceptance-artifacts/` output with the release verification record.
 
 Releases are built locally on the maintainer system to conserve GitHub Actions runner minutes:
 

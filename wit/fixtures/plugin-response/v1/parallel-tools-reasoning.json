@@ -1,0 +1,51 @@
+{
+  "schema": "kinetix.plugin.response",
+  "schema_version": 1,
+  "events": [
+    {
+      "type": "start",
+      "upstream_request_id": "req_parallel"
+    },
+    {
+      "type": "thinking_delta",
+      "text": "consider tools",
+      "signature": "sig-parallel"
+    },
+    {
+      "type": "tool_call_start",
+      "index": 0,
+      "id": "call_a",
+      "name": "get_weather",
+      "signature": null
+    },
+    {
+      "type": "tool_call_args_delta",
+      "index": 0,
+      "args": "{\"city\":\"Paris\"}"
+    },
+    {
+      "type": "tool_call_start",
+      "index": 1,
+      "id": "call_b",
+      "name": "read_file",
+      "signature": "sig-tool-b"
+    },
+    {
+      "type": "tool_call_args_delta",
+      "index": 1,
+      "args": "{\"path\":\"src/main.rs\"}"
+    },
+    {
+      "type": "usage",
+      "input": 20,
+      "output": 8,
+      "cached": null,
+      "cache_write": null,
+      "thinking": 3
+    },
+    {
+      "type": "finish",
+      "reason": "tool_calls"
+    }
+  ]
+}
