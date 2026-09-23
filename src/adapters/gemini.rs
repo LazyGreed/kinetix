@@ -1266,10 +1266,7 @@ mod schema_tests {
         });
         let got = sanitize_schema(&input, "tool 'chrome_devtools_load'").unwrap();
 
-        assert_eq!(
-            got.pointer("/properties/query/minLength"),
-            Some(&json!(1))
-        );
+        assert_eq!(got.pointer("/properties/query/minLength"), Some(&json!(1)));
         assert_eq!(
             got.pointer("/properties/query/maxLength"),
             Some(&json!(10000))
