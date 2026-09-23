@@ -409,8 +409,8 @@ fn add_nullable_type(
 /// - OpenAPI `nullable` -> JSON Schema null type
 /// - lossless object-style `allOf` merges
 ///
-/// Unknown validation keywords fail closed instead of being forwarded to Google
-/// or silently discarded.
+/// Gemini-unsupported validation keywords are stripped recursively before dispatch.
+/// Unknown schema constructs still fail closed instead of being forwarded to Google.
 fn sanitize_schema(schema: &Value, root_path: &str) -> Result<Value, UpstreamFailure> {
     sanitize_schema_node(schema, root_path)
 }
@@ -428,6 +428,20 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
         match key.as_str() {
             "$schema" | "$comment" | "strict" | "default" | "examples" | "example"
             | "deprecated" | "readOnly" | "writeOnly" => {}
+
+            // Gemini's tool-schema subset rejects these standard validation
+            // constraints. Drop them recursively instead of rejecting the tool;
+            // supported structural fields are still preserved below.
+            "exclusiveMinimum"
+            | "exclusiveMaximum"
+            | "multipleOf"
+            | "minLength"
+            | "maxLength"
+            | "pattern"
+            | "uniqueItems"
+            | "minProperties"
+            | "maxProperties"
+            | "propertyNames" => {}
 
             "definitions" | "$defs" => {
                 let definitions = value
@@ -1237,31 +1251,71 @@ mod schema_tests {
     }
 
     #[test]
-    fn sanitize_schema_rejects_unsupported_validation_keywords() {
-        for (keyword, value) in [
-            ("exclusiveMinimum", json!(0)),
-            ("exclusiveMaximum", json!(10)),
-            ("propertyNames", json!({"pattern":"^[a-z]+$"})),
-            ("pattern", json!("^[a-z]+$")),
-            ("uniqueItems", json!(true)),
+    fn sanitize_schema_strips_unsupported_validation_keywords_recursively() {
+        let input = json!({
+            "type": "object",
+            "maxProperties": 4,
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "search text",
+                    "minLength": 1,
+                    "maxLength": 10000,
+                    "pattern": "^.+$"
+                },
+                "items": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "score": {
+                                "type": "number",
+                                "exclusiveMinimum": 0,
+                                "exclusiveMaximum": 10,
+                                "multipleOf": 0.5
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "minProperties": 1,
+                                "propertyNames": {"pattern": "^[a-z]+$"}
+                            }
+                        }
+                    }
+                }
+            },
+            "required": ["query"]
+        });
+        let got = sanitize_schema(&input, "tool 'chrome_devtools_load'").unwrap();
+
+        for pointer in [
+            "/maxProperties",
+            "/properties/query/minLength",
+            "/properties/query/maxLength",
+            "/properties/query/pattern",
+            "/properties/items/uniqueItems",
+            "/properties/items/items/properties/score/exclusiveMinimum",
+            "/properties/items/items/properties/score/exclusiveMaximum",
+            "/properties/items/items/properties/score/multipleOf",
+            "/properties/items/items/properties/metadata/minProperties",
+            "/properties/items/items/properties/metadata/propertyNames",
         ] {
-            let mut value_schema = json!({ "type": "string" });
-            value_schema
-                .as_object_mut()
-                .unwrap()
-                .insert(keyword.to_string(), value);
-            let input = json!({
-                "type": "object",
-                "properties": { "value": value_schema }
-            });
-            let err = sanitize_schema(&input, "tool 'agent'").unwrap_err();
-            assert_eq!(err.kind, FailureKind::BadRequest);
-            assert!(
-                err.message.contains(keyword),
-                "expected {keyword} in: {}",
-                err.message
-            );
+            assert!(got.pointer(pointer).is_none(), "unexpected {pointer}: {got}");
         }
+
+        assert_eq!(
+            got.pointer("/properties/query/type"),
+            Some(&json!("string"))
+        );
+        assert_eq!(
+            got.pointer("/properties/query/description"),
+            Some(&json!("search text"))
+        );
+        assert_eq!(
+            got.pointer("/properties/items/items/properties/score/type"),
+            Some(&json!("number"))
+        );
+        assert_eq!(got["required"], json!(["query"]));
     }
 
     #[test]
@@ -1285,21 +1339,33 @@ mod schema_tests {
     }
 
     #[test]
-    fn build_tools_uses_parameters_json_schema() {
+    fn build_tools_uses_sanitized_parameters_json_schema() {
         let req = InternalRequest {
             requested_model: "gemini".into(),
             system: vec![],
             messages: vec![],
             tools: vec![crate::types::ToolDef {
-                name: "read".into(),
-                description: Some("read a file".into()),
+                name: "chrome_devtools_load".into(),
+                description: Some("load a DevTools resource".into()),
                 parameters: json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "path": { "type": "string" }
+                        "query": {
+                            "type": "string",
+                            "description": "resource query",
+                            "maxLength": 10000
+                        },
+                        "selectors": {
+                            "type": "array",
+                            "uniqueItems": true,
+                            "items": {
+                                "type": "string",
+                                "minLength": 1
+                            }
+                        }
                     },
-                    "required": ["path"]
+                    "required": ["query"]
                 }),
             }],
             tool_choice: None,
@@ -1314,16 +1380,22 @@ mod schema_tests {
 
         let tools = GeminiAdapter::build_tools(&req).unwrap().unwrap();
         let declaration = &tools[0]["functionDeclarations"][0];
+        let schema = &declaration["parametersJsonSchema"];
+
         assert!(declaration.get("parameters").is_none());
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["query"]));
         assert_eq!(
-            declaration["parametersJsonSchema"]["additionalProperties"],
-            false
+            schema.pointer("/properties/query/description"),
+            Some(&json!("resource query"))
         );
-        assert_eq!(
-            declaration["parametersJsonSchema"]["required"],
-            json!(["path"])
-        );
+        assert!(schema.pointer("/properties/query/maxLength").is_none());
+        assert!(schema.pointer("/properties/selectors/uniqueItems").is_none());
+        assert!(schema
+            .pointer("/properties/selectors/items/minLength")
+            .is_none());
     }
+
 }
 
 #[cfg(test)]
