@@ -534,7 +534,8 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
             }
 
             "$id" | "$anchor" | "type" | "format" | "title" | "description" | "enum"
-            | "minItems" | "maxItems" | "minimum" | "maximum" | "required" | "propertyOrdering" => {
+            | "minLength" | "maxLength" | "minItems" | "maxItems" | "minimum" | "maximum"
+            | "required" | "propertyOrdering" => {
                 out.insert(key.clone(), value.clone());
             }
 
@@ -1237,13 +1238,65 @@ mod schema_tests {
     }
 
     #[test]
+    fn sanitize_schema_preserves_string_length_constraints_recursively() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "search text",
+                    "minLength": 1,
+                    "maxLength": 10000
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 64
+                            }
+                        }
+                    }
+                }
+            },
+            "required": ["query"]
+        });
+        let got = sanitize_schema(&input, "tool 'chrome_devtools_load'").unwrap();
+
+        assert_eq!(got.pointer("/properties/query/minLength"), Some(&json!(1)));
+        assert_eq!(
+            got.pointer("/properties/query/maxLength"),
+            Some(&json!(10000))
+        );
+        assert_eq!(
+            got.pointer("/properties/items/items/properties/label/minLength"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            got.pointer("/properties/items/items/properties/label/maxLength"),
+            Some(&json!(64))
+        );
+        assert_eq!(
+            got.pointer("/properties/query/description"),
+            Some(&json!("search text"))
+        );
+        assert_eq!(got["required"], json!(["query"]));
+    }
+
+    #[test]
     fn sanitize_schema_rejects_unsupported_validation_keywords() {
         for (keyword, value) in [
             ("exclusiveMinimum", json!(0)),
             ("exclusiveMaximum", json!(10)),
+            ("multipleOf", json!(0.5)),
             ("propertyNames", json!({"pattern":"^[a-z]+$"})),
             ("pattern", json!("^[a-z]+$")),
             ("uniqueItems", json!(true)),
+            ("minProperties", json!(1)),
+            ("maxProperties", json!(4)),
         ] {
             let mut value_schema = json!({ "type": "string" });
             value_schema
@@ -1285,21 +1338,26 @@ mod schema_tests {
     }
 
     #[test]
-    fn build_tools_uses_parameters_json_schema() {
+    fn build_tools_preserves_json_schema_length_constraints() {
         let req = InternalRequest {
             requested_model: "gemini".into(),
             system: vec![],
             messages: vec![],
             tools: vec![crate::types::ToolDef {
-                name: "read".into(),
-                description: Some("read a file".into()),
+                name: "chrome_devtools_load".into(),
+                description: Some("load a DevTools resource".into()),
                 parameters: json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "path": { "type": "string" }
+                        "query": {
+                            "type": "string",
+                            "description": "resource query",
+                            "minLength": 1,
+                            "maxLength": 10000
+                        }
                     },
-                    "required": ["path"]
+                    "required": ["query"]
                 }),
             }],
             tool_choice: None,
@@ -1314,14 +1372,22 @@ mod schema_tests {
 
         let tools = GeminiAdapter::build_tools(&req).unwrap().unwrap();
         let declaration = &tools[0]["functionDeclarations"][0];
+        let schema = &declaration["parametersJsonSchema"];
+
         assert!(declaration.get("parameters").is_none());
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["query"]));
         assert_eq!(
-            declaration["parametersJsonSchema"]["additionalProperties"],
-            false
+            schema.pointer("/properties/query/description"),
+            Some(&json!("resource query"))
         );
         assert_eq!(
-            declaration["parametersJsonSchema"]["required"],
-            json!(["path"])
+            schema.pointer("/properties/query/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            schema.pointer("/properties/query/maxLength"),
+            Some(&json!(10000))
         );
     }
 }
