@@ -1393,7 +1393,6 @@ mod schema_tests {
             Some(&json!(10000))
         );
     }
-
 }
 
 #[cfg(test)]
