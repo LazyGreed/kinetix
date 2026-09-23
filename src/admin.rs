@@ -1680,7 +1680,8 @@ pub async fn create_model(
             capabilities: serde_json::to_value(&caps).unwrap(),
             prices: serde_json::to_value(&prices).unwrap(),
             parameters: body.parameters.clone(),
-            thinking_map: serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible"),
+            thinking_map: serde_json::to_value(&body.thinking_map)
+                .expect("ThinkingMap serialization is infallible"),
             extra_request: body.extra_request.clone(),
             discovery: json!({}),
         },
