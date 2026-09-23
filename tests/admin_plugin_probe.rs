@@ -23,7 +23,9 @@ use kinetix::{
 };
 use serde_json::json;
 
-async fn chat_completions(\n    State(attempts): State<Arc<AtomicUsize>>,\n) -> (StatusCode, Json<serde_json::Value>) {
+async fn chat_completions(
+    State(attempts): State<Arc<AtomicUsize>>,
+) -> (StatusCode, Json<serde_json::Value>) {
     attempts.fetch_add(1, Ordering::SeqCst);
     (
         StatusCode::OK,
