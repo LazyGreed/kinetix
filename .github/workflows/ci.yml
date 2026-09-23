@@ -1,9 +1,10 @@
 name: ci
 
+# Automatic push/PR triggers are disabled; local CI now runs via
+# scripts/run-ci.sh. Trigger this workflow manually from the Actions tab
+# (or `gh workflow run ci.yml`) if needed.
 on:
-  push:
-    branches: [main, master]
-  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -99,7 +100,6 @@ jobs:
 
   dependency-policy:
     name: dependency policy
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

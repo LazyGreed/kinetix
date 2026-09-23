@@ -44,11 +44,11 @@ Thank you for your interest in contributing to Kinetix! Kinetix is a streaming-f
 Before submitting changes, ensure all tests and lint checks pass. We provide a local CI script that mirrors the GitHub Actions workflow:
 
 ```bash
-# Run the fast checks (formatting, clippy, unit tests, cargo-deny)
-scripts/ci.sh --fast
+# Run the full gate: format, dashboard build, clippy + tests + compat matrix, cargo-deny
+scripts/run-ci.sh
 
-# Run the complete test suite (fmt, clippy, tests, release build, dashboard build, smoke test, compatibility matrix, bench, cargo-deny)
-scripts/ci.sh
+# Skip the dependency-policy (cargo-deny) job, which in ci.yml only runs on push
+scripts/run-ci.sh --skip-deps
 ```
 
 ### Individual Test Suites
@@ -77,7 +77,7 @@ scripts/ci.sh
 1. Create a feature branch off `main` or commit locally.
 2. Keep commits atomic and write descriptive commit messages (e.g. `feat(frontends): add foo`, `fix(adapters): handle bar`).
 3. If introducing changes to wire formats, add corresponding test cases in `tests/decode_fixtures.rs`, `tests/wire_fixtures.rs`, or the compatibility matrix.
-4. Run `scripts/ci.sh` locally to ensure all checks pass before pushing.
+4. Run `scripts/run-ci.sh` locally to ensure all checks pass before pushing.
 5. Keep [`AGENTS.md`](AGENTS.md) synchronized if your changes affect architecture, commands, dependencies, schemas, or conventions.
 6. **Conserve GitHub Actions resources**: Do not push every intermediate commit. Batch commits locally and push when a cohesive milestone is ready.
 

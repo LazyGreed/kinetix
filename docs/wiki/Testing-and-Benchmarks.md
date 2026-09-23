@@ -39,8 +39,8 @@ rejection. Wired into CI after the release build.
 ## Local CI mirror
 
 ```bash
-scripts/ci.sh            # fmt, clippy, tests, release, dashboard, smoke, bench, cargo-deny
-scripts/ci.sh --fast     # skips release/smoke/bench/dashboard
+scripts/run-ci.sh              # format, dashboard, rust (clippy+test+compat-matrix), cargo-deny
+scripts/run-ci.sh --skip-deps  # skips the dependency-policy (cargo-deny) job
 ```
 
 Run this before pushing — it mirrors `.github/workflows/ci.yml`.

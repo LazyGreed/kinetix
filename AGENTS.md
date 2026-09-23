@@ -95,15 +95,13 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   ```bash
   cargo test --quiet
   ```
-- **Fast local CI gate**:
-  Runs formatting check, clippy, unit tests, source-integrity check, and cargo-deny:
+- **Local CI gate** (mirrors `.github/workflows/ci.yml` exactly: format, dashboard, rust, dependency-policy jobs, with the same dependency graph):
   ```bash
-  scripts/ci.sh --fast
+  scripts/run-ci.sh
   ```
-- **Full local CI gate**:
-  Runs fmt, clippy, tests, release build, dashboard build, installer smoke test, synthetic upstream smoke test, compat matrix, benchmark, and cargo-deny:
+- **Skip the dependency-policy (cargo-deny) job** (push-only in ci.yml):
   ```bash
-  scripts/ci.sh
+  scripts/run-ci.sh --skip-deps
   ```
 - **Individual test suites**:
   ```bash
@@ -235,7 +233,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 - **NEVER hardcode vendor presets or model capabilities**: Kinetix is strictly operator-configured. Do not add hardcoded model dictionaries, provider presets, or assumed capabilities into the Rust core.
 - **NEVER commit without building the dashboard**: If modifying files in `dashboard/`, always run `npm run build` inside `dashboard/` and ensure `src/assets.rs` is refreshed before running `cargo build` or committing.
 - **NEVER introduce non-permissive dependencies**: All new crate dependencies must strictly comply with `deny.toml` (OSI permissive licenses only, no GPL/AGPL, zero unreviewed security advisories).
-- **NEVER push unverified commits directly to remote**: Batch commits locally and verify with `scripts/ci.sh --fast` (or `scripts/ci.sh`) before pushing to conserve CI runner resources.
+- **NEVER push unverified commits directly to remote**: Batch commits locally and verify with `scripts/run-ci.sh` before pushing to conserve CI runner resources.
 - **NEVER silently mutate or discard request parameters**: Preserve payload information unless an explicit operator route policy dictates parameter stripping or rewriting.
 - **NEVER forget to update AGENTS.md**: Whenever repository architecture, build scripts, testing expectations, database migrations, or conventions change, **agents must update AGENTS.md** as part of the same task.
 
@@ -259,13 +257,9 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   ```bash
   cargo test --quiet
   ```
-- Fast local CI checks pass:
+- Local CI gate passes (mirrors `.github/workflows/ci.yml`):
   ```bash
-  scripts/ci.sh --fast
-  ```
-- Full CI test suite passes before merging major milestones:
-  ```bash
-  scripts/ci.sh
+  scripts/run-ci.sh
   ```
 - Plugin integration tests pass:
   ```bash

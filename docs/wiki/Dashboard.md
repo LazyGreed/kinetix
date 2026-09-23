@@ -63,4 +63,4 @@ cd .. && touch src/assets.rs && cargo build   # re-embed
 ```
 
 `scripts/build-dashboard.sh` does all of the above and then a release build.
-`scripts/ci.sh` mirrors the GitHub Actions pipeline locally.
+`scripts/run-ci.sh` mirrors the GitHub Actions pipeline locally.
