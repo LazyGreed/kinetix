@@ -18,7 +18,6 @@ type CanonicalThinkingLevel = (typeof CANONICAL_THINKING_LEVELS)[number];
 
 const thinkingValueToInput = (value: unknown): string => {
   if (value === undefined) return '';
-  if (typeof value === 'string') return value;
   return JSON.stringify(value) ?? '';
 };
 
