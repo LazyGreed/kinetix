@@ -1282,61 +1282,6 @@ async fn discover_models_native(
     Ok(adapter.parse_model_list(&parsed))
 }
 
-fn adapter_for_provider_probe(
-    adapters: &crate::adapters::AdapterRegistry,
-    provider: &db::ProviderRow,
-) -> std::sync::Arc<dyn crate::adapters::Adapter> {
-    adapters.for_provider(provider)
-}
-
-#[cfg(test)]
-mod provider_probe_adapter_tests {
-    use super::adapter_for_provider_probe;
-    use crate::adapters::{AdapterRegistry, UnimplementedAdapter};
-    use crate::db::ProviderRow;
-    use std::sync::Arc;
-
-    fn plugin_provider() -> ProviderRow {
-        ProviderRow {
-            id: "plugin-provider".into(),
-            name: "Plugin Provider".into(),
-            base_url: "https://example.com".into(),
-            wire_format: "plugin".into(),
-            auth_scheme: "none".into(),
-            custom_header_name: None,
-            custom_param_name: None,
-            extra_headers: "{}".into(),
-            timeout_ms: 30_000,
-            capability_mode: "strict".into(),
-            models_path: None,
-            rate_limit_rules: "{}".into(),
-            enabled: 1,
-            follow_redirects: 0,
-            credential_hosts: String::new(),
-            allow_insecure_tls: 0,
-            created_at: String::new(),
-            wire_plugin: "plugin:dev.kinetix.test/chat".into(),
-            credential_plugin: String::new(),
-            model_source_plugin: String::new(),
-        }
-    }
-
-    #[test]
-    fn plugin_backed_provider_probe_uses_registered_adapter() {
-        let adapters = AdapterRegistry::new();
-        adapters.register_plugin(
-            "plugin:dev.kinetix.test/chat",
-            Arc::new(UnimplementedAdapter {
-                format: "probe-plugin",
-            }),
-        );
-
-        let adapter = adapter_for_provider_probe(&adapters, &plugin_provider());
-
-        assert_eq!(adapter.wire_format(), "probe-plugin");
-    }
-}
-
 /// `POST /admin/api/providers/:id/test` — send a minimal probe (FR-10.11).
 pub async fn test_provider(
     State(state): State<AppState>,
@@ -1410,7 +1355,7 @@ pub async fn test_provider(
             opaque_state_plugin: String::new(),
         });
 
-    let adapter = adapter_for_provider_probe(&state.adapters, &provider);
+    let adapter = state.adapters.for_provider(&provider);
     let ctx = UpstreamContext {
         provider: &provider,
         model: &model,
