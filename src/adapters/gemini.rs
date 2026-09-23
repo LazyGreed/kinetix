@@ -432,16 +432,8 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
             // Gemini's tool-schema subset rejects these standard validation
             // constraints. Drop them recursively instead of rejecting the tool;
             // supported structural fields are still preserved below.
-            "exclusiveMinimum"
-            | "exclusiveMaximum"
-            | "multipleOf"
-            | "minLength"
-            | "maxLength"
-            | "pattern"
-            | "uniqueItems"
-            | "minProperties"
-            | "maxProperties"
-            | "propertyNames" => {}
+            "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf" | "minLength" | "maxLength"
+            | "pattern" | "uniqueItems" | "minProperties" | "maxProperties" | "propertyNames" => {}
 
             "definitions" | "$defs" => {
                 let definitions = value
@@ -1300,7 +1292,10 @@ mod schema_tests {
             "/properties/items/items/properties/metadata/minProperties",
             "/properties/items/items/properties/metadata/propertyNames",
         ] {
-            assert!(got.pointer(pointer).is_none(), "unexpected {pointer}: {got}");
+            assert!(
+                got.pointer(pointer).is_none(),
+                "unexpected {pointer}: {got}"
+            );
         }
 
         assert_eq!(
@@ -1390,12 +1385,13 @@ mod schema_tests {
             Some(&json!("resource query"))
         );
         assert!(schema.pointer("/properties/query/maxLength").is_none());
-        assert!(schema.pointer("/properties/selectors/uniqueItems").is_none());
+        assert!(schema
+            .pointer("/properties/selectors/uniqueItems")
+            .is_none());
         assert!(schema
             .pointer("/properties/selectors/items/minLength")
             .is_none());
     }
-
 }
 
 #[cfg(test)]
