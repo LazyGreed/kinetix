@@ -13,6 +13,24 @@ import { Kinetix, DiscoveredModel } from '../../lib/resources';
  */
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const DEFAULT_MAX_OUTPUT = 8192;
+const CANONICAL_THINKING_LEVELS = ['low', 'medium', 'high'] as const;
+type CanonicalThinkingLevel = (typeof CANONICAL_THINKING_LEVELS)[number];
+
+const thinkingValueToInput = (value: unknown): string => {
+  if (value === undefined) return '';
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value) ?? '';
+};
+
+const parseThinkingInput = (raw: string): unknown => {
+  const value = raw.trim();
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+};
 
 interface ProvidersViewProps {
   providers: Provider[];
@@ -100,6 +118,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [capVision, setCapVision] = useState(true);
   const [capReasoning, setCapReasoning] = useState(false);
   const [capTools, setCapTools] = useState(true);
+  const [modelThinkingLow, setModelThinkingLow] = useState('');
+  const [modelThinkingMedium, setModelThinkingMedium] = useState('');
+  const [modelThinkingHigh, setModelThinkingHigh] = useState('');
+  const [modelThinkingBudgetField, setModelThinkingBudgetField] = useState('');
+  const [modelThinkingExtraLevels, setModelThinkingExtraLevels] = useState<Record<string, unknown>>({});
   const [modelValidation, setModelValidation] = useState<{ valid: boolean; problems: string[]; warnings: string[] } | null>(null);
   const [validatingModel, setValidatingModel] = useState(false);
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
@@ -201,7 +224,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         thinkingPer1M: 0,
       },
       parameters: {},
-      thinkingMap: { scale: 'off', mappedField: '' },
+      thinkingMap: { levels: {} },
     };
 
     onAddModel(newModel);
@@ -347,6 +370,33 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     }
   };
 
+  const currentThinkingMap = (): ModelConfig['thinkingMap'] => {
+    const levels = { ...modelThinkingExtraLevels };
+    const inputs: Record<CanonicalThinkingLevel, string> = {
+      low: modelThinkingLow,
+      medium: modelThinkingMedium,
+      high: modelThinkingHigh,
+    };
+    for (const level of CANONICAL_THINKING_LEVELS) {
+      const value = parseThinkingInput(inputs[level]);
+      if (value === undefined) {
+        delete levels[level];
+      } else {
+        levels[level] = value;
+      }
+    }
+    return {
+      levels,
+      budgetField: modelThinkingBudgetField.trim() || undefined,
+    };
+  };
+
+  const thinkingLevelInputs = [
+    ['low', modelThinkingLow, setModelThinkingLow],
+    ['medium', modelThinkingMedium, setModelThinkingMedium],
+    ['high', modelThinkingHigh, setModelThinkingHigh],
+  ] as const;
+
   /** Prefill the model form for editing an existing model. */
   const openEditModel = (m: ModelConfig) => {
     setEditingModelId(m.id);
@@ -363,6 +413,12 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapVision(m.capabilities.vision);
     setCapReasoning(m.capabilities.reasoning);
     setCapTools(m.capabilities.toolCalling);
+    const { low, medium, high, ...extraLevels } = m.thinkingMap.levels;
+    setModelThinkingLow(thinkingValueToInput(low));
+    setModelThinkingMedium(thinkingValueToInput(medium));
+    setModelThinkingHigh(thinkingValueToInput(high));
+    setModelThinkingBudgetField(m.thinkingMap.budgetField || '');
+    setModelThinkingExtraLevels(extraLevels);
     setModelValidation(null);
     setShowAddModelModal(true);
   };
@@ -382,6 +438,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapVision(true);
     setCapReasoning(false);
     setCapTools(true);
+    setModelThinkingLow('');
+    setModelThinkingMedium('');
+    setModelThinkingHigh('');
+    setModelThinkingBudgetField('');
+    setModelThinkingExtraLevels({});
     setModelValidation(null);
   };
 
@@ -415,10 +476,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         thinkingPer1M: Number(modelThinkingPrice) || 0,
       },
       parameters: {},
-      thinkingMap: {
-        scale: capReasoning ? 'medium' : 'off',
-        mappedField: capReasoning ? 'thinkingConfig' : '',
-      },
+      thinkingMap: currentThinkingMap(),
     };
 
     if (editingModelId) {
@@ -430,21 +488,28 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     resetModelForm();
   };
 
-  const modelBody = () => ({
-    upstream_id: modelUpstreamId.trim(),
-    display_name: modelDisplayName.trim() || modelUpstreamId.trim(),
-    enabled: true,
-    context_window: Number(modelContextWindow) || DEFAULT_CONTEXT_WINDOW,
-    max_output_tokens: Number(modelMaxOutput) || DEFAULT_MAX_OUTPUT,
-    capabilities: { text: capText, vision: capVision, reasoning: capReasoning, tool_calling: capTools, audio: false },
-    prices: {
-      input_per_1m: Number(modelInputPrice) || null,
-      output_per_1m: Number(modelOutputPrice) || null,
-      cached_per_1m: Number(modelCachedPrice) || null,
-      cache_write_per_1m: Number(modelCacheWritePrice) || null,
-      thinking_per_1m: Number(modelThinkingPrice) || null,
-    },
-  });
+  const modelBody = () => {
+    const thinkingMap = currentThinkingMap();
+    return {
+      upstream_id: modelUpstreamId.trim(),
+      display_name: modelDisplayName.trim() || modelUpstreamId.trim(),
+      enabled: true,
+      context_window: Number(modelContextWindow) || DEFAULT_CONTEXT_WINDOW,
+      max_output_tokens: Number(modelMaxOutput) || DEFAULT_MAX_OUTPUT,
+      capabilities: { text: capText, vision: capVision, reasoning: capReasoning, tool_calling: capTools, audio: false },
+      prices: {
+        input_per_1m: Number(modelInputPrice) || null,
+        output_per_1m: Number(modelOutputPrice) || null,
+        cached_per_1m: Number(modelCachedPrice) || null,
+        cache_write_per_1m: Number(modelCacheWritePrice) || null,
+        thinking_per_1m: Number(modelThinkingPrice) || null,
+      },
+      thinking_map: {
+        levels: thinkingMap.levels,
+        budget_field: thinkingMap.budgetField || null,
+      },
+    };
+  };
 
   const handleValidateModel = async () => {
     if (!modelUpstreamId.trim()) return;
@@ -881,11 +946,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                             </strong>
                             <div>Temperature Policy: <strong>Clamp (0.0 - 2.0)</strong></div>
                             <div>
-                              Thinking Scale:{' '}
-                              <strong className="text-[var(--pen-blue)]">{m.thinkingMap.scale}</strong>
+                              Thinking Levels:{' '}
+                              <strong className="text-[var(--pen-blue)]">
+                                {Object.keys(m.thinkingMap.levels).sort().join(', ') || 'none'}
+                              </strong>
                             </div>
                             <div className="truncate">
-                              Mapped Field: <code>{m.thinkingMap.mappedField}</code>
+                              Budget Field: <code>{m.thinkingMap.budgetField || '—'}</code>
                             </div>
                           </div>
                         </div>
@@ -1384,6 +1451,51 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     </label>
                   </div>
                 </div>
+
+                {capReasoning && (
+                  <div className="space-y-3 bg-[var(--erased-soft)] p-3 border border-[var(--ink)] rounded">
+                    <div>
+                      <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                        Canonical Thinking Map
+                      </label>
+                      <p className="text-xs font-body text-[var(--ink)]/70">
+                        Configure low, medium, and high as JSON objects merged into the upstream request,
+                        or as scalar values sent under the optional budget field.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 gap-2">
+                      {thinkingLevelInputs.map(([level, value, setter]) => (
+                        <div key={level}>
+                          <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1 capitalize">
+                            {level}
+                          </label>
+                          <input
+                            type="text"
+                            value={value}
+                            onChange={(e) => setter(e.target.value)}
+                            placeholder={`{"reasoning_effort":"${level}"} or numeric budget`}
+                            className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    <div>
+                      <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                        Budget Field (optional)
+                      </label>
+                      <input
+                        type="text"
+                        value={modelThinkingBudgetField}
+                        onChange={(e) => setModelThinkingBudgetField(e.target.value)}
+                        placeholder="e.g. thinking.budget_tokens"
+                        className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                      />
+                      <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
+                        Used only when a level mapping is a scalar. Object mappings can use dotted field paths directly.
+                      </p>
+                    </div>
+                  </div>
+                )}
 
                 <div className="pt-2 flex justify-end gap-3">
                   <SketchButton

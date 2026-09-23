@@ -170,6 +170,7 @@ pub enum ThinkingLevel {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThinkingMap {
     /// Canonical level -> upstream request field value (opaque JSON).
     #[serde(default)]
@@ -602,5 +603,37 @@ mod tests {
             reasoning: false,
         };
         assert!(caps.satisfies(&vision_needed));
+    }
+
+    #[test]
+    fn thinking_map_rejects_unknown_fields() {
+        let malformed = serde_json::json!({
+            "scale": "medium",
+            "mappedField": "thinkingConfig"
+        });
+        assert!(serde_json::from_value::<ThinkingMap>(malformed).is_err());
+    }
+
+    #[test]
+    fn thinking_map_round_trips_levels_and_budget_field() {
+        let expected = serde_json::json!({
+            "levels": {
+                "low": 512,
+                "medium": {"reasoning_effort": "medium"},
+                "high": {"thinkingConfig.thinkingBudget": 4096}
+            },
+            "budget_field": "thinking.budget_tokens"
+        });
+        let parsed: ThinkingMap = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(parsed.levels.get("low"), Some(&serde_json::json!(512)));
+        assert_eq!(
+            parsed.levels.get("medium"),
+            Some(&serde_json::json!({"reasoning_effort": "medium"}))
+        );
+        assert_eq!(
+            parsed.budget_field.as_deref(),
+            Some("thinking.budget_tokens")
+        );
+        assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
     }
 }

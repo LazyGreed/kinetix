@@ -361,7 +361,10 @@ export default function App() {
           thinking_per_1m: model.prices.thinkingPer1M,
         },
         parameters: model.parameters,
-        thinking_map: model.thinkingMap,
+        thinking_map: {
+          levels: model.thinkingMap.levels,
+          budget_field: model.thinkingMap.budgetField || null,
+        },
       }),
     );
 
@@ -390,7 +393,10 @@ export default function App() {
           thinking_per_1m: model.prices.thinkingPer1M,
         },
         parameters: model.parameters,
-        thinking_map: model.thinkingMap,
+        thinking_map: {
+          levels: model.thinkingMap.levels,
+          budget_field: model.thinkingMap.budgetField || null,
+        },
       }),
     );
 
