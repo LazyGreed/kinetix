@@ -786,35 +786,30 @@ impl Adapter for GeminiAdapter {
 fn events_from_gemini(v: &Value) -> Vec<StreamEvent> {
     let mut events = Vec::new();
     let mut tool_index = 0u32;
+    let mut finishes = Vec::new();
 
     if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
         for cand in candidates {
             if let Some(parts) = cand.pointer("/content/parts").and_then(|p| p.as_array()) {
                 for part in parts {
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        let is_thought = part
-                            .get("thought")
-                            .and_then(|t| t.as_bool())
-                            .unwrap_or(false);
-                        let signature = part
-                            .get("thoughtSignature")
-                            .and_then(|s| s.as_str())
-                            .map(String::from);
-                        if is_thought {
-                            events.push(StreamEvent::ThinkingDelta {
-                                text: text.to_string(),
-                                signature,
-                            });
-                        } else if !text.is_empty() {
-                            events.push(StreamEvent::TextDelta(text.to_string()));
-                        } else if signature.is_some() {
-                            // Thought-signature-only part.
-                            events.push(StreamEvent::ThinkingDelta {
-                                text: String::new(),
-                                signature,
-                            });
-                        }
+                    let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(|t| t.as_bool())
+                        .unwrap_or(false);
+                    let signature = part
+                        .get("thoughtSignature")
+                        .and_then(|s| s.as_str())
+                        .map(String::from);
+                    if is_thought && (!text.is_empty() || signature.is_some()) {
+                        events.push(StreamEvent::ThinkingDelta {
+                            text: text.to_string(),
+                            signature,
+                        });
+                    } else if !text.is_empty() {
+                        events.push(StreamEvent::TextDelta(text.to_string()));
                     }
+
                     if let Some(fc) = part.get("functionCall") {
                         let name = fc
                             .get("name")
@@ -842,11 +837,14 @@ fn events_from_gemini(v: &Value) -> Vec<StreamEvent> {
                 }
             }
             if let Some(reason) = cand.get("finishReason").and_then(|r| r.as_str()) {
-                events.push(StreamEvent::Finish(map_finish(reason)));
+                finishes.push(StreamEvent::Finish(map_finish(reason)));
             }
         }
     }
 
+    // Usage must precede Finish when both arrive in one Gemini chunk. Client
+    // encoders flush their final usage frame while handling Finish; emitting
+    // usage afterward would silently drop it from translated streams.
     if let Some(usage) = v.get("usageMetadata") {
         let candidates = usage.get("candidatesTokenCount").and_then(Value::as_u64);
         let thinking = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
@@ -865,6 +863,7 @@ fn events_from_gemini(v: &Value) -> Vec<StreamEvent> {
         }));
     }
 
+    events.extend(finishes);
     events
 }
 
@@ -952,6 +951,29 @@ pub fn message_has_tool_result(m: &Message) -> bool {
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    #[test]
+    fn signature_only_thinking_decodes_for_round_trip() {
+        let events = events_from_gemini(&json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "thought": true,
+                        "thoughtSignature": "sig-only"
+                    }]
+                }
+            }]
+        }));
+
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ThinkingDelta {
+                text,
+                signature: Some(signature)
+            } if text.is_empty() && signature == "sig-only"
+        ));
+    }
 
     #[test]
     fn thinking_signature_round_trips_into_gemini_history() {
@@ -1043,6 +1065,24 @@ mod schema_tests {
         assert_eq!(cfg["topK"], 40.0);
         assert!(cfg.get("top_p").is_none());
         assert!(cfg.get("top_k").is_none());
+    }
+
+    #[test]
+    fn usage_precedes_finish_when_gemini_combines_them() {
+        let events = events_from_gemini(&json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 12,
+                "totalTokenCount": 112
+            }
+        }));
+
+        assert!(matches!(events[0], StreamEvent::Usage(_)));
+        assert!(matches!(events[1], StreamEvent::Finish(FinishReason::Stop)));
     }
 
     #[test]

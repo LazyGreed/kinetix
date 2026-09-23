@@ -6,6 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+echo "==> Testing release acceptance streaming proxy"
+python3 scripts/release_client_proxy_test.py
+
 BIND="${1:-127.0.0.1:8186}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-9198}"
 ADMIN_TOKEN="compat-admin-token-00000000000000000000"
@@ -76,3 +79,12 @@ fi
 
 echo "==> Running compatibility matrix suite"
 KINETIX_BASE="http://$BIND" KINETIX_KEY="$KEY" python3 scripts/compat-matrix.py
+
+echo "==> Running protocol v1 native/translated matrix"
+KINETIX_BASE="http://$BIND" \
+KINETIX_KEY="$KEY" \
+KINETIX_RESTRICTED_MODELS_KEY="sk-kinetix-compat-restricted-models" \
+  python3 scripts/protocol-v1-matrix.py
+
+echo "==> Checking generated protocol compatibility docs"
+python3 scripts/render-protocol-v1-compat.py --check

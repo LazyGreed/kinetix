@@ -77,22 +77,122 @@ background responses, hosted/MCP/computer/code-interpreter tools,
 `include` expansions, structured `text.format`, reasoning summaries/output
 items, automatic truncation, metadata storage, and unknown Responses fields.
 
-## Coding-Agent Compatibility CI Matrix
+## Hermetic coding-agent compatibility matrix
 
-Wire compatibility across coding agents is exercised continuously via
-`scripts/compat-matrix.sh` (backed by `scripts/compat-matrix.py`) against synthetic
-upstreams:
+Wire compatibility is exercised by `scripts/compat-matrix.sh` against deterministic
+OpenAI, Gemini, and Anthropic upstreams. The original #75/#83 coding-agent profiles
+remain in `scripts/compat-matrix.py`; `scripts/protocol-v1-matrix.py` adds the
+versioned v1 contract from `tests/fixtures/protocol-v1-compatibility.json`.
 
-| Client Profile | Inbound API | Scenarios Tested |
+The path matrix explicitly runs **sync and streaming** for every built-in frontend /
+adapter combination Kinetix supports:
+
+| Inbound API | Same-format / native | Translated paths |
 |---|---|---|
-| **Pi Coding Agent** | `/v1/chat/completions` | Plain streaming, tool calls & delta reassembly, multi-turn continuation, session affinity, sync fallback |
-| **Next-Gen / Codex CLI** | `/v1/responses` | Plain streaming, tool calling, input chaining, session affinity, sync fallback |
-| **Claude Code / Anthropic Agent** | `/v1/messages`, `/v1/messages/count_tokens` | Token counting, plain streaming, tool calling, tool result continuation, session affinity, sync fallback |
+| `/v1/chat/completions` | OpenAI-compatible | Gemini, Anthropic |
+| `/v1/messages` | Anthropic | Gemini, OpenAI-compatible |
+| `/v1/responses` | none | OpenAI-compatible, Gemini, Anthropic |
 
-Chat Completions scenarios cover same-format OpenAI passthrough and translated
-Gemini paths. Responses scenarios exercise Kinetix's translated Responses
-frontend; native Responses upstream passthrough is not implemented. The matrix
-has zero external test runner dependencies.
+That is 18 path/mode cells before specialized cases. Sync cases assert aggregated
+usage and tool identity. Streaming cases assert terminal events, usage, and stable
+tool-call identity. Specialized cases cover parallel tools, tool-result continuation,
+vision variants, tool-choice variants, nested schemas/content rejection, opaque
+reasoning portability, token-count modes, model discovery/auth, fallback, and
+same-format provider extensions.
+
+Positive mixed fixtures send the documented sampling, tool-choice, vision, and
+reasoning fields. `scripts/synthetic_upstream.py` rejects the request if required
+translated wire fields are missing, so a 200 response is evidence that those fields
+actually reached the selected adapter wire format rather than merely surviving
+frontend decoding.
+
+The matrix is hermetic, has no paid/public provider dependency, and remains in the
+normal `scripts/run-ci.sh` gate. Real installed clients are deliberately separate.
+
+## Field-level v1 contract
+
+The generated field matrix lives at
+[`docs/protocol-v1-compatibility.md`](protocol-v1-compatibility.md). Its source of
+truth is `tests/fixtures/protocol-v1-compatibility.json`.
+
+Each semantic row cites one or more concrete evidence cases. Rows that describe both
+same-format and translated behavior cite the relevant paths independently instead of
+using one broad case as a proxy for both. Rejection rows have explicit probes for the
+documented fields, including Chat `n`, logprobs, structured response format,
+modalities/audio and prediction, plus Responses storage/background/include/text
+format/truncation/stream options/metadata/parallel-tool/unknown semantics.
+
+Regenerate and verify it with:
+
+```bash
+python3 scripts/render-protocol-v1-compat.py
+python3 scripts/render-protocol-v1-compat.py --check
+```
+
+The renderer rejects missing/unknown evidence references and the compatibility runner
+executes every declared HTTP case. Cargo-backed plugin request/response contracts run
+as normal Rust integration tests; the real external `.kxp` case is explicitly marked
+as manual release acceptance.
+
+## Real-client release acceptance
+
+Real Pi, Claude Code, Codex/Responses, and optional external `.kxp` sessions are a
+release gate, not normal CI. They may consume provider quota and depend on installed
+client versions.
+
+Configure explicit models/routes for each behavior instead of pointing every client at
+one generic model:
+
+```bash
+export KINETIX_BASE=https://kinetix.example.com
+export KINETIX_KEY=sk-kinetix-...
+export KINETIX_ADMIN_TOKEN='admin credential'
+
+export KINETIX_ACCEPT_PI_SAME_MODEL=direct-openai
+export KINETIX_ACCEPT_PI_TRANSLATED_MODEL=translated-non-openai
+export KINETIX_ACCEPT_PI_FALLBACK_MODEL=forced-fallback-route
+export KINETIX_ACCEPT_PI_AFFINITY_MODEL=sticky-route
+
+export KINETIX_ACCEPT_CLAUDE_SAME_MODEL=direct-anthropic
+export KINETIX_ACCEPT_CLAUDE_TRANSLATED_MODEL=translated-non-anthropic
+export KINETIX_ACCEPT_CLAUDE_FALLBACK_MODEL=forced-fallback-route
+export KINETIX_ACCEPT_CLAUDE_AFFINITY_MODEL=sticky-route
+
+export KINETIX_ACCEPT_RESPONSES_OPENAI_MODEL=responses-via-openai
+export KINETIX_ACCEPT_RESPONSES_GEMINI_MODEL=responses-via-gemini
+export KINETIX_ACCEPT_RESPONSES_ANTHROPIC_MODEL=responses-via-anthropic
+export KINETIX_ACCEPT_RESPONSES_FALLBACK_MODEL=forced-fallback-route
+export KINETIX_ACCEPT_RESPONSES_AFFINITY_MODEL=sticky-route
+
+bash scripts/release-client-acceptance.sh all
+```
+
+For the fallback selectors, configure a Route whose first eligible target fails and a
+later target succeeds. For affinity selectors, use a sticky Route with multiple
+eligible targets. Responses has no native Responses upstream passthrough in v1, so its
+real-client matrix covers each built-in translation adapter instead of inventing a
+same-format path.
+
+The runner starts `scripts/release-client-proxy.py` locally for each case. It forwards
+the real client's bytes unchanged while recording client-visible evidence: request
+`stream`, response `Content-Type`, session headers, Kinetix request/opaque route IDs,
+tool-call IDs, returned tool-result references, fallback/warning headers, statuses, and
+error excerpts. It does not record credentials. Every inference turn must prove
+`stream: true` and `text/event-stream`. A client case passes only when it completes a multi-turn streaming
+session, returns both grounded sentinels, produces at least two distinct tool calls,
+and returns at least two tool results.
+
+Fallback cases additionally require `X-Kinetix-Fallback: 1`. Affinity cases require
+a stable session header **and** use the admin-only opaque Route Trace endpoint to prove
+that every turn resolved to the same `final_target`. Claude acceptance also performs
+an explicit `/v1/messages/count_tokens` probe against the same-format Anthropic
+selector and requires `X-Kinetix-Token-Count: exact`.
+
+Artifacts include client versions, raw client logs, evidence-proxy JSONL, verification
+logs, and a TSV summary. Failure categories distinguish `auth`, `model`,
+`transport`, `frontend`, `translation`, `routing`, `upstream`, and `client`.
+Set `KINETIX_PLUGIN_E2E_PACKAGE=/path/to/plugin.kxp` to include real plugin-host
+execution. Keep this runner out of normal PR CI.
 
 ## Anthropic-format clients
 

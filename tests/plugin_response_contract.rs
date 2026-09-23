@@ -8,6 +8,8 @@ const RESPONSE_SCHEMA_JSON: &str =
     include_str!("../wit/contracts/kinetix.plugin.response.v1.schema.json");
 const ALL_EVENTS: &str = include_str!("../wit/fixtures/plugin-response/v1/all-events.json");
 const WARNING: &str = include_str!("../wit/fixtures/plugin-response/v1/warning.json");
+const PARALLEL_TOOLS_REASONING: &str =
+    include_str!("../wit/fixtures/plugin-response/v1/parallel-tools-reasoning.json");
 const TERMINAL_ERROR: &str = include_str!("../wit/fixtures/plugin-response/v1/terminal-error.json");
 const INVALID_VERSION: &str =
     include_str!("../wit/fixtures/plugin-response/v1/invalid-version.json");
@@ -62,6 +64,33 @@ fn v1_golden_fixture_decodes() {
     ));
     assert!(matches!(
         events[6],
+        StreamEvent::Finish(FinishReason::ToolCalls)
+    ));
+}
+
+#[test]
+fn parallel_tools_and_reasoning_keep_stable_plugin_identity() {
+    let events = json_to_events(PARALLEL_TOOLS_REASONING).expect("valid parallel fixture");
+
+    assert!(matches!(
+        &events[1],
+        StreamEvent::ThinkingDelta { text, signature }
+            if text == "consider tools" && signature.as_deref() == Some("sig-parallel")
+    ));
+    assert!(matches!(
+        &events[2],
+        StreamEvent::ToolCallStart { index: 0, id, name, .. }
+            if id.as_deref() == Some("call_a") && name == "get_weather"
+    ));
+    assert!(matches!(
+        &events[4],
+        StreamEvent::ToolCallStart { index: 1, id, name, signature }
+            if id.as_deref() == Some("call_b")
+                && name == "read_file"
+                && signature.as_deref() == Some("sig-tool-b")
+    ));
+    assert!(matches!(
+        events[7],
         StreamEvent::Finish(FinishReason::ToolCalls)
     ));
 }

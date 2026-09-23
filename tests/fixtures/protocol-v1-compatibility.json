@@ -1,0 +1,940 @@
+{
+  "schema": "kinetix.protocol.compatibility",
+  "schema_version": 1,
+  "generated_doc": "docs/protocol-v1-compatibility.md",
+  "cases": [
+    {
+      "id": "chat.native.openai.sync",
+      "runner": "http",
+      "summary": "chat same-format OpenAI synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "chat.native.openai.stream",
+      "runner": "http",
+      "summary": "chat same-format OpenAI streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "chat.translate.gemini.sync",
+      "runner": "http",
+      "summary": "chat translated Gemini synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "chat.translate.gemini.stream",
+      "runner": "http",
+      "summary": "chat translated Gemini streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "chat.translate.anthropic.sync",
+      "runner": "http",
+      "summary": "chat translated Anthropic synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "chat.translate.anthropic.stream",
+      "runner": "http",
+      "summary": "chat translated Anthropic streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "messages.native.anthropic.sync",
+      "runner": "http",
+      "summary": "messages same-format Anthropic synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "messages.native.anthropic.stream",
+      "runner": "http",
+      "summary": "messages same-format Anthropic streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "messages.translate.gemini.sync",
+      "runner": "http",
+      "summary": "messages translated Gemini synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "messages.translate.gemini.stream",
+      "runner": "http",
+      "summary": "messages translated Gemini streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "messages.translate.openai.sync",
+      "runner": "http",
+      "summary": "messages translated OpenAI-compatible synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "messages.translate.openai.stream",
+      "runner": "http",
+      "summary": "messages translated OpenAI-compatible streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "responses.translate.openai.sync",
+      "runner": "http",
+      "summary": "responses translated OpenAI-compatible synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "responses.translate.openai.stream",
+      "runner": "http",
+      "summary": "responses translated OpenAI-compatible streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "responses.translate.gemini.sync",
+      "runner": "http",
+      "summary": "responses translated Gemini synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "responses.translate.gemini.stream",
+      "runner": "http",
+      "summary": "responses translated Gemini streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "responses.translate.anthropic.sync",
+      "runner": "http",
+      "summary": "responses translated Anthropic synchronous path preserves documented request/response semantics"
+    },
+    {
+      "id": "responses.translate.anthropic.stream",
+      "runner": "http",
+      "summary": "responses translated Anthropic streaming path preserves terminal, usage and tool identity semantics"
+    },
+    {
+      "id": "chat.translate.gemini.parallel_tools",
+      "runner": "http",
+      "summary": "Parallel Chat tool identities survive OpenAI-to-Gemini translation"
+    },
+    {
+      "id": "messages.translate.gemini.parallel_tools",
+      "runner": "http",
+      "summary": "Parallel Messages tool identities survive Anthropic-to-Gemini translation"
+    },
+    {
+      "id": "responses.translate.anthropic.parallel_tools",
+      "runner": "http",
+      "summary": "Parallel Responses tool identities survive Responses-to-Anthropic translation"
+    },
+    {
+      "id": "chat.translate.gemini.nested_schema",
+      "runner": "http",
+      "summary": "Nested Chat tool schema survives Gemini translation"
+    },
+    {
+      "id": "chat.fallback.tool_continuation",
+      "runner": "http",
+      "summary": "Chat tool-result identity survives route fallback"
+    },
+    {
+      "id": "messages.translate.openai.tool_continuation",
+      "runner": "http",
+      "summary": "Messages tool-result identity survives OpenAI translation"
+    },
+    {
+      "id": "chat.fallback.opaque_reasoning",
+      "runner": "http",
+      "summary": "Opaque reasoning state is stripped with warning at first portability boundary"
+    },
+    {
+      "id": "messages.translate.multimodal_tool_result.reject",
+      "runner": "http",
+      "summary": "Unsupported multimodal tool results, documents, and server-tool semantics fail explicitly"
+    },
+    {
+      "id": "chat.native.openai.provider_extensions",
+      "runner": "http",
+      "summary": "Chat same-format OpenAI preserves n and provider-specific fields"
+    },
+    {
+      "id": "messages.native.anthropic.provider_extensions",
+      "runner": "http",
+      "summary": "Messages same-format Anthropic preserves provider-specific fields"
+    },
+    {
+      "id": "chat.translate.gemini.unsupported_fields.reject",
+      "runner": "http",
+      "summary": "Every documented non-portable Chat semantic field is explicitly rejected on translation"
+    },
+    {
+      "id": "responses.unsupported_fields.reject",
+      "runner": "http",
+      "summary": "Every documented unsupported Responses semantic is explicitly rejected"
+    },
+    {
+      "id": "messages.count_tokens.native_exact",
+      "runner": "http",
+      "summary": "Native Anthropic token count accepts system/messages/tools and is exact"
+    },
+    {
+      "id": "messages.count_tokens.translated_estimated",
+      "runner": "http",
+      "summary": "Translated token count accepts system/messages/tools and is explicitly estimated"
+    },
+    {
+      "id": "models.visible",
+      "runner": "http",
+      "summary": "Models endpoint enforces auth, key-scoped visibility, and provider-model/alias/route selector discovery"
+    },
+    {
+      "id": "plugin.request.mixed_contract",
+      "runner": "cargo",
+      "summary": "Canonical plugin request contract preserves vision, tool identity and reasoning"
+    },
+    {
+      "id": "plugin.response.parallel_contract",
+      "runner": "cargo",
+      "summary": "Canonical plugin response contract preserves parallel tool ids and reasoning signatures"
+    },
+    {
+      "id": "plugin.release.real_guest",
+      "runner": "manual",
+      "summary": "Release-only external .kxp execution exercises the real plugin host"
+    },
+    {
+      "id": "chat.image.variants",
+      "runner": "http",
+      "summary": "Chat image URL and data-URL variants translate explicitly"
+    },
+    {
+      "id": "chat.tool_choice.variants",
+      "runner": "http",
+      "summary": "Chat auto/none/required/specific tool choice variants translate explicitly"
+    },
+    {
+      "id": "messages.system.variants",
+      "runner": "http",
+      "summary": "Messages string and text-block system prompts translate explicitly"
+    },
+    {
+      "id": "messages.image.variants",
+      "runner": "http",
+      "summary": "Messages base64 and URL image sources translate explicitly"
+    },
+    {
+      "id": "messages.tool_choice.variants",
+      "runner": "http",
+      "summary": "Messages auto/none/any/specific tool choice variants translate explicitly"
+    },
+    {
+      "id": "messages.translate.gemini.opaque_reasoning",
+      "runner": "http",
+      "summary": "Messages opaque thinking signature is stripped with warning at portability boundary"
+    },
+    {
+      "id": "chat.translate.gemini.nested_content.reject",
+      "runner": "http",
+      "summary": "Chat file/audio/function_call/refusal/reasoning_details semantics reject explicitly on translation"
+    },
+    {
+      "id": "responses.input.variants",
+      "runner": "http",
+      "summary": "Responses string and message input variants translate explicitly"
+    },
+    {
+      "id": "responses.image.variants",
+      "runner": "http",
+      "summary": "Responses URL and data-URL image variants translate explicitly"
+    },
+    {
+      "id": "responses.tool_choice.variants",
+      "runner": "http",
+      "summary": "Responses auto/none/required/named function tool choices translate explicitly"
+    },
+    {
+      "id": "responses.translate.openai.tool_continuation",
+      "runner": "http",
+      "summary": "Responses function_call/function_call_output identity survives translation"
+    },
+    {
+      "id": "responses.supported_options",
+      "runner": "http",
+      "summary": "Responses accepted false/empty/text/disabled option forms remain accepted"
+    },
+    {
+      "id": "messages.count_tokens.openai_estimated",
+      "runner": "http",
+      "summary": "OpenAI-compatible token count uses the documented local estimate"
+    },
+    {
+      "id": "messages.count_tokens.heterogeneous_estimated",
+      "runner": "http",
+      "summary": "Heterogeneous route token count stays local and does not consume route-balancing state"
+    }
+  ],
+  "apis": [
+    {
+      "endpoint": "POST /v1/chat/completions",
+      "rows": [
+        [
+          "model",
+          "required / route resolved",
+          "required / route resolved",
+          "Required client model selector.",
+          [
+            "chat.native.openai.sync",
+            "chat.translate.gemini.sync",
+            "chat.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "messages: text",
+          "passthrough",
+          "translated",
+          "System/developer text is hoisted; user/assistant text is canonicalized.",
+          [
+            "chat.native.openai.sync",
+            "chat.translate.gemini.sync",
+            "chat.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "messages: image_url / data URL",
+          "passthrough",
+          "translated",
+          "URL and data-URL images map to canonical image parts.",
+          [
+            "chat.image.variants",
+            "chat.native.openai.stream",
+            "chat.translate.gemini.stream",
+            "chat.translate.anthropic.stream"
+          ]
+        ],
+        [
+          "assistant tool_calls + tool results",
+          "passthrough",
+          "translated",
+          "Tool ids are retained; result names are resolved from prior calls when needed.",
+          [
+            "chat.fallback.tool_continuation"
+          ]
+        ],
+        [
+          "function tools",
+          "passthrough",
+          "translated",
+          "Function name, description and JSON schema are canonicalized.",
+          [
+            "chat.native.openai.sync",
+            "chat.translate.gemini.nested_schema"
+          ]
+        ],
+        [
+          "parallel tool calls",
+          "passthrough",
+          "translated",
+          "Stable call identity is required across translated streams.",
+          [
+            "chat.translate.gemini.parallel_tools"
+          ]
+        ],
+        [
+          "tool_choice",
+          "passthrough",
+          "translated",
+          "auto/none/required/specific function map to canonical tool choice.",
+          [
+            "chat.tool_choice.variants",
+            "chat.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "temperature / top_p / top_k",
+          "passthrough",
+          "translated when target model policy supports them",
+          "Target parameter policy can reject unsupported controls.",
+          [
+            "chat.native.openai.sync",
+            "chat.translate.gemini.sync",
+            "chat.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "max_tokens / max_completion_tokens",
+          "passthrough",
+          "translated",
+          "Both map to canonical max output tokens.",
+          [
+            "chat.native.openai.sync",
+            "chat.translate.gemini.sync",
+            "chat.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "stop / seed / presence_penalty / frequency_penalty",
+          "passthrough",
+          "translated where the selected adapter has a canonical wire mapping",
+          "The positive fixture sends all four; Gemini proves stop/seed while same-format OpenAI preserves penalties.",
+          [
+            "chat.native.openai.sync",
+            "chat.translate.gemini.sync"
+          ]
+        ],
+        [
+          "reasoning_effort",
+          "passthrough",
+          "translated only with model thinking_map",
+          "No reasoning control is invented when no mapping exists.",
+          [
+            "chat.native.openai.sync",
+            "chat.translate.gemini.sync",
+            "chat.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "assistant reasoning history/signature",
+          "passthrough",
+          "portable only on compatible path; otherwise route portability policy applies",
+          "Opaque state is stripped-with-warning or rejected at the first cross-format/provider boundary.",
+          [
+            "chat.fallback.opaque_reasoning"
+          ]
+        ],
+        [
+          "stream",
+          "passthrough",
+          "translated",
+          "Streaming is normalized through canonical events on translation.",
+          [
+            "chat.native.openai.sync",
+            "chat.native.openai.stream",
+            "chat.translate.gemini.sync",
+            "chat.translate.gemini.stream",
+            "chat.translate.anthropic.sync",
+            "chat.translate.anthropic.stream"
+          ]
+        ],
+        [
+          "stream_options.include_usage",
+          "passthrough",
+          "client preference preserved on translation",
+          "Internal accounting may request upstream usage even when client did not.",
+          [
+            "chat.native.openai.stream",
+            "chat.translate.gemini.stream",
+            "chat.translate.anthropic.stream"
+          ]
+        ],
+        [
+          "n > 1",
+          "passthrough",
+          "rejected (422)",
+          "Multiple completions cannot be represented faithfully on translated paths.",
+          [
+            "chat.native.openai.provider_extensions",
+            "chat.translate.gemini.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "logprobs / top_logprobs",
+          "passthrough",
+          "rejected (422)",
+          "No canonical cross-format representation.",
+          [
+            "chat.translate.gemini.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "response_format.json_schema",
+          "passthrough",
+          "rejected (422)",
+          "Structured schema enforcement cannot be guaranteed cross-format.",
+          [
+            "chat.translate.gemini.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "modalities / audio output",
+          "passthrough",
+          "rejected (422)",
+          "Audio output is not in the v1 canonical model.",
+          [
+            "chat.translate.gemini.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "prediction",
+          "passthrough",
+          "rejected (422)",
+          "Prediction semantics are not portable.",
+          [
+            "chat.translate.gemini.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "unsupported nested content (file/audio/refusal/reasoning_details)",
+          "passthrough",
+          "rejected (422)",
+          "Behaviorally significant nested content is never silently dropped.",
+          [
+            "chat.translate.gemini.nested_content.reject"
+          ]
+        ],
+        [
+          "unknown/provider-specific top-level fields",
+          "passthrough verbatim",
+          "not guaranteed; cosmetic unknowns may be ignored",
+          "Use a same-format provider when vendor extensions are required.",
+          [
+            "chat.native.openai.provider_extensions"
+          ]
+        ]
+      ]
+    },
+    {
+      "endpoint": "POST /v1/messages",
+      "rows": [
+        [
+          "model / messages",
+          "required",
+          "required / translated",
+          "Anthropic Messages is accepted as a first-class frontend.",
+          [
+            "messages.native.anthropic.sync",
+            "messages.translate.gemini.sync",
+            "messages.translate.openai.sync"
+          ]
+        ],
+        [
+          "system text blocks",
+          "passthrough",
+          "translated",
+          "String and text-block system prompts map to canonical system entries.",
+          [
+            "messages.system.variants"
+          ]
+        ],
+        [
+          "text content",
+          "passthrough",
+          "translated",
+          "Text blocks are canonicalized.",
+          [
+            "messages.native.anthropic.sync",
+            "messages.translate.gemini.sync",
+            "messages.translate.openai.sync"
+          ]
+        ],
+        [
+          "image source (base64/URL)",
+          "passthrough",
+          "translated",
+          "Images map through the canonical image representation.",
+          [
+            "messages.image.variants",
+            "messages.native.anthropic.stream"
+          ]
+        ],
+        [
+          "tool_use / tool_result",
+          "passthrough",
+          "translated",
+          "Tool-use ids and result identity are retained.",
+          [
+            "messages.translate.openai.tool_continuation"
+          ]
+        ],
+        [
+          "function tools + input_schema",
+          "passthrough",
+          "translated",
+          "Nested schemas are preserved where target schema permits.",
+          [
+            "messages.native.anthropic.sync",
+            "messages.translate.gemini.sync",
+            "messages.translate.openai.sync"
+          ]
+        ],
+        [
+          "parallel tool_use blocks",
+          "passthrough",
+          "translated",
+          "Distinct ids/indexes must survive translation.",
+          [
+            "messages.translate.gemini.parallel_tools"
+          ]
+        ],
+        [
+          "tool_choice",
+          "passthrough",
+          "translated",
+          "auto/any/none/specific tool are normalized.",
+          [
+            "messages.tool_choice.variants",
+            "messages.translate.openai.sync"
+          ]
+        ],
+        [
+          "temperature / top_p / top_k / max_tokens / stop_sequences",
+          "passthrough",
+          "translated subject to target policy",
+          "Target-model policy remains authoritative.",
+          [
+            "messages.native.anthropic.sync",
+            "messages.translate.gemini.sync",
+            "messages.translate.openai.sync"
+          ]
+        ],
+        [
+          "thinking control",
+          "passthrough",
+          "translated only with model thinking_map",
+          "Thinking budget maps to configured low/medium/high levels.",
+          [
+            "messages.native.anthropic.sync",
+            "messages.translate.gemini.sync",
+            "messages.translate.openai.sync"
+          ]
+        ],
+        [
+          "thinking history/signature",
+          "passthrough",
+          "portable only on compatible path",
+          "Cross-provider/cross-format portability policy applies before dispatch.",
+          [
+            "messages.translate.gemini.opaque_reasoning"
+          ]
+        ],
+        [
+          "stream",
+          "passthrough",
+          "translated",
+          "Translated streams emit Anthropic event lifecycle.",
+          [
+            "messages.native.anthropic.sync",
+            "messages.native.anthropic.stream",
+            "messages.translate.gemini.sync",
+            "messages.translate.gemini.stream",
+            "messages.translate.openai.sync",
+            "messages.translate.openai.stream"
+          ]
+        ],
+        [
+          "multimodal tool_result / documents / server-tool-only blocks",
+          "passthrough when upstream supports them",
+          "rejected (422)",
+          "Unsupported semantic content fails explicitly.",
+          [
+            "messages.translate.multimodal_tool_result.reject"
+          ]
+        ],
+        [
+          "unknown/provider-specific fields",
+          "passthrough verbatim",
+          "not guaranteed",
+          "Same-format passthrough is the extension-preserving path.",
+          [
+            "messages.native.anthropic.provider_extensions"
+          ]
+        ]
+      ]
+    },
+    {
+      "endpoint": "POST /v1/messages/count_tokens",
+      "rows": [
+        [
+          "model / system / messages / tools",
+          "accepted",
+          "canonicalized for estimate",
+          "Counting does not consume route balancing state.",
+          [
+            "messages.count_tokens.native_exact",
+            "messages.count_tokens.translated_estimated",
+            "messages.count_tokens.openai_estimated",
+            "messages.count_tokens.heterogeneous_estimated"
+          ]
+        ],
+        [
+          "healthy unambiguous built-in Anthropic target",
+          "exact",
+          "n/a",
+          "Calls the native Anthropic count_tokens endpoint.",
+          [
+            "messages.count_tokens.native_exact"
+          ]
+        ],
+        [
+          "Gemini / OpenAI-compatible / heterogeneous route",
+          "n/a",
+          "estimated",
+          "Non-Anthropic direct targets and heterogeneous routes use the deterministic local estimate.",
+          [
+            "messages.count_tokens.translated_estimated",
+            "messages.count_tokens.openai_estimated",
+            "messages.count_tokens.heterogeneous_estimated"
+          ]
+        ],
+        [
+          "response shape",
+          "{\"input_tokens\": N}",
+          "same",
+          "Header exposes exact vs estimated mode without changing Anthropic JSON.",
+          [
+            "messages.count_tokens.native_exact",
+            "messages.count_tokens.translated_estimated",
+            "messages.count_tokens.openai_estimated",
+            "messages.count_tokens.heterogeneous_estimated"
+          ]
+        ]
+      ]
+    },
+    {
+      "endpoint": "POST /v1/responses",
+      "rows": [
+        [
+          "model",
+          "required",
+          "translated",
+          "Responses is an explicit translated subset; there is no native Responses passthrough.",
+          [
+            "responses.translate.openai.sync",
+            "responses.translate.gemini.sync",
+            "responses.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "input string / message items",
+          "n/a",
+          "translated",
+          "Text and message items map to canonical messages.",
+          [
+            "responses.input.variants"
+          ]
+        ],
+        [
+          "input_image URL/data URL",
+          "n/a",
+          "translated",
+          "Vision input is supported.",
+          [
+            "responses.image.variants"
+          ]
+        ],
+        [
+          "instructions",
+          "n/a",
+          "translated",
+          "Text instructions map to canonical system prompts.",
+          [
+            "responses.translate.openai.sync",
+            "responses.translate.gemini.sync",
+            "responses.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "function tools / function_call / function_call_output",
+          "n/a",
+          "translated",
+          "Custom function tools and tool history/results are supported.",
+          [
+            "responses.translate.openai.sync",
+            "responses.translate.openai.tool_continuation"
+          ]
+        ],
+        [
+          "tool_choice auto/none/required/named function",
+          "n/a",
+          "translated",
+          "Other tool-choice semantics are rejected.",
+          [
+            "responses.tool_choice.variants"
+          ]
+        ],
+        [
+          "parallel tool calls from upstream",
+          "n/a",
+          "translated",
+          "Distinct tool ids are retained; request field parallel_tool_calls is not enforceable and is rejected.",
+          [
+            "responses.translate.anthropic.parallel_tools"
+          ]
+        ],
+        [
+          "temperature / top_p / top_k / max_output_tokens / penalties",
+          "n/a",
+          "translated subject to target capability; penalties are asserted on OpenAI-compatible translation",
+          "The executable fixture sends every listed field and the synthetic OpenAI upstream rejects if any are dropped.",
+          [
+            "responses.translate.openai.sync"
+          ]
+        ],
+        [
+          "reasoning.effort / reasoning_effort",
+          "n/a",
+          "translated only with model thinking_map",
+          "Reasoning summary/output semantics are not implemented.",
+          [
+            "responses.translate.openai.sync",
+            "responses.translate.gemini.sync",
+            "responses.translate.anthropic.sync"
+          ]
+        ],
+        [
+          "prompt_cache_key",
+          "n/a",
+          "portable hint where target supports it",
+          "Preserved as a canonical extension.",
+          [
+            "responses.translate.openai.sync"
+          ]
+        ],
+        [
+          "stream false / true",
+          "n/a",
+          "translated",
+          "Stream lifecycle terminates with response.completed; no Chat [DONE].",
+          [
+            "responses.translate.openai.sync",
+            "responses.translate.openai.stream",
+            "responses.translate.gemini.sync",
+            "responses.translate.gemini.stream",
+            "responses.translate.anthropic.sync",
+            "responses.translate.anthropic.stream"
+          ]
+        ],
+        [
+          "store:true / background:true",
+          "n/a",
+          "rejected (422)",
+          "Kinetix has no Responses object store/background execution.",
+          [
+            "responses.supported_options",
+            "responses.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "include expansions",
+          "n/a",
+          "only empty array accepted",
+          "Non-empty include is rejected.",
+          [
+            "responses.supported_options",
+            "responses.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "text.format",
+          "n/a",
+          "only {type:\"text\"} accepted",
+          "Structured output formats are rejected.",
+          [
+            "responses.supported_options",
+            "responses.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "truncation",
+          "n/a",
+          "only \"disabled\" accepted",
+          "Automatic truncation is not implemented.",
+          [
+            "responses.supported_options",
+            "responses.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "stream_options",
+          "n/a",
+          "only include_obfuscation:false accepted",
+          "Obfuscation and unknown options are rejected.",
+          [
+            "responses.supported_options",
+            "responses.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "metadata / parallel_tool_calls",
+          "n/a",
+          "rejected (422)",
+          "Storage/enforcement semantics are not approximated.",
+          [
+            "responses.unsupported_fields.reject"
+          ]
+        ],
+        [
+          "unknown top-level fields / unknown nested semantic items",
+          "n/a",
+          "rejected (422)",
+          "Responses subset fails closed.",
+          [
+            "responses.unsupported_fields.reject"
+          ]
+        ]
+      ]
+    },
+    {
+      "endpoint": "GET /v1/models",
+      "rows": [
+        [
+          "authentication",
+          "virtual key required",
+          "same",
+          "Visibility is filtered by the caller's virtual key.",
+          [
+            "models.visible"
+          ]
+        ],
+        [
+          "model ids",
+          "provider models + aliases + routes",
+          "same",
+          "Returns client-visible selectors, not serving account identities.",
+          [
+            "models.visible"
+          ]
+        ],
+        [
+          "object shape",
+          "OpenAI-compatible list",
+          "same",
+          "Used by compatible clients for discovery.",
+          [
+            "models.visible"
+          ]
+        ]
+      ]
+    },
+    {
+      "endpoint": "Plugin adapter contract",
+      "rows": [
+        [
+          "canonical request schema/version",
+          "kinetix.plugin.request v1",
+          "same",
+          "Host serializes canonical requests before guest adapter translation.",
+          [
+            "plugin.request.mixed_contract"
+          ]
+        ],
+        [
+          "text / image / tool call / tool result / reasoning",
+          "preserved in canonical request",
+          "same",
+          "Mixed semantic state is contract-tested before a real guest is involved.",
+          [
+            "plugin.request.mixed_contract"
+          ]
+        ],
+        [
+          "parallel tool ids / arguments",
+          "versioned canonical events",
+          "same",
+          "Response fixture verifies distinct tool indexes and ids.",
+          [
+            "plugin.response.parallel_contract"
+          ]
+        ],
+        [
+          "thinking signature / usage / finish",
+          "versioned canonical events",
+          "same",
+          "Malformed/incompatible plugin responses fail closed.",
+          [
+            "plugin.response.parallel_contract"
+          ]
+        ],
+        [
+          "real .kxp guest execution",
+          "manual release acceptance",
+          "manual release acceptance",
+          "KINETIX_PLUGIN_E2E_PACKAGE keeps normal core CI hermetic.",
+          [
+            "plugin.release.real_guest"
+          ]
+        ]
+      ]
+    }
+  ]
+}

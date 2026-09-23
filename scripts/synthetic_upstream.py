@@ -122,14 +122,60 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if "/gemini/" in self.path:
+            if _fixture(req, "chat-fields"):
+                required = {"temperature", "topP", "topK", "maxOutputTokens", "stopSequences", "seed", "toolConfig", "thinkingConfig"}
+                missing = sorted(key for key in required if not _contains_key(req, {key}))
+                if missing:
+                    self._json(400, {"error": {"message": f"chat field semantics missing: {missing}"}})
+                    return
+            if _fixture(req, "messages-fields"):
+                required = {"systemInstruction", "temperature", "topP", "topK", "maxOutputTokens", "stopSequences", "toolConfig", "thinkingConfig"}
+                missing = sorted(key for key in required if not _contains_key(req, {key}))
+                if missing:
+                    self._json(400, {"error": {"message": f"messages field semantics missing: {missing}"}})
+                    return
+            if _fixture(req, "responses-fields"):
+                required = {"systemInstruction", "temperature", "topP", "topK", "maxOutputTokens", "toolConfig", "thinkingConfig"}
+                missing = sorted(key for key in required if not _contains_key(req, {key}))
+                if missing:
+                    self._json(400, {"error": {"message": f"responses field semantics missing: {missing}"}})
+                    return
+            if _fixture(req, "system-variant") and not _contains_key(req, {"systemInstruction"}):
+                self._json(400, {"error": {"message": "system variant was not translated"}})
+                return
+            for fixture, expected_mode in [
+                ("tool-choice-auto", "AUTO"),
+                ("tool-choice-none", "NONE"),
+                ("tool-choice-required", "ANY"),
+                ("tool-choice-specific", "ANY"),
+            ]:
+                if _fixture(req, fixture):
+                    config = req.get("toolConfig", {}).get("functionCallingConfig", {})
+                    if config.get("mode") != expected_mode:
+                        self._json(400, {"error": {"message": f"{fixture} translated to wrong Gemini mode"}})
+                        return
+                    if fixture == "tool-choice-specific" and config.get("allowedFunctionNames") != ["get_weather"]:
+                        self._json(400, {"error": {"message": "specific tool choice lost function name"}})
+                        return
             if "client_only_unknown" in req:
                 self._json(400, {"error": {"message": "unknown client field leaked upstream"}})
                 return
             if _fixture(req, "thinking") and not _contains_key(req, {"thinkingConfig"}):
                 self._json(400, {"error": {"message": "thinking control was not translated"}})
                 return
-            if _fixture(req, "vision") and not _contains_key(req, {"inlineData", "inline_data"}):
+            if _fixture(req, "vision") and not _contains_key(req, {"inlineData", "inline_data", "fileData", "file_data"}):
                 self._json(400, {"error": {"message": "image was not translated"}})
+                return
+            if _fixture(req, "nested-schema") and not _contains_key(req, {"deep_tag"}):
+                self._json(400, {"error": {"message": "nested tool schema was not preserved"}})
+                return
+            if _fixture(req, "tool-continuation") and not _contains_key(req, {"functionResponse"}):
+                self._json(400, {"error": {"message": "tool result identity was not preserved"}})
+                return
+            if _fixture(req, "opaque-fallback") and _contains_key(
+                req, {"thoughtSignature", "reasoning_signature", "reasoning_content"}
+            ):
+                self._json(400, {"error": {"message": "opaque reasoning state crossed portability boundary"}})
                 return
             self._gemini(model, want_tools, req)
         else:
@@ -147,6 +193,55 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- OpenAI-compatible SSE -------------------------------------------
     def _openai(self, model, stream, want_tools=False, tool_fragments=0, req=None):
+        req = req or {}
+        if _fixture(req, "chat-fields"):
+            required = {"temperature", "top_p", "top_k", "max_tokens", "stop", "seed", "presence_penalty", "frequency_penalty", "tool_choice"}
+            missing = sorted(key for key in required if not _contains_key(req, {key}))
+            if missing:
+                self._json(400, {"error": {"message": f"chat field semantics missing: {missing}"}})
+                return
+        if _fixture(req, "messages-fields"):
+            required = {"temperature", "top_p", "top_k", "max_tokens", "stop", "tool_choice", "reasoning_effort"}
+            missing = sorted(key for key in required if not _contains_key(req, {key}))
+            if missing:
+                self._json(400, {"error": {"message": f"messages field semantics missing: {missing}"}})
+                return
+        if _fixture(req, "responses-fields"):
+            required = {"temperature", "top_p", "top_k", "max_tokens", "presence_penalty", "frequency_penalty", "tool_choice", "reasoning_effort", "prompt_cache_key"}
+            missing = sorted(key for key in required if not _contains_key(req, {key}))
+            if missing:
+                self._json(400, {"error": {"message": f"responses field semantics missing: {missing}"}})
+                return
+        if _fixture(req, "openai-extra"):
+            if "vendor_extension" not in req or req.get("n") != 2:
+                self._json(400, {"error": {"message": "OpenAI same-format extensions were not preserved"}})
+                return
+        passthrough_requirements = {
+            "passthrough-n": {"n"},
+            "passthrough-logprobs": {"logprobs", "top_logprobs"},
+            "passthrough-response-format": {"response_format"},
+            "passthrough-modalities-audio": {"modalities", "audio"},
+            "passthrough-prediction": {"prediction"},
+        }
+        for fixture, required in passthrough_requirements.items():
+            if _fixture(req, fixture):
+                missing = sorted(key for key in required if key not in req)
+                if missing:
+                    self._json(400, {"error": {"message": f"{fixture} fields missing: {missing}"}})
+                    return
+        if _fixture(req, "thinking") and not _contains_key(req, {"reasoning_effort", "reasoning"}):
+            self._json(400, {"error": {"message": "reasoning control was not translated"}})
+            return
+        if _fixture(req, "vision") and not _contains_key(req, {"image_url"}):
+            self._json(400, {"error": {"message": "image was not translated"}})
+            return
+        if _fixture(req, "nested-schema") and not _contains_key(req, {"deep_tag"}):
+            self._json(400, {"error": {"message": "nested tool schema was not preserved"}})
+            return
+        if _fixture(req, "tool-continuation") and not _contains_key(req, {"tool_call_id"}):
+            self._json(400, {"error": {"message": "tool result identity was not preserved"}})
+            return
+
         if model == "syn-truncated-openai":
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -182,25 +277,36 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if not stream:
+            message = {
+                "role": "assistant",
+                "content": (
+                    f"target:{model}"
+                    if model in ("syn-openai-a", "syn-openai-b")
+                    else WORD * 4
+                ),
+            }
+            finish_reason = "stop"
+            if want_tools:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_syn_sync_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                    }],
+                }
+                finish_reason = "tool_calls"
             body = json.dumps(
                 {
                     "id": "syn-1",
                     "object": "chat.completion",
                     "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": (
-                                    f"target:{model}"
-                                    if model in ("syn-openai-a", "syn-openai-b")
-                                    else WORD * 4
-                                ),
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
+                    "choices": [{
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": finish_reason,
+                    }],
                     "usage": {"prompt_tokens": 100, "completion_tokens": TOKENS, "total_tokens": 100 + TOKENS},
                 }
             ).encode()
@@ -279,6 +385,27 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- Anthropic Messages -------------------------------------------------
     def _anthropic(self, req, model, stream, want_tools=False):
+        if _fixture(req, "chat-fields"):
+            required = {"temperature", "top_p", "top_k", "max_tokens", "stop_sequences", "tool_choice", "thinking"}
+            missing = sorted(key for key in required if not _contains_key(req, {key}))
+            if missing:
+                self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"chat field semantics missing: {missing}"}})
+                return
+        if _fixture(req, "messages-fields"):
+            required = {"system", "temperature", "top_p", "top_k", "max_tokens", "stop_sequences", "tool_choice", "thinking"}
+            missing = sorted(key for key in required if not _contains_key(req, {key}))
+            if missing:
+                self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"messages field semantics missing: {missing}"}})
+                return
+        if _fixture(req, "responses-fields"):
+            required = {"system", "temperature", "top_p", "top_k", "max_tokens", "tool_choice", "thinking"}
+            missing = sorted(key for key in required if not _contains_key(req, {key}))
+            if missing:
+                self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"responses field semantics missing: {missing}"}})
+                return
+        if _fixture(req, "anthropic-extra") and "vendor_extension" not in req:
+            self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "Anthropic provider extension was not preserved"}})
+            return
         if self.path.endswith("/messages/count_tokens"):
             self._json(200, {"input_tokens": 123})
             return
@@ -296,6 +423,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if _fixture(req, "vision") and not _contains_key(req, {"source"}):
             self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "image missing"}})
+            return
+        if _fixture(req, "nested-schema") and not _contains_key(req, {"deep_tag"}):
+            self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "nested tool schema missing"}})
+            return
+        if _fixture(req, "tool-continuation") and not _contains_key(req, {"tool_use_id"}):
+            self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "tool result identity missing"}})
             return
 
         if model == "syn-malformed":
@@ -341,13 +474,22 @@ class Handler(BaseHTTPRequestHandler):
                 else WORD * 4
             )
             content = [{"type": "text", "text": text}]
+            stop_reason = "end_turn"
+            if want_tools:
+                content = [{
+                    "type": "tool_use",
+                    "id": "toolu_syn_sync_1",
+                    "name": "get_weather",
+                    "input": {"city": "Paris"},
+                }]
+                stop_reason = "tool_use"
             self._json(200, {
                 "id": "msg_syn_1",
                 "type": "message",
                 "role": "assistant",
                 "model": model,
                 "content": content,
-                "stop_reason": "end_turn",
+                "stop_reason": stop_reason,
                 "usage": {"input_tokens": 100, "output_tokens": 12},
             }, {"request-id": "req_syn_anthropic"})
             return

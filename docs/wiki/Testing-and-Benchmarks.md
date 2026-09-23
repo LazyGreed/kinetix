@@ -48,17 +48,67 @@ Run this before pushing — it mirrors `.github/workflows/ci.yml`.
 ## Coding-agent compatibility matrix
 
 `scripts/compat-matrix.sh` starts deterministic synthetic OpenAI, Gemini, and
-Anthropic upstreams plus a fresh Kinetix instance, then runs current Pi and
-Claude Code wire profiles end to end. Coverage includes sync/streaming chat,
-tool-result continuation and parallel tools, current session-affinity headers,
-vision, reasoning/thinking controls, Anthropic protocol headers and exact
-`count_tokens`, route fallback, unknown-field translation, malformed streams,
-and post-commit truncation.
+Anthropic upstreams plus a fresh Kinetix instance. The original #75/#83 profiles
+remain in `scripts/compat-matrix.py`; `scripts/protocol-v1-matrix.py` adds the
+v1 field/path contract.
 
-The matrix runs in normal pull-request CI after Rust tests and reuses the same
-debug binary/toolchain cache; it does not add a second Rust build job. See
-[`docs/pi-compatibility.md`](https://github.com/PrightCord/kinetix/blob/main/docs/pi-compatibility.md)
-and [`docs/compatibility.md`](https://github.com/PrightCord/kinetix/blob/main/docs/compatibility.md).
+The v1 path matrix covers sync + streaming for all 18 built-in frontend/adapter
+cells: Chat via OpenAI/Gemini/Anthropic, Messages via Anthropic/Gemini/OpenAI, and
+Responses via OpenAI/Gemini/Anthropic. Additional cases exercise explicit
+field-level positive/rejection semantics, parallel tools, vision variants, nested
+schemas, fallback portability, token counting, and model discovery.
+
+The source of truth is `tests/fixtures/protocol-v1-compatibility.json`. Generate
+`docs/protocol-v1-compatibility.md` with
+`python3 scripts/render-protocol-v1-compat.py`; `--check` fails if generated
+documentation or evidence references drift. Positive field fixtures are validated
+at the synthetic upstream boundary so dropped translated fields fail the matrix.
+
+This hermetic matrix remains part of `scripts/run-ci.sh` and uses no paid/public
+model APIs.
+
+## Real-client release acceptance
+
+Real Pi, Claude Code, Codex/Responses, and optional external `.kxp` sessions are a
+release gate, never normal CI. Configure separate selectors for the actual path being
+proved:
+
+```bash
+export KINETIX_BASE=https://kinetix.example.com
+export KINETIX_KEY=sk-kinetix-...
+export KINETIX_ADMIN_TOKEN='admin credential'
+
+export KINETIX_ACCEPT_PI_SAME_MODEL=direct-openai
+export KINETIX_ACCEPT_PI_TRANSLATED_MODEL=translated-non-openai
+export KINETIX_ACCEPT_PI_FALLBACK_MODEL=forced-fallback-route
+export KINETIX_ACCEPT_PI_AFFINITY_MODEL=sticky-route
+
+export KINETIX_ACCEPT_CLAUDE_SAME_MODEL=direct-anthropic
+export KINETIX_ACCEPT_CLAUDE_TRANSLATED_MODEL=translated-non-anthropic
+export KINETIX_ACCEPT_CLAUDE_FALLBACK_MODEL=forced-fallback-route
+export KINETIX_ACCEPT_CLAUDE_AFFINITY_MODEL=sticky-route
+
+export KINETIX_ACCEPT_RESPONSES_OPENAI_MODEL=responses-via-openai
+export KINETIX_ACCEPT_RESPONSES_GEMINI_MODEL=responses-via-gemini
+export KINETIX_ACCEPT_RESPONSES_ANTHROPIC_MODEL=responses-via-anthropic
+export KINETIX_ACCEPT_RESPONSES_FALLBACK_MODEL=forced-fallback-route
+export KINETIX_ACCEPT_RESPONSES_AFFINITY_MODEL=sticky-route
+
+bash scripts/release-client-acceptance.sh all
+```
+
+Each client case must complete a multi-turn streaming tool loop, emit two distinct
+tool calls, return two tool results, and ground both sentinel files. Fallback cases
+must expose `X-Kinetix-Fallback: 1`. Affinity cases require a stable client session
+header and matching admin Route Trace `final_target` values across turns. Claude
+also gets an explicit exact `count_tokens` probe.
+
+The local evidence proxy records request `stream`, response `Content-Type`, request/route
+IDs, session headers, tool identities, tool-result counts, fallback/warning headers, and
+errors without recording credentials. Every inference turn must prove `stream: true` and
+`text/event-stream`.
+Failures are classified as auth/model/transport/frontend/translation/routing/upstream/
+client. Set `KINETIX_PLUGIN_E2E_PACKAGE=/path/to/plugin.kxp` to include a real guest.
 
 ## Benchmarks
 
@@ -84,7 +134,9 @@ the 50 req/s target with zero errors, idle RSS ~13 MB, cold start ~75 ms.
 
 ## CI
 
-`.github/workflows/ci.yml` runs rustfmt and the dashboard in parallel, then
-runs Clippy, Rust tests, builds the debug `kinetix` binary, and executes the
-Pi + Claude Code compatibility matrix in the same Rust job. Dependency policy
-runs on pushes.
+`scripts/run-ci.sh` is the normal verification gate. The same jobs are
+available in `.github/workflows/ci.yml`, but automatic push/pull-request
+triggers are disabled; GitHub CI runs only via `workflow_dispatch`. The Rust
+job runs Clippy, Rust tests, builds the debug `kinetix` binary, and executes
+the hermetic compatibility matrix. Real-client release acceptance is never
+invoked from this workflow.

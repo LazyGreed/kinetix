@@ -116,8 +116,30 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   # End-to-end smoke test against synthetic upstream
   scripts/smoke.sh 127.0.0.1:8180
 
-  # Coding-agent compatibility matrix (Pi, Codex, Anthropic personas)
+  # Hermetic compatibility matrix (#75/#83 profiles + v1 native/translated contract)
   scripts/compat-matrix.sh 127.0.0.1:8186
+
+  # Check generated field-level compatibility docs
+  python3 scripts/render-protocol-v1-compat.py --check
+
+  # Manual release-only real-client acceptance (never normal CI).
+  # Configure the full model/route matrix documented in docs/compatibility.md.
+  KINETIX_BASE=https://kinetix.example.com KINETIX_KEY=sk-kinetix-... \
+    KINETIX_ADMIN_TOKEN='admin credential' \
+    KINETIX_ACCEPT_PI_SAME_MODEL=direct-openai \
+    KINETIX_ACCEPT_PI_TRANSLATED_MODEL=translated-non-openai \
+    KINETIX_ACCEPT_PI_FALLBACK_MODEL=forced-fallback-route \
+    KINETIX_ACCEPT_PI_AFFINITY_MODEL=sticky-route \
+    KINETIX_ACCEPT_CLAUDE_SAME_MODEL=direct-anthropic \
+    KINETIX_ACCEPT_CLAUDE_TRANSLATED_MODEL=translated-non-anthropic \
+    KINETIX_ACCEPT_CLAUDE_FALLBACK_MODEL=forced-fallback-route \
+    KINETIX_ACCEPT_CLAUDE_AFFINITY_MODEL=sticky-route \
+    KINETIX_ACCEPT_RESPONSES_OPENAI_MODEL=responses-via-openai \
+    KINETIX_ACCEPT_RESPONSES_GEMINI_MODEL=responses-via-gemini \
+    KINETIX_ACCEPT_RESPONSES_ANTHROPIC_MODEL=responses-via-anthropic \
+    KINETIX_ACCEPT_RESPONSES_FALLBACK_MODEL=forced-fallback-route \
+    KINETIX_ACCEPT_RESPONSES_AFFINITY_MODEL=sticky-route \
+    bash scripts/release-client-acceptance.sh all
   ```
 
 ## lint
@@ -154,6 +176,8 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 
 - **Rust code**: Idiomatic Rust standard (`snake_case` for modules, functions, methods, and variables; `PascalCase` for types, traits, and enum variants; `SCREAMING_SNAKE_CASE` for statics and constants).
 - **Files**: Rust source files in `snake_case.rs`, shell scripts in `kebab-case.sh`, Python test harnesses in `snake_case.py`.
+- **Protocol acceptance evidence**: `tests/fixtures/protocol-v1-compatibility.json` is authoritative. Every documented field row must cite one or more concrete cases. HTTP cases must be implemented in `scripts/protocol-v1-matrix.py`; positive translation cases must be observable at `scripts/synthetic_upstream.py`. Keep sync + stream coverage for every supported built-in frontend/adapter cell.
+- **Real-client acceptance**: `scripts/release-client-acceptance.sh` and `scripts/release-client-proxy.py` are release-only. Never add them to normal CI. Real-client cases must prove multi-turn two-tool continuation, required fallback/affinity behavior, and preserve categorized artifacts without logging credentials.
 - **Virtual keys**: Client-facing virtual API keys always use the `sk-kinetix-` prefix.
 - **Custom HTTP headers**: All downstream response diagnostic headers must use the `X-Kinetix-` prefix (e.g., `X-Kinetix-Route`, `X-Kinetix-Attempt`, `X-Kinetix-Latency-Ms`).
 - **Domain vocabulary**: Use authoritative terms:
@@ -212,7 +236,8 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 
 - **End-to-end proxy behavior**: Validated using `scripts/synthetic_upstream.py` as a deterministic mock upstream server:
   - `scripts/smoke.sh`: Tests routing, wire translation, virtual keys, models discovery, and admin APIs.
-  - `scripts/compat-matrix.sh`: Tests coding-agent client profiles (Pi, Codex Responses, Anthropic) across multi-turn sessions, tool calling, and thinking blocks.
+  - `scripts/compat-matrix.sh`: Runs the #75/#83 coding-agent profiles plus `scripts/protocol-v1-matrix.py`, which consumes `tests/fixtures/protocol-v1-compatibility.json` for native/translated/fallback compatibility coverage and checks the generated field matrix.
+  - `scripts/release-client-acceptance.sh`: Manual release-only Pi/Claude Code/Codex and optional real-`.kxp` acceptance. It may consume provider quota and must never be added to normal CI.
 - **WASM plugin runtime**:
   - `tests/plugins.rs`: Tests plugin store, capabilities, lifecycle, and host policy.
   - `tests/plugin_e2e.rs`: Tests end-to-end installation, instantiation, and invocation of an external compiled `.kxp` supplied with `KINETIX_PLUGIN_E2E_PACKAGE`.
