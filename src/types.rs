@@ -213,9 +213,9 @@ impl ThinkingMap {
                 continue;
             }
             match value {
-                serde_json::Value::Null => errors.push(format!(
-                    "thinking_map level '{level}' must not be null"
-                )),
+                serde_json::Value::Null => {
+                    errors.push(format!("thinking_map level '{level}' must not be null"))
+                }
                 serde_json::Value::Array(_) => errors.push(format!(
                     "thinking_map level '{level}' must be an object or scalar"
                 )),
