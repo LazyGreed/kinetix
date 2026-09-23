@@ -380,6 +380,9 @@ impl Adapter for AnthropicAdapter {
                     body.insert("thinking".to_string(), v.clone());
                 } else if let Some(field) = tmap.budget_field.as_deref() {
                     insert_dotted(&mut body, field, v.clone());
+                    if field == "thinking.budget_tokens" {
+                        insert_dotted(&mut body, "thinking.type", json!("enabled"));
+                    }
                 }
             }
         }
@@ -795,8 +798,13 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        assert_eq!(body["thinking"]["budget_tokens"], 4096);
-        assert!(body["thinking"].is_object());
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 4096
+            })
+        );
     }
 
     #[test]
