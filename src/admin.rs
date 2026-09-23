@@ -1355,7 +1355,7 @@ pub async fn test_provider(
             opaque_state_plugin: String::new(),
         });
 
-    let adapter = state.adapters.for_format(provider.wire());
+    let adapter = state.adapters.for_provider(&provider);
     let ctx = UpstreamContext {
         provider: &provider,
         model: &model,
