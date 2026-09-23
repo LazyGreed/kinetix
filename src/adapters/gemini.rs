@@ -409,8 +409,8 @@ fn add_nullable_type(
 /// - OpenAPI `nullable` -> JSON Schema null type
 /// - lossless object-style `allOf` merges
 ///
-/// Gemini-unsupported validation keywords are stripped recursively before dispatch.
-/// Unknown schema constructs still fail closed instead of being forwarded to Google.
+/// Unknown validation keywords fail closed instead of being forwarded to Google
+/// or silently discarded.
 fn sanitize_schema(schema: &Value, root_path: &str) -> Result<Value, UpstreamFailure> {
     sanitize_schema_node(schema, root_path)
 }
@@ -428,12 +428,6 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
         match key.as_str() {
             "$schema" | "$comment" | "strict" | "default" | "examples" | "example"
             | "deprecated" | "readOnly" | "writeOnly" => {}
-
-            // Gemini's tool-schema subset rejects these standard validation
-            // constraints. Drop them recursively instead of rejecting the tool;
-            // supported structural fields are still preserved below.
-            "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf" | "minLength" | "maxLength"
-            | "pattern" | "uniqueItems" | "minProperties" | "maxProperties" | "propertyNames" => {}
 
             "definitions" | "$defs" => {
                 let definitions = value
@@ -540,7 +534,8 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
             }
 
             "$id" | "$anchor" | "type" | "format" | "title" | "description" | "enum"
-            | "minItems" | "maxItems" | "minimum" | "maximum" | "required" | "propertyOrdering" => {
+            | "minLength" | "maxLength" | "minItems" | "maxItems" | "minimum" | "maximum"
+            | "required" | "propertyOrdering" => {
                 out.insert(key.clone(), value.clone());
             }
 
@@ -1243,34 +1238,25 @@ mod schema_tests {
     }
 
     #[test]
-    fn sanitize_schema_strips_unsupported_validation_keywords_recursively() {
+    fn sanitize_schema_preserves_string_length_constraints_recursively() {
         let input = json!({
             "type": "object",
-            "maxProperties": 4,
             "properties": {
                 "query": {
                     "type": "string",
                     "description": "search text",
                     "minLength": 1,
-                    "maxLength": 10000,
-                    "pattern": "^.+$"
+                    "maxLength": 10000
                 },
                 "items": {
                     "type": "array",
-                    "uniqueItems": true,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "score": {
-                                "type": "number",
-                                "exclusiveMinimum": 0,
-                                "exclusiveMaximum": 10,
-                                "multipleOf": 0.5
-                            },
-                            "metadata": {
-                                "type": "object",
-                                "minProperties": 1,
-                                "propertyNames": {"pattern": "^[a-z]+$"}
+                            "label": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 64
                             }
                         }
                     }
@@ -1280,37 +1266,58 @@ mod schema_tests {
         });
         let got = sanitize_schema(&input, "tool 'chrome_devtools_load'").unwrap();
 
-        for pointer in [
-            "/maxProperties",
-            "/properties/query/minLength",
-            "/properties/query/maxLength",
-            "/properties/query/pattern",
-            "/properties/items/uniqueItems",
-            "/properties/items/items/properties/score/exclusiveMinimum",
-            "/properties/items/items/properties/score/exclusiveMaximum",
-            "/properties/items/items/properties/score/multipleOf",
-            "/properties/items/items/properties/metadata/minProperties",
-            "/properties/items/items/properties/metadata/propertyNames",
-        ] {
-            assert!(
-                got.pointer(pointer).is_none(),
-                "unexpected {pointer}: {got}"
-            );
-        }
-
         assert_eq!(
-            got.pointer("/properties/query/type"),
-            Some(&json!("string"))
+            got.pointer("/properties/query/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            got.pointer("/properties/query/maxLength"),
+            Some(&json!(10000))
+        );
+        assert_eq!(
+            got.pointer("/properties/items/items/properties/label/minLength"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            got.pointer("/properties/items/items/properties/label/maxLength"),
+            Some(&json!(64))
         );
         assert_eq!(
             got.pointer("/properties/query/description"),
             Some(&json!("search text"))
         );
-        assert_eq!(
-            got.pointer("/properties/items/items/properties/score/type"),
-            Some(&json!("number"))
-        );
         assert_eq!(got["required"], json!(["query"]));
+    }
+
+    #[test]
+    fn sanitize_schema_rejects_unsupported_validation_keywords() {
+        for (keyword, value) in [
+            ("exclusiveMinimum", json!(0)),
+            ("exclusiveMaximum", json!(10)),
+            ("multipleOf", json!(0.5)),
+            ("propertyNames", json!({"pattern":"^[a-z]+$"})),
+            ("pattern", json!("^[a-z]+$")),
+            ("uniqueItems", json!(true)),
+            ("minProperties", json!(1)),
+            ("maxProperties", json!(4)),
+        ] {
+            let mut value_schema = json!({ "type": "string" });
+            value_schema
+                .as_object_mut()
+                .unwrap()
+                .insert(keyword.to_string(), value);
+            let input = json!({
+                "type": "object",
+                "properties": { "value": value_schema }
+            });
+            let err = sanitize_schema(&input, "tool 'agent'").unwrap_err();
+            assert_eq!(err.kind, FailureKind::BadRequest);
+            assert!(
+                err.message.contains(keyword),
+                "expected {keyword} in: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
@@ -1334,7 +1341,7 @@ mod schema_tests {
     }
 
     #[test]
-    fn build_tools_uses_sanitized_parameters_json_schema() {
+    fn build_tools_preserves_json_schema_length_constraints() {
         let req = InternalRequest {
             requested_model: "gemini".into(),
             system: vec![],
@@ -1349,15 +1356,8 @@ mod schema_tests {
                         "query": {
                             "type": "string",
                             "description": "resource query",
+                            "minLength": 1,
                             "maxLength": 10000
-                        },
-                        "selectors": {
-                            "type": "array",
-                            "uniqueItems": true,
-                            "items": {
-                                "type": "string",
-                                "minLength": 1
-                            }
                         }
                     },
                     "required": ["query"]
@@ -1384,14 +1384,16 @@ mod schema_tests {
             schema.pointer("/properties/query/description"),
             Some(&json!("resource query"))
         );
-        assert!(schema.pointer("/properties/query/maxLength").is_none());
-        assert!(schema
-            .pointer("/properties/selectors/uniqueItems")
-            .is_none());
-        assert!(schema
-            .pointer("/properties/selectors/items/minLength")
-            .is_none());
+        assert_eq!(
+            schema.pointer("/properties/query/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            schema.pointer("/properties/query/maxLength"),
+            Some(&json!(10000))
+        );
     }
+
 }
 
 #[cfg(test)]
