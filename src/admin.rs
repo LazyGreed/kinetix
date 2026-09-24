@@ -1093,6 +1093,33 @@ fn discovered_observation(
     }
 }
 
+fn merge_model_discovery(existing: &str, fresh: Value) -> Value {
+    let mut merged = serde_json::from_str::<Value>(existing)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+
+    if let (Some(current), Value::Object(update)) = (merged.as_object_mut(), fresh) {
+        for (key, value) in update {
+            current.insert(key, value);
+        }
+        if current.get("disappeared").and_then(Value::as_bool) == Some(false) {
+            current.remove("flagged_at");
+        }
+    }
+
+    merged
+}
+
+async fn persist_model_discovery_update(
+    pool: &Pool,
+    row: &db::ModelRow,
+    fresh: Value,
+) -> anyhow::Result<()> {
+    let merged = merge_model_discovery(&row.discovery, fresh);
+    db::set_model_discovery(pool, &row.id, &merged).await
+}
+
 fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a Value> {
     fn matches_model(value: &Value, model_id: &str) -> bool {
         value
@@ -1231,10 +1258,10 @@ pub async fn discover_models(
     for observation in &discovered {
         let m = &observation.model;
         if let Some(row) = existing.iter().find(|e| e.upstream_id == m.id) {
-            let _ = db::set_model_discovery(
+            let _ = persist_model_discovery_update(
                 &state.pool,
-                &row.id,
-                &json!({
+                row,
+                json!({
                     "last_seen": now,
                     "context_window": m.context_window,
                     "max_output_tokens": m.max_output_tokens,
@@ -1268,11 +1295,15 @@ pub async fn discover_models(
         if discovered_ids.contains(&row.upstream_id) {
             continue;
         }
-        let prev: Value = serde_json::from_str(&row.discovery).unwrap_or(json!({}));
-        let mut merged = prev.clone();
-        merged["disappeared"] = json!(true);
-        merged["flagged_at"] = json!(now);
-        let _ = db::set_model_discovery(&state.pool, &row.id, &merged).await;
+        let _ = persist_model_discovery_update(
+            &state.pool,
+            row,
+            json!({
+                "disappeared": true,
+                "flagged_at": now,
+            }),
+        )
+        .await;
         disappeared.push(json!({
             "upstream_id": row.upstream_id,
             "display_name": row.display_name,
@@ -6041,6 +6072,90 @@ mod reasoning_discovery_control_plane_tests {
             assert!(observation.reasoning.is_none());
             assert!(observation.thinking_map.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn import_then_rediscover_preserves_discovery_provenance() {
+        let db_path = std::env::temp_dir().join(format!(
+            "kinetix-discovery-provenance-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let database_url = format!("sqlite://{}", db_path.display());
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let provider_id = db::insert_provider(
+            &pool,
+            &db::NewProvider {
+                name: "test",
+                base_url: "https://api.example.com",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+            },
+        )
+        .await
+        .unwrap();
+
+        let model_id = db::insert_model(
+            &pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "reasoner",
+                display_name: "Reasoner",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "import_source": "dashboard"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let imported = db::get_model(&pool, &model_id).await.unwrap().unwrap();
+        persist_model_discovery_update(
+            &pool,
+            &imported,
+            json!({
+                "last_seen": "2026-09-24T00:00:00Z",
+                "context_window": 200000,
+                "disappeared": false
+            }),
+        )
+        .await
+        .unwrap();
+
+        let rediscovered = db::get_model(&pool, &model_id).await.unwrap().unwrap();
+        let discovery: Value = serde_json::from_str(&rediscovered.discovery).unwrap();
+        assert_eq!(discovery["imported_from_discovery"], true);
+        assert_eq!(discovery["import_source"], "dashboard");
+        assert_eq!(discovery["context_window"], 200000);
+        assert_eq!(discovery["disappeared"], false);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
     }
 
     #[test]
