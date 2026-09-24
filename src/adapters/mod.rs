@@ -813,7 +813,7 @@ mod reasoning_discovery_tests {
                 "supported": true
             }
         });
-        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        let capability = normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
         assert_eq!(capability.mode, None);
         assert!(capability.levels.is_empty());
         assert!(thinking_map_for_reasoning(&capability).is_none());
@@ -829,7 +829,7 @@ mod reasoning_discovery_tests {
                 "can_disable": true
             }
         });
-        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        let capability = normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
         assert_eq!(capability.mode, Some(ReasoningCapabilityMode::Toggle));
         assert!(capability.levels.is_empty());
         assert!(capability.can_disable);
@@ -883,9 +883,9 @@ mod reasoning_discovery_tests {
     }
 
     #[test]
-    fn accepts_plugin_normalized_reasoning_capability() {
+    fn accepts_provider_normalized_adaptive_reasoning_capability() {
         let metadata = serde_json::json!({
-            "reasoning": {
+            "reasoning_capability": {
                 "mode": "adaptive",
                 "levels": ["low", "high", "max"],
                 "can_disable": false,
