@@ -78,11 +78,11 @@ export interface ModelCapability {
 }
 
 export interface ModelPrice {
-  inputPer1M: number;
-  outputPer1M: number;
-  cachedPer1M: number;
-  cacheWritePer1M: number;
-  thinkingPer1M: number;
+  inputPer1M: number | null;
+  outputPer1M: number | null;
+  cachedPer1M: number | null;
+  cacheWritePer1M: number | null;
+  thinkingPer1M: number | null;
 }
 
 export interface ModelConfig {

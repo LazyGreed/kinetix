@@ -48,6 +48,7 @@ export interface DiscoveredModel {
   context_window?: number | null;
   max_output_tokens?: number | null;
   capabilities?: {
+    text?: boolean | null;
     reasoning?: boolean | null;
     vision?: boolean | null;
     tool_calling?: boolean | null;
@@ -56,7 +57,19 @@ export interface DiscoveredModel {
   reasoning_capability?: DiscoveredReasoningCapability | null;
   thinking_map?: DiscoveredThinkingMap | null;
   capability_sources?: Record<string, string | null> | null;
-  catalog?: { id: string; source?: string | null } | null;
+  modalities?: {
+    input?: string[] | null;
+    output?: string[] | null;
+  } | null;
+  prices?: {
+    input_per_1m?: number | null;
+    output_per_1m?: number | null;
+    cached_per_1m?: number | null;
+    cache_write_per_1m?: number | null;
+    thinking_per_1m?: number | null;
+  } | null;
+  price_sources?: Record<string, string | null> | null;
+  catalog?: { id?: string; source?: string | null; reference?: string | null; url?: string | null } | null;
   already_imported: boolean;
 }
 

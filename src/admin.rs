@@ -1060,6 +1060,9 @@ struct DiscoveredObservation {
     thinking_map: Option<ThinkingMap>,
     capabilities: ModelCapabilityFlags,
     capability_sources: Value,
+    modalities: Option<Value>,
+    prices: Prices,
+    price_sources: Value,
     catalog: Option<Value>,
 }
 
@@ -1097,7 +1100,22 @@ fn provider_capability_flags(metadata: &Value) -> ModelCapabilityFlags {
             .find_map(|pointer| metadata.pointer(pointer).and_then(Value::as_bool))
     }
 
+    let text = first_bool(metadata, &["/capabilities/text", "/text/supported"]).or_else(|| {
+        metadata
+            .get("supportedGenerationMethods")
+            .and_then(Value::as_array)
+            .filter(|methods| !methods.is_empty())
+            .map(|methods| {
+                methods.iter().any(|method| {
+                    method
+                        .as_str()
+                        .is_some_and(|method| method.contains("generateContent"))
+                })
+            })
+    });
+
     ModelCapabilityFlags {
+        text,
         reasoning: explicit_reasoning_support(metadata),
         vision: first_bool(
             metadata,
@@ -1122,6 +1140,9 @@ fn provider_capability_flags(metadata: &Value) -> ModelCapabilityFlags {
 }
 
 fn overlay_capability_flags(base: &mut ModelCapabilityFlags, overlay: &ModelCapabilityFlags) {
+    if overlay.text.is_some() {
+        base.text = overlay.text;
+    }
     if overlay.reasoning.is_some() {
         base.reasoning = overlay.reasoning;
     }
@@ -1150,6 +1171,87 @@ fn capability_source(
         catalog_source.map(str::to_string)
     } else {
         None
+    }
+}
+
+fn valid_discovery_price(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn discovery_prices(metadata: &Value) -> Prices {
+    let Some(prices) = metadata.get("prices") else {
+        return Prices::default();
+    };
+    Prices {
+        input_per_1m: valid_discovery_price(prices.get("input_per_1m")),
+        output_per_1m: valid_discovery_price(prices.get("output_per_1m")),
+        cached_per_1m: valid_discovery_price(prices.get("cached_per_1m")),
+        cache_write_per_1m: valid_discovery_price(prices.get("cache_write_per_1m")),
+        thinking_per_1m: valid_discovery_price(prices.get("thinking_per_1m")),
+    }
+}
+
+fn overlay_prices(base: &mut Prices, overlay: &Prices) {
+    if overlay.input_per_1m.is_some() {
+        base.input_per_1m = overlay.input_per_1m;
+    }
+    if overlay.output_per_1m.is_some() {
+        base.output_per_1m = overlay.output_per_1m;
+    }
+    if overlay.cached_per_1m.is_some() {
+        base.cached_per_1m = overlay.cached_per_1m;
+    }
+    if overlay.cache_write_per_1m.is_some() {
+        base.cache_write_per_1m = overlay.cache_write_per_1m;
+    }
+    if overlay.thinking_per_1m.is_some() {
+        base.thinking_per_1m = overlay.thinking_per_1m;
+    }
+}
+
+fn price_source(
+    provider: Option<f64>,
+    plugin: Option<f64>,
+    catalog: Option<f64>,
+    catalog_source: Option<&str>,
+) -> Option<String> {
+    if provider.is_some() {
+        Some("provider_metadata".to_string())
+    } else if plugin.is_some() {
+        Some("plugin".to_string())
+    } else if catalog.is_some() {
+        catalog_source.map(str::to_string)
+    } else {
+        None
+    }
+}
+
+fn normalized_modalities(metadata: &Value) -> Option<Value> {
+    fn direction(metadata: &Value, key: &str) -> Option<Vec<String>> {
+        let values = metadata.get("modalities")?.get(key)?.as_array()?;
+        let mut out = Vec::new();
+        for value in values {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            let value = value.trim().to_ascii_lowercase();
+            if matches!(value.as_str(), "text" | "image" | "audio" | "video" | "pdf")
+                && !out.iter().any(|existing| existing == &value)
+            {
+                out.push(value);
+            }
+        }
+        Some(out)
+    }
+
+    let input = direction(metadata, "input");
+    let output = direction(metadata, "output");
+    if input.is_none() && output.is_none() {
+        None
+    } else {
+        Some(json!({"input": input, "output": output}))
     }
 }
 
@@ -1183,6 +1285,59 @@ fn discovered_observation_with_catalog(
         .as_ref()
         .map(provider_capability_flags)
         .unwrap_or_default();
+
+    let provider_prices = provider_metadata
+        .as_ref()
+        .map(discovery_prices)
+        .unwrap_or_default();
+    let plugin_prices = fallback_metadata
+        .as_ref()
+        .map(discovery_prices)
+        .unwrap_or_default();
+    let catalog_prices = catalog
+        .as_ref()
+        .map(|entry| entry.prices.clone())
+        .unwrap_or_default();
+    let mut prices = catalog_prices.clone();
+    overlay_prices(&mut prices, &plugin_prices);
+    overlay_prices(&mut prices, &provider_prices);
+    let price_sources = json!({
+        "input_per_1m": price_source(
+            provider_prices.input_per_1m,
+            plugin_prices.input_per_1m,
+            catalog_prices.input_per_1m,
+            catalog_source.as_deref(),
+        ),
+        "output_per_1m": price_source(
+            provider_prices.output_per_1m,
+            plugin_prices.output_per_1m,
+            catalog_prices.output_per_1m,
+            catalog_source.as_deref(),
+        ),
+        "cached_per_1m": price_source(
+            provider_prices.cached_per_1m,
+            plugin_prices.cached_per_1m,
+            catalog_prices.cached_per_1m,
+            catalog_source.as_deref(),
+        ),
+        "cache_write_per_1m": price_source(
+            provider_prices.cache_write_per_1m,
+            plugin_prices.cache_write_per_1m,
+            catalog_prices.cache_write_per_1m,
+            catalog_source.as_deref(),
+        ),
+        "thinking_per_1m": price_source(
+            provider_prices.thinking_per_1m,
+            plugin_prices.thinking_per_1m,
+            catalog_prices.thinking_per_1m,
+            catalog_source.as_deref(),
+        ),
+    });
+    let modalities = provider_metadata
+        .as_ref()
+        .and_then(normalized_modalities)
+        .or_else(|| fallback_metadata.as_ref().and_then(normalized_modalities))
+        .or_else(|| catalog.as_ref().and_then(|entry| entry.modalities.clone()));
 
     let provider_declares_reasoning = provider_metadata
         .as_ref()
@@ -1299,6 +1454,12 @@ fn discovered_observation_with_catalog(
     let capability_sources = json!({
         "context_window": context_source,
         "max_output_tokens": max_output_source,
+        "text": capability_source(
+            provider_flags.text,
+            plugin_flags.text,
+            catalog_flags.text,
+            catalog_source.as_deref(),
+        ),
         "reasoning": reasoning_source,
         "vision": capability_source(
             provider_flags.vision,
@@ -1338,12 +1499,16 @@ fn discovered_observation_with_catalog(
         thinking_map,
         capabilities,
         capability_sources,
+        modalities,
+        prices,
+        price_sources,
         catalog,
     }
 }
 
 fn discovered_capabilities(observation: &DiscoveredObservation) -> Value {
     json!({
+        "text": observation.capabilities.text,
         "reasoning": observation.capabilities.reasoning,
         "vision": observation.capabilities.vision,
         "tool_calling": observation.capabilities.tool_calling,
@@ -1534,6 +1699,9 @@ pub async fn discover_models(
                     "reasoning_capability": &observation.reasoning,
                     "thinking_map": &observation.thinking_map,
                     "capability_sources": &observation.capability_sources,
+                    "modalities": &observation.modalities,
+                    "prices": &observation.prices,
+                    "price_sources": &observation.price_sources,
                     "catalog": &observation.catalog,
                     "disappeared": false,
                 }),
@@ -1549,6 +1717,9 @@ pub async fn discover_models(
             "reasoning_capability": &observation.reasoning,
             "thinking_map": &observation.thinking_map,
             "capability_sources": &observation.capability_sources,
+            "modalities": &observation.modalities,
+            "prices": &observation.prices,
+            "price_sources": &observation.price_sources,
             "catalog": &observation.catalog,
             "already_imported": existing.iter().any(|e| e.upstream_id == m.id),
         }));
@@ -6414,6 +6585,117 @@ mod reasoning_discovery_control_plane_tests {
         }
     }
 
+    #[test]
+    fn pricing_precedence_is_per_field_with_provenance() {
+        let catalog = crate::model_catalog::CatalogMatch {
+            source: crate::model_catalog::CatalogSource::ModelsDev,
+            provider_id: "example".to_string(),
+            host: "api.example.com".to_string(),
+            model_id: "priced-model".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            capabilities_json: json!({"schema_version": 1}),
+            modalities: None,
+            prices: Prices {
+                input_per_1m: Some(0.75),
+                output_per_1m: Some(3.75),
+                cached_per_1m: Some(0.075),
+                cache_write_per_1m: Some(0.1),
+                thinking_per_1m: None,
+            },
+            source_url: Some("https://models.dev/api.json".to_string()),
+        };
+        let observation = discovered_observation_with_catalog(
+            model("priced-model"),
+            Some(json!({
+                "id": "priced-model",
+                "prices": {
+                    "input_per_1m": 1.5,
+                    "cached_per_1m": 0.05
+                }
+            })),
+            Some(json!({
+                "schema_version": 1,
+                "prices": {
+                    "input_per_1m": 1.0,
+                    "output_per_1m": null,
+                    "cache_write_per_1m": 0.2
+                }
+            })),
+            WireFormat::Openai,
+            Some(catalog),
+        );
+
+        assert_eq!(observation.prices.input_per_1m, Some(1.5));
+        assert_eq!(observation.prices.output_per_1m, Some(3.75));
+        assert_eq!(observation.prices.cached_per_1m, Some(0.05));
+        assert_eq!(observation.prices.cache_write_per_1m, Some(0.2));
+        assert_eq!(observation.prices.thinking_per_1m, None);
+        assert_eq!(
+            observation.price_sources["input_per_1m"],
+            json!("provider_metadata")
+        );
+        assert_eq!(
+            observation.price_sources["output_per_1m"],
+            json!("models.dev")
+        );
+        assert_eq!(
+            observation.price_sources["cached_per_1m"],
+            json!("provider_metadata")
+        );
+        assert_eq!(
+            observation.price_sources["cache_write_per_1m"],
+            json!("plugin")
+        );
+        assert!(observation.price_sources["thinking_per_1m"].is_null());
+    }
+
+    #[test]
+    fn malformed_plugin_prices_are_ignored_without_erasing_catalog_values() {
+        let catalog = crate::model_catalog::CatalogMatch {
+            source: crate::model_catalog::CatalogSource::ModelsDev,
+            provider_id: "example".to_string(),
+            host: "api.example.com".to_string(),
+            model_id: "priced-model".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            capabilities_json: json!({"schema_version": 1}),
+            modalities: None,
+            prices: Prices {
+                input_per_1m: Some(0.75),
+                output_per_1m: Some(3.75),
+                ..Prices::default()
+            },
+            source_url: Some("https://models.dev/api.json".to_string()),
+        };
+        let observation = discovered_observation_with_catalog(
+            model("priced-model"),
+            None,
+            Some(json!({
+                "schema_version": 1,
+                "prices": {
+                    "input_per_1m": -1,
+                    "output_per_1m": "free",
+                    "cached_per_1m": null
+                }
+            })),
+            WireFormat::Plugin,
+            Some(catalog),
+        );
+
+        assert_eq!(observation.prices.input_per_1m, Some(0.75));
+        assert_eq!(observation.prices.output_per_1m, Some(3.75));
+        assert_eq!(observation.prices.cached_per_1m, None);
+        assert_eq!(
+            observation.price_sources["input_per_1m"],
+            json!("models.dev")
+        );
+        assert_eq!(
+            observation.price_sources["output_per_1m"],
+            json!("models.dev")
+        );
+    }
+
     #[tokio::test]
     async fn admin_rediscovery_preserves_import_provenance() {
         use std::sync::Arc;
@@ -6506,10 +6788,17 @@ mod reasoning_discovery_control_plane_tests {
                 upstream_id: "reasoner",
                 display_name: "Reasoner",
                 enabled: true,
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: json!({}),
-                prices: json!({}),
+                context_window: Some(4096),
+                max_output_tokens: Some(1024),
+                capabilities: json!({
+                    "text": false,
+                    "reasoning": false,
+                    "tool_calling": false
+                }),
+                prices: json!({
+                    "input_per_1m": 9.99,
+                    "output_per_1m": 19.99
+                }),
                 parameters: json!({}),
                 thinking_map: json!({}),
                 extra_request: json!({}),
@@ -6555,6 +6844,24 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(discovery["import_source"], "dashboard");
         assert_eq!(discovery["disappeared"], false);
         assert!(discovery.get("last_seen").is_some());
+
+        assert_eq!(rediscovered.context_window, Some(4096));
+        assert_eq!(rediscovered.max_output_tokens, Some(1024));
+        assert_eq!(
+            serde_json::from_str::<Value>(&rediscovered.capabilities).unwrap(),
+            json!({
+                "text": false,
+                "reasoning": false,
+                "tool_calling": false
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&rediscovered.prices).unwrap(),
+            json!({
+                "input_per_1m": 9.99,
+                "output_per_1m": 19.99
+            })
+        );
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(home);
@@ -6610,10 +6917,22 @@ mod reasoning_discovery_control_plane_tests {
                     "levels": ["low", "medium", "high"],
                     "can_disable": false
                 },
+                "text": {"supported": true},
                 "tools": {"supported": true},
                 "vision": {"input": true},
                 "structured_output": {"supported": true}
             }),
+            modalities: Some(json!({
+                "input": ["text", "image"],
+                "output": ["text"]
+            })),
+            prices: Prices {
+                input_per_1m: Some(0.75),
+                output_per_1m: Some(3.75),
+                cached_per_1m: Some(0.075),
+                cache_write_per_1m: None,
+                thinking_per_1m: None,
+            },
             source_url: Some("https://models.dev/api.json".to_string()),
         };
         let mut discovered = model("gemini-3.8-flash");
@@ -6636,8 +6955,23 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(observation.model.context_window, Some(1_048_576));
         assert_eq!(observation.model.max_output_tokens, Some(65_536));
         assert_eq!(observation.reasoning_support, Some(true));
+        assert_eq!(observation.capabilities.text, Some(true));
         assert_eq!(observation.capabilities.vision, Some(true));
         assert_eq!(observation.capabilities.tool_calling, Some(true));
+        assert_eq!(observation.prices.input_per_1m, Some(0.75));
+        assert_eq!(observation.prices.output_per_1m, Some(3.75));
+        assert_eq!(observation.prices.cached_per_1m, Some(0.075));
+        assert_eq!(observation.prices.cache_write_per_1m, None);
+        assert_eq!(observation.prices.thinking_per_1m, None);
+        assert_eq!(
+            observation.price_sources["input_per_1m"],
+            json!("models.dev")
+        );
+        assert_eq!(observation.price_sources["thinking_per_1m"], Value::Null);
+        assert_eq!(
+            observation.modalities.as_ref().unwrap()["input"],
+            json!(["text", "image"])
+        );
 
         let reasoning = observation.reasoning.as_ref().unwrap();
         assert_eq!(
@@ -6677,6 +7011,8 @@ mod reasoning_discovery_control_plane_tests {
                     "can_disable": false
                 }
             }),
+            modalities: None,
+            prices: Prices::default(),
             source_url: Some("https://models.dev/api.json".to_string()),
         };
         let observation = discovered_observation_with_catalog(

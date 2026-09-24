@@ -80,11 +80,11 @@ export function mapModel(j: any): ModelConfig {
   const c = j.capabilities || {};
   const p = j.prices || {};
   const prices: ModelPrice = {
-    inputPer1M: num(p.input_per_1m),
-    outputPer1M: num(p.output_per_1m),
-    cachedPer1M: num(p.cached_per_1m),
-    cacheWritePer1M: num(p.cache_write_per_1m),
-    thinkingPer1M: num(p.thinking_per_1m),
+    inputPer1M: optionalNum(p.input_per_1m),
+    outputPer1M: optionalNum(p.output_per_1m),
+    cachedPer1M: optionalNum(p.cached_per_1m),
+    cacheWritePer1M: optionalNum(p.cache_write_per_1m),
+    thinkingPer1M: optionalNum(p.thinking_per_1m),
   };
   const thinkingMap =
     j.thinking_map && typeof j.thinking_map === 'object' ? j.thinking_map : {};

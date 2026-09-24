@@ -320,6 +320,31 @@ DiscoveredModel {
 }
 ```
 
+API v1 keeps the WIT record binary-compatible. Optional canonical discovery extensions are carried
+inside the existing versioned `capabilities_json` envelope:
+
+```json
+{
+  "schema_version": 1,
+  "text": { "supported": true },
+  "modalities": {
+    "input": ["text", "image"],
+    "output": ["text"]
+  },
+  "prices": {
+    "input_per_1m": 0.75,
+    "output_per_1m": 3.75,
+    "cached_per_1m": 0.075,
+    "cache_write_per_1m": null,
+    "thinking_per_1m": null
+  }
+}
+```
+
+Price fields are optional and normalized independently. Missing, negative, non-numeric, or
+non-finite values do not become zero and do not erase a lower-priority known value. Newer plugin
+API versions may promote these fields into typed WIT records, but v1 components require no rebuild.
+
 Core rules remain:
 
 - observations do not overwrite explicit admin edits;
