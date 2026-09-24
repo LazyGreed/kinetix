@@ -13,7 +13,7 @@ import { Kinetix, DiscoveredModel } from '../../lib/resources';
  */
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const DEFAULT_MAX_OUTPUT = 8192;
-const CANONICAL_THINKING_LEVELS = ['low', 'medium', 'high'] as const;
+const CANONICAL_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 type CanonicalThinkingLevel = (typeof CANONICAL_THINKING_LEVELS)[number];
 
 const thinkingValueToInput = (value: unknown): string => {
@@ -117,10 +117,16 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [capVision, setCapVision] = useState(true);
   const [capReasoning, setCapReasoning] = useState(false);
   const [capTools, setCapTools] = useState(true);
+  const [modelThinkingOff, setModelThinkingOff] = useState('');
+  const [modelThinkingMinimal, setModelThinkingMinimal] = useState('');
   const [modelThinkingLow, setModelThinkingLow] = useState('');
   const [modelThinkingMedium, setModelThinkingMedium] = useState('');
   const [modelThinkingHigh, setModelThinkingHigh] = useState('');
+  const [modelThinkingXHigh, setModelThinkingXHigh] = useState('');
+  const [modelThinkingMax, setModelThinkingMax] = useState('');
+  const [modelThinkingMode, setModelThinkingMode] = useState<'' | 'manual_budget' | 'level' | 'adaptive'>('');
   const [modelThinkingBudgetField, setModelThinkingBudgetField] = useState('');
+  const [modelThinkingLevelField, setModelThinkingLevelField] = useState('');
   const [modelThinkingExtraLevels, setModelThinkingExtraLevels] = useState<Record<string, unknown>>({});
   const [modelValidation, setModelValidation] = useState<{ valid: boolean; problems: string[]; warnings: string[] } | null>(null);
   const [validatingModel, setValidatingModel] = useState(false);
@@ -372,9 +378,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const currentThinkingMap = (): ModelConfig['thinkingMap'] => {
     const levels = { ...modelThinkingExtraLevels };
     const inputs: Record<CanonicalThinkingLevel, string> = {
+      off: modelThinkingOff,
+      minimal: modelThinkingMinimal,
       low: modelThinkingLow,
       medium: modelThinkingMedium,
       high: modelThinkingHigh,
+      xhigh: modelThinkingXHigh,
+      max: modelThinkingMax,
     };
     for (const level of CANONICAL_THINKING_LEVELS) {
       const value = parseThinkingInput(inputs[level]);
@@ -386,14 +396,26 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     }
     return {
       levels,
-      budgetField: modelThinkingBudgetField.trim() || undefined,
+      mode: modelThinkingMode || undefined,
+      budgetField:
+        modelThinkingMode === 'level' || modelThinkingMode === 'adaptive'
+          ? undefined
+          : modelThinkingBudgetField.trim() || undefined,
+      levelField:
+        modelThinkingMode === 'level' || modelThinkingMode === 'adaptive'
+          ? modelThinkingLevelField.trim() || undefined
+          : undefined,
     };
   };
 
   const thinkingLevelInputs = [
+    ['off', modelThinkingOff, setModelThinkingOff],
+    ['minimal', modelThinkingMinimal, setModelThinkingMinimal],
     ['low', modelThinkingLow, setModelThinkingLow],
     ['medium', modelThinkingMedium, setModelThinkingMedium],
     ['high', modelThinkingHigh, setModelThinkingHigh],
+    ['xhigh', modelThinkingXHigh, setModelThinkingXHigh],
+    ['max', modelThinkingMax, setModelThinkingMax],
   ] as const;
 
   /** Prefill the model form for editing an existing model. */
@@ -412,11 +434,17 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapVision(m.capabilities.vision);
     setCapReasoning(m.capabilities.reasoning);
     setCapTools(m.capabilities.toolCalling);
-    const { low, medium, high, ...extraLevels } = m.thinkingMap.levels;
+    const { off, minimal, low, medium, high, xhigh, max, ...extraLevels } = m.thinkingMap.levels;
+    setModelThinkingOff(thinkingValueToInput(off));
+    setModelThinkingMinimal(thinkingValueToInput(minimal));
     setModelThinkingLow(thinkingValueToInput(low));
     setModelThinkingMedium(thinkingValueToInput(medium));
     setModelThinkingHigh(thinkingValueToInput(high));
+    setModelThinkingXHigh(thinkingValueToInput(xhigh));
+    setModelThinkingMax(thinkingValueToInput(max));
+    setModelThinkingMode(m.thinkingMap.mode || '');
     setModelThinkingBudgetField(m.thinkingMap.budgetField || '');
+    setModelThinkingLevelField(m.thinkingMap.levelField || '');
     setModelThinkingExtraLevels(extraLevels);
     setModelValidation(null);
     setShowAddModelModal(true);
@@ -437,10 +465,16 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapVision(true);
     setCapReasoning(false);
     setCapTools(true);
+    setModelThinkingOff('');
+    setModelThinkingMinimal('');
     setModelThinkingLow('');
     setModelThinkingMedium('');
     setModelThinkingHigh('');
+    setModelThinkingXHigh('');
+    setModelThinkingMax('');
+    setModelThinkingMode('');
     setModelThinkingBudgetField('');
+    setModelThinkingLevelField('');
     setModelThinkingExtraLevels({});
     setModelValidation(null);
   };
@@ -505,7 +539,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       },
       thinking_map: {
         levels: thinkingMap.levels,
+        mode: thinkingMap.mode || null,
         budget_field: thinkingMap.budgetField || null,
+        level_field: thinkingMap.levelField || null,
       },
     };
   };
@@ -1458,9 +1494,23 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         Canonical Thinking Map
                       </label>
                       <p className="text-xs font-body text-[var(--ink)]/70">
-                        Configure low, medium, and high as JSON objects merged into the upstream request,
-                        or as scalar values sent under the optional budget field.
+                        Configure canonical levels as JSON objects, or scalar values sent under the field for the selected reasoning mode.
                       </p>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                        Thinking Mode
+                      </label>
+                      <select
+                        value={modelThinkingMode}
+                        onChange={(e) => setModelThinkingMode(e.target.value as '' | 'manual_budget' | 'level' | 'adaptive')}
+                        className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                      >
+                        <option value="">Legacy / inferred</option>
+                        <option value="manual_budget">Manual budget</option>
+                        <option value="level">Level / effort</option>
+                        <option value="adaptive">Adaptive thinking</option>
+                      </select>
                     </div>
                     <div className="grid grid-cols-1 gap-2">
                       {thinkingLevelInputs.map(([level, value, setter]) => (
@@ -1478,21 +1528,39 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         </div>
                       ))}
                     </div>
-                    <div>
-                      <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
-                        Budget Field (optional)
-                      </label>
-                      <input
-                        type="text"
-                        value={modelThinkingBudgetField}
-                        onChange={(e) => setModelThinkingBudgetField(e.target.value)}
-                        placeholder="e.g. thinking.budget_tokens"
-                        className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
-                      />
-                      <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
-                        Used only when a level mapping is a scalar. Object mappings can use dotted field paths directly.
-                      </p>
-                    </div>
+                    {modelThinkingMode === 'level' || modelThinkingMode === 'adaptive' ? (
+                      <div>
+                        <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                          Level Field
+                        </label>
+                        <input
+                          type="text"
+                          value={modelThinkingLevelField}
+                          onChange={(e) => setModelThinkingLevelField(e.target.value)}
+                          placeholder="e.g. output_config.effort"
+                          className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                        />
+                        <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
+                          Scalar adaptive levels are written here; Anthropic adaptive thinking never emits budget_tokens.
+                        </p>
+                      </div>
+                    ) : (
+                      <div>
+                        <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
+                          Budget Field (optional)
+                        </label>
+                        <input
+                          type="text"
+                          value={modelThinkingBudgetField}
+                          onChange={(e) => setModelThinkingBudgetField(e.target.value)}
+                          placeholder="e.g. thinking.budget_tokens"
+                          className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono focus:outline-none rounded"
+                        />
+                        <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
+                          Used when a legacy/manual level mapping is a scalar. Object mappings can use dotted field paths directly.
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
 

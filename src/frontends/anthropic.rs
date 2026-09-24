@@ -75,24 +75,47 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         }
     }
 
-    let thinking = obj.get("thinking").and_then(|t| {
-        let ttype = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
-        if ttype == "disabled" {
-            return Some(ThinkingLevel::Off);
-        }
-        let budget = t.get("budget_tokens").and_then(|b| b.as_u64()).unwrap_or(0);
-        Some(match budget {
-            0 => ThinkingLevel::Off,
-            b if b <= 2048 => ThinkingLevel::Low,
-            b if b <= 8192 => ThinkingLevel::Medium,
-            _ => ThinkingLevel::High,
+    let effort = obj
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .map(|effort| match effort {
+            "low" => Ok(ThinkingLevel::Low),
+            "medium" => Ok(ThinkingLevel::Medium),
+            "high" => Ok(ThinkingLevel::High),
+            "xhigh" => Ok(ThinkingLevel::XHigh),
+            "max" => Ok(ThinkingLevel::Max),
+            _ => Err(ProxyError::bad_request(format!(
+                "unsupported Anthropic output_config.effort '{effort}'"
+            ))),
         })
-    });
+        .transpose()?;
+
+    let thinking = match obj.get("thinking") {
+        None => None,
+        Some(t) => {
+            let ttype = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            match ttype {
+                "disabled" => Some(ThinkingLevel::Off),
+                "adaptive" => Some(effort.unwrap_or(ThinkingLevel::Default)),
+                "enabled" => {
+                    let budget = t.get("budget_tokens").and_then(|b| b.as_u64()).unwrap_or(0);
+                    Some(match budget {
+                        0 => ThinkingLevel::Off,
+                        b if b <= 2048 => ThinkingLevel::Low,
+                        b if b <= 8192 => ThinkingLevel::Medium,
+                        _ => ThinkingLevel::High,
+                    })
+                }
+                _ => None,
+            }
+        }
+    };
 
     let stream = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut extra = serde_json::Map::new();
-    const KNOWN: [&str; 9] = [
+    const KNOWN: [&str; 10] = [
         "model",
         "messages",
         "system",
@@ -102,6 +125,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         "top_k",
         "max_tokens",
         "stop_sequences",
+        "output_config",
     ];
     for (k, v) in obj {
         if !KNOWN.contains(&k.as_str()) && k != "tools" && k != "tool_choice" && k != "thinking" {
@@ -202,6 +226,29 @@ fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String
                     "messages[{message_index}].content has unsupported nested structure"
                 )),
             }
+        }
+    }
+
+    if let Some(output_config) = obj.get("output_config") {
+        match output_config.as_object() {
+            Some(config) => {
+                let adaptive = obj
+                    .get("thinking")
+                    .and_then(|thinking| thinking.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("adaptive");
+                for key in config.keys() {
+                    if key != "effort" || !adaptive {
+                        issues.push(format!(
+                            "output_config.{key} has no canonical cross-format representation"
+                        ));
+                    }
+                }
+            }
+            None => issues.push(
+                "output_config has unsupported nested structure for cross-format translation"
+                    .to_string(),
+            ),
         }
     }
 

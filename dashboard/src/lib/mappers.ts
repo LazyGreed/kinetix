@@ -112,9 +112,19 @@ export function mapModel(j: any): ModelConfig {
       : {}) as ModelConfig['parameters'],
     thinkingMap: {
       levels: thinkingLevels,
+      mode:
+        thinkingMap.mode === 'manual_budget' ||
+        thinkingMap.mode === 'level' ||
+        thinkingMap.mode === 'adaptive'
+          ? thinkingMap.mode
+          : undefined,
       budgetField:
         typeof thinkingMap.budget_field === 'string' && thinkingMap.budget_field
           ? thinkingMap.budget_field
+          : undefined,
+      levelField:
+        typeof thinkingMap.level_field === 'string' && thinkingMap.level_field
+          ? thinkingMap.level_field
           : undefined,
     },
   };

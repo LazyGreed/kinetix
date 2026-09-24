@@ -317,15 +317,7 @@ pub fn request_to_json(req: &InternalRequest) -> String {
         };
         json!({ "mode": mode, "name": name })
     };
-    let thinking = req.thinking.map(|level| {
-        let level = match level {
-            crate::types::ThinkingLevel::Off => "off",
-            crate::types::ThinkingLevel::Low => "low",
-            crate::types::ThinkingLevel::Medium => "medium",
-            crate::types::ThinkingLevel::High => "high",
-        };
-        json!({ "level": level })
-    });
+    let thinking = req.thinking.map(|level| json!({ "level": level.as_key() }));
     let value = json!({
         "schema": "kinetix.plugin.request",
         "schema_version": 1,

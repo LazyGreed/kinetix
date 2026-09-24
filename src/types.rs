@@ -164,9 +164,37 @@ fn default_policy() -> ParamPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
     Off,
+    Default,
+    Minimal,
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl ThinkingLevel {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Default => "default",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingMode {
+    ManualBudget,
+    Level,
+    Adaptive,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -175,12 +203,37 @@ pub struct ThinkingMap {
     /// Canonical level -> upstream request field value (opaque JSON).
     #[serde(default)]
     pub levels: std::collections::HashMap<String, serde_json::Value>,
-    /// Whether a scalar mapping is sent under an explicit upstream field.
+    /// Optional explicit reasoning mode. Omitted preserves legacy mapping behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ThinkingMode>,
+    /// Scalar field used by legacy/manual-budget mappings.
     #[serde(default)]
     pub budget_field: Option<String>,
+    /// Scalar field used by categorical level/adaptive mappings (for example `output_config.effort`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_field: Option<String>,
 }
 
 impl ThinkingMap {
+    pub fn is_adaptive(&self) -> bool {
+        matches!(self.mode, Some(ThinkingMode::Adaptive))
+    }
+
+    pub fn uses_level_field(&self) -> bool {
+        matches!(
+            self.mode,
+            Some(ThinkingMode::Level | ThinkingMode::Adaptive)
+        )
+    }
+
+    pub fn scalar_field(&self) -> Option<&str> {
+        if self.uses_level_field() {
+            self.level_field.as_deref()
+        } else {
+            self.budget_field.as_deref()
+        }
+    }
+
     pub fn level_is_executable(&self, level: &str) -> bool {
         let Some(value) = self.levels.get(level) else {
             return false;
@@ -193,11 +246,29 @@ impl ThinkingMap {
             serde_json::Value::Bool(_)
             | serde_json::Value::Number(_)
             | serde_json::Value::String(_) => self
-                .budget_field
-                .as_deref()
+                .scalar_field()
                 .map(str::trim)
                 .is_some_and(|field| !field.is_empty()),
         }
+    }
+
+    pub fn anthropic_adaptive_off_is_executable(&self) -> bool {
+        if !self.is_adaptive() {
+            return false;
+        }
+        let Some(serde_json::Value::Object(fields)) = self.levels.get("off") else {
+            return false;
+        };
+        fields
+            .get("thinking.type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == "disabled")
+            || fields
+                .get("thinking")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|thinking| thinking.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value == "disabled")
     }
 
     pub fn validation_errors(&self) -> Vec<String> {
@@ -205,6 +276,10 @@ impl ThinkingMap {
         let budget_field = self.budget_field.as_deref().map(str::trim);
         if budget_field.is_some_and(str::is_empty) {
             errors.push("thinking_map.budget_field must not be empty".to_string());
+        }
+        let level_field = self.level_field.as_deref().map(str::trim);
+        if level_field.is_some_and(str::is_empty) {
+            errors.push("thinking_map.level_field must not be empty".to_string());
         }
 
         for (level, value) in &self.levels {
@@ -233,9 +308,19 @@ impl ThinkingMap {
                 serde_json::Value::Bool(_)
                 | serde_json::Value::Number(_)
                 | serde_json::Value::String(_) => {
-                    if !self.level_is_executable(level) {
+                    if self.is_adaptive() && level == "off" {
+                        errors.push(
+                            "thinking_map adaptive level 'off' must be an object mapping that explicitly disables thinking"
+                                .to_string(),
+                        );
+                    } else if !self.level_is_executable(level) {
+                        let field = if self.uses_level_field() {
+                            "level_field"
+                        } else {
+                            "budget_field"
+                        };
                         errors.push(format!(
-                            "thinking_map level '{level}' uses a scalar mapping but budget_field is not configured"
+                            "thinking_map level '{level}' uses a scalar mapping but {field} is not configured"
                         ));
                     }
                 }
@@ -727,5 +812,51 @@ mod tests {
         .unwrap();
         assert!(scalar_with_field.validation_errors().is_empty());
         assert!(scalar_with_field.level_is_executable("high"));
+
+        let level: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "mode": "level",
+            "levels": {"high": "high"},
+            "level_field": "thinkingConfig.thinkingLevel"
+        }))
+        .unwrap();
+        assert!(level.validation_errors().is_empty());
+        assert!(level.level_is_executable("high"));
+        assert_eq!(level.mode, Some(ThinkingMode::Level));
+
+        let adaptive: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"high": "high"},
+            "level_field": "output_config.effort"
+        }))
+        .unwrap();
+        assert!(adaptive.validation_errors().is_empty());
+        assert!(adaptive.level_is_executable("high"));
+        assert_eq!(adaptive.mode, Some(ThinkingMode::Adaptive));
+
+        let adaptive_scalar_off: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"off": "low"},
+            "level_field": "output_config.effort"
+        }))
+        .unwrap();
+        assert!(adaptive_scalar_off.level_is_executable("off"));
+        assert!(!adaptive_scalar_off.validation_errors().is_empty());
+        assert!(!adaptive_scalar_off.anthropic_adaptive_off_is_executable());
+
+        let adaptive_disabled_off: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"off": {"thinking.type": "disabled"}},
+            "level_field": "output_config.effort"
+        }))
+        .unwrap();
+        assert!(adaptive_disabled_off.anthropic_adaptive_off_is_executable());
+
+        let adaptive_without_level_field: ThinkingMap = serde_json::from_value(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"high": "high"}
+        }))
+        .unwrap();
+        assert!(!adaptive_without_level_field.validation_errors().is_empty());
+        assert!(!adaptive_without_level_field.level_is_executable("high"));
     }
 }

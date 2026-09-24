@@ -162,12 +162,7 @@ impl OpenAiAdapter {
         let Some(level) = req.thinking else {
             return;
         };
-        let key = match level {
-            crate::types::ThinkingLevel::Off => "off",
-            crate::types::ThinkingLevel::Low => "low",
-            crate::types::ThinkingLevel::Medium => "medium",
-            crate::types::ThinkingLevel::High => "high",
-        };
+        let key = level.as_key();
         let mapping = ctx.model.thinking();
         let Some(value) = mapping.levels.get(key) else {
             return;
@@ -177,7 +172,7 @@ impl OpenAiAdapter {
             for (path, value) in object {
                 insert_dotted(body, path, value.clone());
             }
-        } else if let Some(field) = mapping.budget_field.as_deref() {
+        } else if let Some(field) = mapping.scalar_field() {
             insert_dotted(body, field, value.clone());
         }
     }

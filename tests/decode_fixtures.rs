@@ -155,12 +155,28 @@ fn openai_reasoning_effort_maps_to_thinking_level() {
         Some(ThinkingLevel::High)
     );
     assert_eq!(
+        openai(r#"{"model":"m","reasoning_effort":"minimal","messages":[]}"#).thinking,
+        Some(ThinkingLevel::Minimal)
+    );
+    assert_eq!(
         openai(r#"{"model":"m","reasoning_effort":"low","messages":[]}"#).thinking,
         Some(ThinkingLevel::Low)
     );
     assert_eq!(
+        openai(r#"{"model":"m","reasoning_effort":"xhigh","messages":[]}"#).thinking,
+        Some(ThinkingLevel::XHigh)
+    );
+    assert_eq!(
+        openai(r#"{"model":"m","reasoning_effort":"max","messages":[]}"#).thinking,
+        Some(ThinkingLevel::Max)
+    );
+    assert_eq!(
         openai(r#"{"model":"m","reasoning_effort":"none","messages":[]}"#).thinking,
         Some(ThinkingLevel::Off)
+    );
+    assert_eq!(
+        responses(r#"{"model":"m","input":"hi","reasoning":{"effort":"max"}}"#).thinking,
+        Some(ThinkingLevel::Max)
     );
     // Absent reasoning control means no thinking request (nothing invented).
     assert_eq!(openai(r#"{"model":"m","messages":[]}"#).thinking, None);
@@ -280,6 +296,59 @@ fn anthropic_plain_chat_tools_and_thinking_round_trip() {
         other => panic!("expected thinking part, got {other:?}"),
     }
     assert_eq!(req.tools[0].name, "get_weather");
+}
+
+#[test]
+fn anthropic_output_format_is_marked_nonportable_for_translation() {
+    let req = anthropic(
+        r#"{
+          "model":"claude-x",
+          "messages":[{"role":"user","content":"hi"}],
+          "output_config":{
+            "format":{
+              "type":"json_schema",
+              "schema":{"type":"object","properties":{"answer":{"type":"string"}}}
+            }
+          }
+        }"#,
+    );
+
+    let issue = frontends::translation_unsupported(&req.extra)
+        .expect("structured output format must fail closed on translation");
+    assert!(issue.contains("output_config.format"));
+}
+
+#[test]
+fn anthropic_adaptive_effort_maps_to_extended_thinking_level() {
+    let max = anthropic(
+        r#"{
+          "model":"claude-x",
+          "messages":[{"role":"user","content":"hi"}],
+          "thinking":{"type":"adaptive"},
+          "output_config":{"effort":"max"}
+        }"#,
+    );
+    assert_eq!(max.thinking, Some(ThinkingLevel::Max));
+    assert!(max.extra.get("output_config").is_none());
+
+    let defaulted = anthropic(
+        r#"{
+          "model":"claude-x",
+          "messages":[{"role":"user","content":"hi"}],
+          "thinking":{"type":"adaptive"}
+        }"#,
+    );
+    assert_eq!(defaulted.thinking, Some(ThinkingLevel::Default));
+
+    let effort_only = anthropic(
+        r#"{
+          "model":"claude-x",
+          "messages":[{"role":"user","content":"hi"}],
+          "output_config":{"effort":"medium"}
+        }"#,
+    );
+    assert_eq!(effort_only.thinking, None);
+    assert!(frontends::translation_unsupported(&effort_only.extra).is_some());
 }
 
 #[test]

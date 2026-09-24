@@ -154,19 +154,14 @@ impl GeminiAdapter {
         // Thinking mapping (FR-10.7): canonical level -> upstream fields.
         if let Some(level) = req.thinking {
             let tmap = model.thinking();
-            let key = match level {
-                crate::types::ThinkingLevel::Off => "off",
-                crate::types::ThinkingLevel::Low => "low",
-                crate::types::ThinkingLevel::Medium => "medium",
-                crate::types::ThinkingLevel::High => "high",
-            };
+            let key = level.as_key();
             if let Some(v) = tmap.levels.get(key) {
                 // Value may be a full object to merge, or a scalar under budget_field.
                 if let Some(obj) = v.as_object() {
                     for (k, val) in obj {
                         insert_dotted(&mut cfg, k, val.clone());
                     }
-                } else if let Some(field) = &tmap.budget_field {
+                } else if let Some(field) = tmap.scalar_field() {
                     insert_dotted(&mut cfg, field, v.clone());
                 }
             }
@@ -1030,7 +1025,12 @@ mod schema_tests {
                 "top_k": { "supported": true, "max": 40.0, "policy": "clamp" }
             })
             .to_string(),
-            thinking_map: "{}".into(),
+            thinking_map: json!({
+                "mode": "level",
+                "levels": {"high": "high"},
+                "level_field": "thinkingConfig.thinkingLevel"
+            })
+            .to_string(),
             extra_request: "{}".into(),
             discovery: "{}".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -1056,7 +1056,7 @@ mod schema_tests {
             },
             stream: true,
             include_usage: false,
-            thinking: None,
+            thinking: Some(crate::types::ThinkingLevel::High),
             extra: Default::default(),
             raw_body: None,
         };
@@ -1064,6 +1064,7 @@ mod schema_tests {
         let cfg = GeminiAdapter::build_generation_config(&ctx, &req);
         assert_eq!(cfg["topP"], 0.8);
         assert_eq!(cfg["topK"], 40.0);
+        assert_eq!(cfg["thinkingConfig"]["thinkingLevel"], "high");
         assert!(cfg.get("top_p").is_none());
         assert!(cfg.get("top_k").is_none());
     }

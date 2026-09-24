@@ -129,6 +129,64 @@ impl AnthropicAdapter {
         Some(Value::Array(tools))
     }
 
+    fn apply_thinking_map(
+        body: &mut serde_json::Map<String, Value>,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+    ) {
+        let Some(level) = req.thinking else {
+            return;
+        };
+        let tmap = ctx.model.thinking();
+        let key = level.as_key();
+        if tmap.is_adaptive() {
+            if matches!(level, crate::types::ThinkingLevel::Off) {
+                if let Some(v) = tmap.levels.get(key) {
+                    if let Some(fields) = v.as_object() {
+                        for (field, value) in fields {
+                            insert_dotted(body, field, value.clone());
+                        }
+                    } else if let Some(field) = tmap.scalar_field() {
+                        insert_dotted(body, field, v.clone());
+                    }
+                }
+                if let Some(thinking) = body.get_mut("thinking").and_then(Value::as_object_mut) {
+                    thinking.remove("budget_tokens");
+                }
+                return;
+            }
+
+            if !matches!(level, crate::types::ThinkingLevel::Default) {
+                if let Some(v) = tmap.levels.get(key) {
+                    if let Some(fields) = v.as_object() {
+                        for (field, value) in fields {
+                            insert_dotted(body, field, value.clone());
+                        }
+                    } else if let Some(field) = tmap.scalar_field() {
+                        insert_dotted(body, field, v.clone());
+                    }
+                }
+            }
+            insert_dotted(body, "thinking.type", json!("adaptive"));
+            if let Some(thinking) = body.get_mut("thinking").and_then(Value::as_object_mut) {
+                thinking.remove("budget_tokens");
+            }
+            return;
+        }
+
+        let Some(v) = tmap.levels.get(key) else {
+            return;
+        };
+        if v.is_object() {
+            body.insert("thinking".to_string(), v.clone());
+        } else if let Some(field) = tmap.scalar_field() {
+            insert_dotted(body, field, v.clone());
+            if field == "thinking.budget_tokens" {
+                insert_dotted(body, "thinking.type", json!("enabled"));
+            }
+        }
+    }
+
     fn build_tool_choice(req: &InternalRequest) -> Option<Value> {
         match req.tool_choice {
             Some(ToolChoice::None) => Some(json!({ "type": "none" })),
@@ -367,25 +425,7 @@ impl Adapter for AnthropicAdapter {
         }
 
         // Thinking map.
-        if let Some(level) = req.thinking {
-            let tmap = ctx.model.thinking();
-            let key = match level {
-                crate::types::ThinkingLevel::Off => "off",
-                crate::types::ThinkingLevel::Low => "low",
-                crate::types::ThinkingLevel::Medium => "medium",
-                crate::types::ThinkingLevel::High => "high",
-            };
-            if let Some(v) = tmap.levels.get(key) {
-                if v.is_object() {
-                    body.insert("thinking".to_string(), v.clone());
-                } else if let Some(field) = tmap.budget_field.as_deref() {
-                    insert_dotted(&mut body, field, v.clone());
-                    if field == "thinking.budget_tokens" {
-                        insert_dotted(&mut body, "thinking.type", json!("enabled"));
-                    }
-                }
-            }
-        }
+        Self::apply_thinking_map(&mut body, ctx, req);
 
         let extra = ctx.model.extra_request_value();
         if let Some(obj) = extra.as_object() {
@@ -395,6 +435,37 @@ impl Adapter for AnthropicAdapter {
         }
 
         Ok(Value::Object(body))
+    }
+
+    fn normalize_passthrough_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+        body: &mut Value,
+    ) -> Result<(), UpstreamFailure> {
+        let tmap = ctx.model.thinking();
+        if !tmap.is_adaptive() {
+            return Ok(());
+        }
+        if matches!(req.thinking, Some(crate::types::ThinkingLevel::Off))
+            && !tmap.anthropic_adaptive_off_is_executable()
+        {
+            return Err(UpstreamFailure {
+                kind: FailureKind::BadRequest,
+                status: None,
+                retry_after_secs: None,
+                message: format!(
+                    "thinking level 'off' has no executable mapping for model '{}'",
+                    ctx.model.display_name
+                ),
+                quota_reset_at: None,
+            });
+        }
+        let Some(body) = body.as_object_mut() else {
+            return Ok(());
+        };
+        Self::apply_thinking_map(body, ctx, req);
+        Ok(())
     }
 
     fn classify_error(
@@ -805,6 +876,82 @@ mod tests {
                 "budget_tokens": 4096
             })
         );
+    }
+
+    #[test]
+    fn adaptive_thinking_mapping_uses_effort_without_budget() {
+        let p = provider();
+        let mut m = model();
+        m.thinking_map = serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"max": "max"},
+            "level_field": "output_config.effort"
+        })
+        .to_string();
+        let mut req = base_request();
+        req.thinking = Some(crate::types::ThinkingLevel::Max);
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn adaptive_thinking_default_preserves_omitted_effort() {
+        let p = provider();
+        let mut m = model();
+        m.thinking_map = serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"high": "high"},
+            "level_field": "output_config.effort"
+        })
+        .to_string();
+        let mut req = base_request();
+        req.thinking = Some(crate::types::ThinkingLevel::Default);
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn adaptive_thinking_off_stays_disabled_without_effort() {
+        let p = provider();
+        let mut m = model();
+        m.thinking_map = serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"off": {"thinking.type": "disabled"}},
+            "level_field": "output_config.effort"
+        })
+        .to_string();
+        let mut req = base_request();
+        req.thinking = Some(crate::types::ThinkingLevel::Off);
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]

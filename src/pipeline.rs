@@ -923,7 +923,7 @@ pub async fn run(
                     format!("request uses a feature that cannot be translated: {msg}"),
                 ));
             }
-            if let Err(error) = check_thinking_translation(&target.model, &target_req) {
+            if let Err(error) = check_thinking_translation(target, &target_req) {
                 trace.finish("rejected");
                 state
                     .live
@@ -1557,6 +1557,31 @@ fn default_quota_window(account: &db::AccountRow) -> i64 {
     }
 }
 
+fn build_upstream_body(
+    adapter: &dyn Adapter,
+    ctx: &UpstreamContext<'_>,
+    req: &InternalRequest,
+    use_passthrough: bool,
+) -> Result<Value, UpstreamFailure> {
+    if !use_passthrough {
+        return adapter.build_body(ctx, req);
+    }
+
+    let raw = req.raw_body.as_deref().unwrap_or("{}");
+    let Some(rewritten) = passthrough::rewrite_model(
+        raw,
+        &ctx.model.upstream_id,
+        !req.stream,
+        true,
+        ctx.provider.wire(),
+    ) else {
+        return adapter.build_body(ctx, req);
+    };
+    let mut body = serde_json::from_str(&rewritten).unwrap_or(Value::Null);
+    adapter.normalize_passthrough_body(ctx, req, &mut body)?;
+    Ok(body)
+}
+
 /// Send the upstream request. Returns the raw response or a classified failure.
 ///
 /// The shared outbound transport resolves and pins the exact destination used
@@ -1585,23 +1610,9 @@ async fn send_upstream(
         quota_reset_at: None,
     })?;
 
-    // Passthrough forwards the client's raw body (model field rewritten);
-    // translation builds a fresh body from the internal model.
-    let body: Value = if use_passthrough {
-        let raw = req.raw_body.as_deref().unwrap_or("{}");
-        match passthrough::rewrite_model(
-            raw,
-            &ctx.model.upstream_id,
-            !req.stream,
-            true,
-            ctx.provider.wire(),
-        ) {
-            Some(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
-            None => adapter.build_body(ctx, req)?,
-        }
-    } else {
-        adapter.build_body(ctx, req)?
-    };
+    // Passthrough preserves the client's raw body except for mandatory model/
+    // accounting rewrites and adapter-owned model compatibility normalization.
+    let body = build_upstream_body(adapter.as_ref(), ctx, req, use_passthrough)?;
 
     crate::outbound::send_provider_request(
         &state.outbound_clients,
@@ -2384,31 +2395,41 @@ fn apply_continuity(
 /// Check the admin's parameter policy; reject when a value is unsupported and
 /// the policy is `reject` (FR-10.6).
 fn thinking_level_key(level: crate::types::ThinkingLevel) -> &'static str {
-    match level {
-        crate::types::ThinkingLevel::Off => "off",
-        crate::types::ThinkingLevel::Low => "low",
-        crate::types::ThinkingLevel::Medium => "medium",
-        crate::types::ThinkingLevel::High => "high",
-    }
+    level.as_key()
 }
 
 fn check_thinking_translation(
-    model: &db::ModelRow,
+    target: &ResolvedTarget,
     req: &InternalRequest,
 ) -> Result<(), ProxyError> {
     let Some(level) = req.thinking else {
         return Ok(());
     };
-    if level == crate::types::ThinkingLevel::Off {
+    let key = thinking_level_key(level);
+
+    // Adaptive requests with omitted effort preserve the target model's native
+    // default. Every explicit level, including "off", requires an executable
+    // per-model mapping.
+    if level == crate::types::ThinkingLevel::Default && target.model.thinking().is_adaptive() {
         return Ok(());
     }
-    let key = thinking_level_key(level);
-    if model.thinking().level_is_executable(key) {
+    if level == crate::types::ThinkingLevel::Off
+        && target.provider.wire() == crate::types::WireFormat::Anthropic
+        && target.model.thinking().is_adaptive()
+    {
+        if target
+            .model
+            .thinking()
+            .anthropic_adaptive_off_is_executable()
+        {
+            return Ok(());
+        }
+    } else if target.model.thinking().level_is_executable(key) {
         return Ok(());
     }
     Err(ProxyError::unsupported(format!(
         "thinking level '{key}' has no executable mapping for model '{}'",
-        model.display_name
+        target.model.display_name
     )))
 }
 
@@ -3971,6 +3992,228 @@ mod route_policy_tests {
     }
 
     #[test]
+    fn adaptive_anthropic_passthrough_normalizes_legacy_manual_thinking() {
+        let mut p = provider(serde_json::json!({}));
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"high": "high"},
+            "level_field": "output_config.effort"
+        }));
+        let raw = serde_json::json!({
+            "model": "sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "budget_tokens": 32000},
+            "vendor_extension": {"keep": true}
+        })
+        .to_string();
+        let mut req =
+            crate::frontends::anthropic::decode_request(serde_json::from_str(&raw).unwrap())
+                .unwrap();
+        req.raw_body = Some(raw);
+        assert_eq!(req.thinking, Some(crate::types::ThinkingLevel::High));
+
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: Some("acc_test"),
+            credential: "sk-ant-api03-test".into(),
+        };
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+
+        let body = build_upstream_body(&adapter, &ctx, &req, true).unwrap();
+
+        assert_eq!(body["model"], "upstream");
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["vendor_extension"]["keep"], true);
+    }
+
+    #[test]
+    fn adaptive_anthropic_passthrough_preserves_native_adaptive_max_effort() {
+        let mut p = provider(serde_json::json!({}));
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"max": "max"},
+            "level_field": "output_config.effort"
+        }));
+        let raw = serde_json::json!({
+            "model": "sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        })
+        .to_string();
+        let mut req =
+            crate::frontends::anthropic::decode_request(serde_json::from_str(&raw).unwrap())
+                .unwrap();
+        req.raw_body = Some(raw);
+        assert_eq!(req.thinking, Some(crate::types::ThinkingLevel::Max));
+
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: Some("acc_test"),
+            credential: "sk-ant-api03-test".into(),
+        };
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+
+        let body = build_upstream_body(&adapter, &ctx, &req, true).unwrap();
+
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn adaptive_anthropic_passthrough_preserves_omitted_effort() {
+        let mut p = provider(serde_json::json!({}));
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"high": "high"},
+            "level_field": "output_config.effort"
+        }));
+        let raw = serde_json::json!({
+            "model": "opus",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "adaptive"}
+        })
+        .to_string();
+        let mut req =
+            crate::frontends::anthropic::decode_request(serde_json::from_str(&raw).unwrap())
+                .unwrap();
+        req.raw_body = Some(raw);
+        assert_eq!(req.thinking, Some(crate::types::ThinkingLevel::Default));
+
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: Some("acc_test"),
+            credential: "sk-ant-api03-test".into(),
+        };
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+
+        let body = build_upstream_body(&adapter, &ctx, &req, true).unwrap();
+
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn adaptive_anthropic_passthrough_normalizes_without_matching_level() {
+        let mut p = provider(serde_json::json!({}));
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {},
+            "level_field": "output_config.effort"
+        }));
+        let raw = serde_json::json!({
+            "model": "sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "budget_tokens": 32000}
+        })
+        .to_string();
+        let mut req =
+            crate::frontends::anthropic::decode_request(serde_json::from_str(&raw).unwrap())
+                .unwrap();
+        req.raw_body = Some(raw);
+
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: Some("acc_test"),
+            credential: "sk-ant-api03-test".into(),
+        };
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+
+        let body = build_upstream_body(&adapter, &ctx, &req, true).unwrap();
+
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn adaptive_anthropic_passthrough_rejects_off_without_model_mapping() {
+        let mut p = provider(serde_json::json!({}));
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"off": "low"},
+            "level_field": "output_config.effort"
+        }));
+        let raw = serde_json::json!({
+            "model": "opus",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "disabled"}
+        })
+        .to_string();
+        let mut req =
+            crate::frontends::anthropic::decode_request(serde_json::from_str(&raw).unwrap())
+                .unwrap();
+        req.raw_body = Some(raw);
+
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: Some("acc_test"),
+            credential: "sk-ant-api03-test".into(),
+        };
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+
+        let failure = build_upstream_body(&adapter, &ctx, &req, true).unwrap_err();
+
+        assert_eq!(failure.kind, FailureKind::BadRequest);
+        assert!(failure.message.contains("thinking level 'off'"));
+    }
+
+    #[test]
+    fn adaptive_anthropic_passthrough_preserves_explicit_thinking_off() {
+        let mut p = provider(serde_json::json!({}));
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"off": {"thinking.type": "disabled"}},
+            "level_field": "output_config.effort"
+        }));
+        let raw = serde_json::json!({
+            "model": "sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "disabled", "budget_tokens": 32000}
+        })
+        .to_string();
+        let mut req =
+            crate::frontends::anthropic::decode_request(serde_json::from_str(&raw).unwrap())
+                .unwrap();
+        req.raw_body = Some(raw);
+        assert_eq!(req.thinking, Some(crate::types::ThinkingLevel::Off));
+
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: Some("acc_test"),
+            credential: "sk-ant-api03-test".into(),
+        };
+        let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
+
+        let body = build_upstream_body(&adapter, &ctx, &req, true).unwrap();
+
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
     fn anthropic_error_passthrough_is_sanitized_and_keeps_retry_metadata() {
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
         let failure = UpstreamFailure {
@@ -4174,44 +4417,76 @@ mod route_policy_tests {
     #[test]
     fn translated_thinking_requires_an_explicit_model_mapping() {
         let mut req = request();
-        req.thinking = Some(crate::types::ThinkingLevel::High);
-        assert!(check_thinking_translation(&model(serde_json::json!({})), &req).is_err());
+        let mut target = target();
 
-        let mapped = model(serde_json::json!({
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+        assert!(check_thinking_translation(&target, &req).is_err());
+
+        target.model = model(serde_json::json!({
             "levels": {
+                "minimal": {"reasoning_effort": "minimal"},
                 "low": {"reasoning_effort": "low"},
                 "medium": {"reasoning_effort": "medium"},
-                "high": {"reasoning_effort": "high"}
+                "high": {"reasoning_effort": "high"},
+                "xhigh": {"reasoning_effort": "xhigh"},
+                "max": {"reasoning_effort": "max"}
             }
         }));
         for level in [
+            crate::types::ThinkingLevel::Minimal,
             crate::types::ThinkingLevel::Low,
             crate::types::ThinkingLevel::Medium,
             crate::types::ThinkingLevel::High,
+            crate::types::ThinkingLevel::XHigh,
+            crate::types::ThinkingLevel::Max,
         ] {
             req.thinking = Some(level);
-            assert!(check_thinking_translation(&mapped, &req).is_ok());
+            assert!(check_thinking_translation(&target, &req).is_ok());
         }
 
         req.thinking = Some(crate::types::ThinkingLevel::High);
-        let null_mapping = model(serde_json::json!({
+        target.model = model(serde_json::json!({
             "levels": {"high": null}
         }));
-        assert!(check_thinking_translation(&null_mapping, &req).is_err());
+        assert!(check_thinking_translation(&target, &req).is_err());
 
-        let scalar_without_field = model(serde_json::json!({
+        target.model = model(serde_json::json!({
             "levels": {"high": 4096}
         }));
-        assert!(check_thinking_translation(&scalar_without_field, &req).is_err());
+        assert!(check_thinking_translation(&target, &req).is_err());
 
-        let scalar_with_field = model(serde_json::json!({
+        target.model = model(serde_json::json!({
             "levels": {"high": 4096},
             "budget_field": "thinking.budget_tokens"
         }));
-        assert!(check_thinking_translation(&scalar_with_field, &req).is_ok());
+        assert!(check_thinking_translation(&target, &req).is_ok());
+
+        req.thinking = Some(crate::types::ThinkingLevel::Default);
+        target.model = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {},
+            "level_field": "output_config.effort"
+        }));
+        target.provider.wire_format = "anthropic".into();
+        assert!(check_thinking_translation(&target, &req).is_ok());
 
         req.thinking = Some(crate::types::ThinkingLevel::Off);
-        assert!(check_thinking_translation(&model(serde_json::json!({})), &req).is_ok());
+        target.model = model(serde_json::json!({}));
+        assert!(check_thinking_translation(&target, &req).is_err());
+
+        target.model = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"off": "low"},
+            "level_field": "output_config.effort"
+        }));
+        assert!(check_thinking_translation(&target, &req).is_err());
+
+        target.model = model(serde_json::json!({
+            "mode": "adaptive",
+            "levels": {"off": {"thinking.type": "disabled"}},
+            "level_field": "output_config.effort"
+        }));
+        assert!(check_thinking_translation(&target, &req).is_ok());
     }
 
     #[test]

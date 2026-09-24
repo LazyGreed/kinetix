@@ -62,6 +62,17 @@ pub trait Adapter: Send + Sync {
         req: &InternalRequest,
     ) -> Result<serde_json::Value, UpstreamFailure>;
 
+    /// Apply model-aware policy to a same-format passthrough body before dispatch.
+    /// Most adapters preserve passthrough content unchanged.
+    fn normalize_passthrough_body(
+        &self,
+        _ctx: &UpstreamContext<'_>,
+        _req: &InternalRequest,
+        _body: &mut serde_json::Value,
+    ) -> Result<(), UpstreamFailure> {
+        Ok(())
+    }
+
     /// Parse an upstream non-2xx response into a classified failure.
     fn classify_error(
         &self,
