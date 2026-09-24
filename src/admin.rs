@@ -5881,6 +5881,35 @@ mod reasoning_discovery_control_plane_tests {
     }
 
     #[test]
+    fn plugin_descriptive_reasoning_survives_discovery() {
+        for (reasoning, expected_mode) in [
+            (
+                json!({"supported": true}),
+                None,
+            ),
+            (
+                json!({"supported": true, "mode": "toggle", "can_disable": true}),
+                Some(crate::adapters::ReasoningCapabilityMode::Toggle),
+            ),
+        ] {
+            let observation = discovered_observation(
+                model("reasoner"),
+                Some(json!({"id": "reasoner", "owned_by": "example"})),
+                Some(json!({
+                    "schema_version": 1,
+                    "reasoning": reasoning
+                })),
+                WireFormat::Plugin,
+            );
+
+            let reasoning = observation.reasoning.unwrap();
+            assert_eq!(reasoning.mode, expected_mode);
+            assert!(reasoning.levels.is_empty());
+            assert!(observation.thinking_map.is_none());
+        }
+    }
+
+    #[test]
     fn raw_metadata_matches_openai_and_gemini_model_ids() {
         let openai = json!({
             "data": [
