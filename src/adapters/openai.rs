@@ -713,7 +713,11 @@ mod tests {
             "supportedThinkingEfforts": ["none", "low", "extra_high"]
         });
         let capability = crate::adapters::normalize_reasoning_capability(&metadata).unwrap();
-        let map = crate::adapters::thinking_map_for_reasoning(&capability).unwrap();
+        let map = crate::adapters::thinking_map_for_reasoning_with_wire(
+            &capability,
+            crate::types::WireFormat::Openai,
+        )
+        .unwrap();
 
         assert_eq!(map.levels.get("off"), Some(&serde_json::json!("none")));
         assert_eq!(
