@@ -6120,11 +6120,12 @@ mod reasoning_discovery_control_plane_tests {
         db::migrate(&pool).await.unwrap();
 
         let crypto = Arc::new(crate::crypto::Crypto::new(&config.master_key));
+        let base_url = format!("http://{address}");
         let provider_id = db::insert_provider(
             &pool,
             &db::NewProvider {
                 name: "test",
-                base_url: &format!("http://{address}"),
+                base_url: &base_url,
                 wire_format: WireFormat::Openai,
                 auth_scheme: AuthScheme::Bearer,
                 custom_header_name: None,
