@@ -1074,12 +1074,8 @@ fn discovered_observation(
     // capabilities_json is a versioned normalized contract. Only v1 is
     // understood here; unsupported, missing, or malformed versions stay
     // opaque instead of being interpreted with v1 semantics.
-    let fallback_metadata = fallback_metadata.filter(|metadata| {
-        metadata
-            .get("schema_version")
-            .and_then(Value::as_u64)
-            == Some(1)
-    });
+    let fallback_metadata = fallback_metadata
+        .filter(|metadata| metadata.get("schema_version").and_then(Value::as_u64) == Some(1));
     let reasoning = match provider_metadata.as_ref() {
         Some(metadata) if reasoning_metadata_declared(metadata) => {
             normalize_reasoning_capability(metadata)
