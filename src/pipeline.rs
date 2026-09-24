@@ -923,7 +923,9 @@ pub async fn run(
                     format!("request uses a feature that cannot be translated: {msg}"),
                 ));
             }
-            if let Err(error) = check_thinking_translation(target, &target_req) {
+            if let Err(error) =
+                check_thinking_translation_for_adapter(adapter.as_ref(), target, &target_req)
+            {
                 trace.finish("rejected");
                 state
                     .live
@@ -2396,6 +2398,17 @@ fn apply_continuity(
 /// the policy is `reject` (FR-10.6).
 fn thinking_level_key(level: crate::types::ThinkingLevel) -> &'static str {
     level.as_key()
+}
+
+fn check_thinking_translation_for_adapter(
+    adapter: &dyn Adapter,
+    target: &ResolvedTarget,
+    req: &InternalRequest,
+) -> Result<(), ProxyError> {
+    if req.thinking.is_some() && adapter.handles_thinking_translation() {
+        return Ok(());
+    }
+    check_thinking_translation(target, req)
 }
 
 fn check_thinking_translation(
@@ -3991,6 +4004,77 @@ mod route_policy_tests {
         }
     }
 
+    struct PluginThinkingTestAdapter;
+
+    #[async_trait::async_trait]
+    impl Adapter for PluginThinkingTestAdapter {
+        fn wire_format(&self) -> &'static str {
+            "test-plugin"
+        }
+
+        fn handles_thinking_translation(&self) -> bool {
+            true
+        }
+
+        fn build_url(&self, _ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
+            Ok("https://api.example.com/v1/chat".into())
+        }
+
+        fn apply_auth(
+            &self,
+            _ctx: &UpstreamContext<'_>,
+            req: reqwest::RequestBuilder,
+        ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
+            Ok(req)
+        }
+
+        fn build_body(
+            &self,
+            _ctx: &UpstreamContext<'_>,
+            req: &InternalRequest,
+        ) -> Result<Value, UpstreamFailure> {
+            let request: Value =
+                serde_json::from_str(&crate::plugins::adapter::request_to_json(req)).unwrap();
+            let level = request
+                .pointer("/thinking/level")
+                .and_then(Value::as_str)
+                .ok_or_else(|| UpstreamFailure {
+                    kind: FailureKind::BadRequest,
+                    status: None,
+                    retry_after_secs: None,
+                    message: "missing canonical thinking level".into(),
+                    quota_reset_at: None,
+                })?;
+            Ok(serde_json::json!({"reasoning_effort": level}))
+        }
+
+        fn classify_error(
+            &self,
+            status: u16,
+            _body: &str,
+            _headers: &reqwest::header::HeaderMap,
+        ) -> UpstreamFailure {
+            UpstreamFailure {
+                kind: FailureKind::BadRequest,
+                status: Some(status),
+                retry_after_secs: None,
+                message: "test plugin error".into(),
+                quota_reset_at: None,
+            }
+        }
+
+        fn parse_stream_chunk(&self, _data: &str) -> Result<Vec<StreamEvent>, UpstreamFailure> {
+            Ok(Vec::new())
+        }
+
+        fn parse_full_response(
+            &self,
+            _body: &Value,
+        ) -> Result<Vec<StreamEvent>, UpstreamFailure> {
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn adaptive_anthropic_passthrough_normalizes_legacy_manual_thinking() {
         let mut p = provider(serde_json::json!({}));
@@ -4412,6 +4496,54 @@ mod route_policy_tests {
         route.portability_policy = "reject".into();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         assert!(apply_continuity(&mut req, &route, &target(), &mut trace).is_err());
+    }
+
+    #[test]
+    fn discovered_plugin_reasoning_reaches_adapter_translation_without_core_map() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["low", "high"],
+                "default": "high",
+                "can_disable": false
+            }
+        });
+        let capability =
+            crate::adapters::normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
+        assert!(crate::adapters::thinking_map_for_reasoning_with_wire(
+            &capability,
+            crate::types::WireFormat::Plugin,
+        )
+        .is_none());
+
+        let adapter = PluginThinkingTestAdapter;
+        let mut target = target();
+        target.provider.wire_format = "plugin".into();
+        target.provider.wire_plugin = "plugin:test/provider-adapter".into();
+        target.model.discovery = serde_json::json!({
+            "reasoning_capability": capability
+        })
+        .to_string();
+
+        let mut req = request();
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+
+        assert!(check_thinking_translation(&target, &req).is_err());
+        assert!(
+            check_thinking_translation_for_adapter(&adapter, &target, &req).is_ok(),
+            "plugin-owned thinking must reach the adapter even without a core ThinkingMap"
+        );
+
+        let ctx = UpstreamContext {
+            provider: &target.provider,
+            model: &target.model,
+            account_id: Some(target.account.id.as_str()),
+            credential: "test".into(),
+        };
+        let body = build_upstream_body(&adapter, &ctx, &req, false).unwrap();
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]

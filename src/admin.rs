@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 
 use crate::adapters::{
     normalize_plugin_reasoning_capability_v1, normalize_reasoning_capability,
-    reasoning_metadata_declared, thinking_map_for_reasoning_with_wire, UpstreamContext,
+    plugin_reasoning_support_v1, reasoning_metadata_declared, thinking_map_for_reasoning_with_wire,
+    UpstreamContext,
 };
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
@@ -1053,6 +1054,7 @@ pub async fn delete_provider(
 #[derive(Debug, Clone)]
 struct DiscoveredObservation {
     model: crate::adapters::DiscoveredModel,
+    reasoning_support: Option<bool>,
     reasoning: Option<crate::adapters::ReasoningCapability>,
     thinking_map: Option<ThinkingMap>,
 }
@@ -1063,6 +1065,22 @@ fn reasoning_wire_context(provider: &db::ProviderRow) -> WireFormat {
     } else {
         provider.wire()
     }
+}
+
+fn explicit_reasoning_support(metadata: &Value) -> Option<bool> {
+    metadata
+        .get("reasoning")
+        .and_then(|reasoning| {
+            reasoning
+                .as_bool()
+                .or_else(|| reasoning.get("supported").and_then(Value::as_bool))
+        })
+        .or_else(|| {
+            metadata
+                .get("reasoning_capability")
+                .and_then(|reasoning| reasoning.get("supported"))
+                .and_then(Value::as_bool)
+        })
 }
 
 fn discovered_observation(
@@ -1077,17 +1095,26 @@ fn discovered_observation(
     let fallback_reasoning = fallback_metadata
         .as_ref()
         .and_then(normalize_plugin_reasoning_capability_v1);
-    let reasoning = match provider_metadata.as_ref() {
+    let fallback_support = fallback_metadata
+        .as_ref()
+        .and_then(plugin_reasoning_support_v1);
+    let (reasoning, reasoning_support) = match provider_metadata.as_ref() {
         Some(metadata) if reasoning_metadata_declared(metadata) => {
-            normalize_reasoning_capability(metadata)
+            let reasoning = normalize_reasoning_capability(metadata);
+            let support = reasoning
+                .as_ref()
+                .map(|_| true)
+                .or_else(|| explicit_reasoning_support(metadata));
+            (reasoning, support)
         }
-        _ => fallback_reasoning,
+        _ => (fallback_reasoning, fallback_support),
     };
     let thinking_map = reasoning
         .as_ref()
         .and_then(|capability| thinking_map_for_reasoning_with_wire(capability, wire));
     DiscoveredObservation {
         model,
+        reasoning_support,
         reasoning,
         thinking_map,
     }
@@ -1267,7 +1294,7 @@ pub async fn discover_models(
                     "max_output_tokens": m.max_output_tokens,
                     "display_name": m.display_name,
                     "capabilities": {
-                        "reasoning": observation.reasoning.is_some(),
+                        "reasoning": observation.reasoning_support,
                     },
                     "reasoning_capability": &observation.reasoning,
                     "thinking_map": &observation.thinking_map,
@@ -1282,7 +1309,7 @@ pub async fn discover_models(
             "context_window": m.context_window,
             "max_output_tokens": m.max_output_tokens,
             "capabilities": {
-                "reasoning": observation.reasoning.is_some(),
+                "reasoning": observation.reasoning_support,
             },
             "reasoning_capability": &observation.reasoning,
             "thinking_map": &observation.thinking_map,
@@ -5945,6 +5972,55 @@ mod reasoning_discovery_control_plane_tests {
             assert!(reasoning.levels.is_empty());
             assert!(observation.thinking_map.is_none());
         }
+    }
+
+    #[test]
+    fn reasoning_support_preserves_unknown_and_explicit_unsupported() {
+        let unknown = discovered_observation(
+            model("unknown"),
+            Some(json!({"id": "unknown"})),
+            Some(json!({"schema_version": 1})),
+            WireFormat::Plugin,
+        );
+        assert_eq!(unknown.reasoning_support, None);
+        assert!(unknown.reasoning.is_none());
+
+        let unsupported = discovered_observation(
+            model("unsupported"),
+            Some(json!({"id": "unsupported"})),
+            Some(json!({
+                "schema_version": 1,
+                "reasoning": {
+                    "supported": false
+                }
+            })),
+            WireFormat::Plugin,
+        );
+        assert_eq!(unsupported.reasoning_support, Some(false));
+        assert!(unsupported.reasoning.is_none());
+
+        let supported = discovered_observation(
+            model("supported"),
+            Some(json!({"id": "supported"})),
+            Some(json!({
+                "schema_version": 1,
+                "reasoning": {
+                    "supported": true
+                }
+            })),
+            WireFormat::Plugin,
+        );
+        assert_eq!(supported.reasoning_support, Some(true));
+        assert!(supported.reasoning.is_some());
+
+        let encoded = json!({
+            "unknown": unknown.reasoning_support,
+            "unsupported": unsupported.reasoning_support,
+            "supported": supported.reasoning_support,
+        });
+        assert!(encoded["unknown"].is_null());
+        assert_eq!(encoded["unsupported"], false);
+        assert_eq!(encoded["supported"], true);
     }
 
     #[test]

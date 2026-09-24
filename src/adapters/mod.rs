@@ -37,6 +37,13 @@ pub trait Adapter: Send + Sync {
     /// Build the outbound URL for a model call.
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError>;
 
+    /// Whether this adapter owns translation/validation of canonical thinking
+    /// levels. Built-in adapters rely on an executable core ThinkingMap;
+    /// plugin adapters receive the canonical level through their request ABI.
+    fn handles_thinking_translation(&self) -> bool {
+        false
+    }
+
     /// Whether this adapter provides an exact upstream token-count API.
     fn supports_count_tokens(&self) -> bool {
         false
@@ -186,6 +193,9 @@ fn reasoning_capability(
 
 pub fn reasoning_metadata_declared(metadata: &serde_json::Value) -> bool {
     if metadata.get("reasoning_capability").is_some() {
+        return true;
+    }
+    if metadata.get("reasoning").is_some_and(serde_json::Value::is_boolean) {
         return true;
     }
     if metadata
@@ -340,14 +350,23 @@ impl ModelCapabilitiesV1 {
     }
 }
 
+fn parse_model_capabilities_v1(
+    metadata: &serde_json::Value,
+) -> Option<ModelCapabilitiesV1> {
+    let metadata: ModelCapabilitiesV1 = serde_json::from_value(metadata.clone()).ok()?;
+    metadata.is_valid().then_some(metadata)
+}
+
+pub fn plugin_reasoning_support_v1(metadata: &serde_json::Value) -> Option<bool> {
+    parse_model_capabilities_v1(metadata)?
+        .reasoning
+        .map(|reasoning| reasoning.supported)
+}
+
 pub fn normalize_plugin_reasoning_capability_v1(
     metadata: &serde_json::Value,
 ) -> Option<ReasoningCapability> {
-    let metadata: ModelCapabilitiesV1 = serde_json::from_value(metadata.clone()).ok()?;
-    if !metadata.is_valid() {
-        return None;
-    }
-
+    let metadata = parse_model_capabilities_v1(metadata)?;
     let reasoning = metadata.reasoning?;
     if !reasoning.supported {
         return None;

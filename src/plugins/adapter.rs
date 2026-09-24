@@ -130,6 +130,10 @@ impl Adapter for PluginAdapter {
         self.wire_format
     }
 
+    fn handles_thinking_translation(&self) -> bool {
+        true
+    }
+
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
         let (p, m) = (Self::provider_json(ctx), Self::model_json(ctx));
         self.block(self.manager.adapter_build_url(&self.plugin_id, &p, &m))
