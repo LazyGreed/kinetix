@@ -2405,7 +2405,7 @@ fn check_thinking_translation_for_adapter(
     target: &ResolvedTarget,
     req: &InternalRequest,
 ) -> Result<(), ProxyError> {
-    if req.thinking.is_some() && adapter.handles_thinking_translation() {
+    if req.thinking.is_some() && adapter.handles_thinking_translation(&target.model) {
         return Ok(());
     }
     check_thinking_translation(target, req)
@@ -4012,8 +4012,8 @@ mod route_policy_tests {
             "test-plugin"
         }
 
-        fn handles_thinking_translation(&self) -> bool {
-            true
+        fn handles_thinking_translation(&self, model: &db::ModelRow) -> bool {
+            crate::plugins::adapter::model_handles_thinking_translation(model)
         }
 
         fn build_url(&self, _ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
@@ -4519,6 +4519,7 @@ mod route_policy_tests {
         target.provider.wire_format = "plugin".into();
         target.provider.wire_plugin = "plugin:test/provider-adapter".into();
         target.model.discovery = serde_json::json!({
+            "capabilities": {"reasoning": true},
             "reasoning_capability": capability
         })
         .to_string();
@@ -4529,7 +4530,7 @@ mod route_policy_tests {
             Arc::new(PluginThinkingTestAdapter),
         );
         let adapter = registry.for_provider(&target.provider);
-        assert!(adapter.handles_thinking_translation());
+        assert!(adapter.handles_thinking_translation(&target.model));
 
         let mut req = request();
         req.thinking = Some(crate::types::ThinkingLevel::High);
@@ -4548,6 +4549,32 @@ mod route_policy_tests {
         };
         let body = build_upstream_body(adapter.as_ref(), &ctx, &req, false).unwrap();
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn plugin_adapter_without_thinking_opt_in_keeps_core_validation() {
+        let mut target = target();
+        target.provider.wire_format = "plugin".into();
+        target.provider.wire_plugin = "plugin:test/provider-adapter".into();
+        target.model.discovery = serde_json::json!({
+            "capabilities": {"reasoning": false}
+        })
+        .to_string();
+
+        let registry = crate::adapters::AdapterRegistry::new();
+        registry.register_plugin(
+            "plugin:test/provider-adapter",
+            Arc::new(PluginThinkingTestAdapter),
+        );
+        let adapter = registry.for_provider(&target.provider);
+        assert!(!adapter.handles_thinking_translation(&target.model));
+
+        let mut req = request();
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+
+        let error =
+            check_thinking_translation_for_adapter(adapter.as_ref(), &target, &req).unwrap_err();
+        assert!(error.message.contains("has no executable mapping"));
     }
 
     #[test]

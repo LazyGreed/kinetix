@@ -24,6 +24,17 @@ use crate::types::{
     FailureKind, ImageData, InternalRequest, Part, ProxyError, StreamEvent, UpstreamFailure,
 };
 
+pub(crate) fn model_handles_thinking_translation(model: &crate::db::ModelRow) -> bool {
+    serde_json::from_str::<Value>(&model.discovery)
+        .ok()
+        .and_then(|discovery| {
+            discovery
+                .pointer("/capabilities/reasoning")
+                .and_then(Value::as_bool)
+        })
+        == Some(true)
+}
+
 /// A plugin-backed adapter bound to one `plugin:<id>/<capability>` reference.
 pub struct PluginAdapter {
     manager: PluginManager,
@@ -130,8 +141,8 @@ impl Adapter for PluginAdapter {
         self.wire_format
     }
 
-    fn handles_thinking_translation(&self) -> bool {
-        true
+    fn handles_thinking_translation(&self, model: &crate::db::ModelRow) -> bool {
+        model_handles_thinking_translation(model)
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
@@ -443,6 +454,42 @@ fn _assert_send_sync() {
 mod tests {
     use super::*;
     use crate::types::{FinishReason, TokenUsage};
+
+    fn model_with_discovery(discovery: Value) -> crate::db::ModelRow {
+        crate::db::ModelRow {
+            id: "model_test".into(),
+            provider_id: "provider_test".into(),
+            upstream_id: "upstream".into(),
+            display_name: "Model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: discovery.to_string(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
+    #[test]
+    fn thinking_translation_requires_explicit_model_discovery_opt_in() {
+        assert!(!model_handles_thinking_translation(&model_with_discovery(
+            json!({})
+        )));
+        assert!(!model_handles_thinking_translation(&model_with_discovery(
+            json!({"capabilities": {"reasoning": null}})
+        )));
+        assert!(!model_handles_thinking_translation(&model_with_discovery(
+            json!({"capabilities": {"reasoning": false}})
+        )));
+        assert!(model_handles_thinking_translation(&model_with_discovery(
+            json!({"capabilities": {"reasoning": true}})
+        )));
+    }
 
     #[test]
     fn stream_events_round_trip() {
