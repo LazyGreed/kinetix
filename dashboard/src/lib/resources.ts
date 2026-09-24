@@ -69,6 +69,8 @@ export interface DiscoveredModel {
     thinking_per_1m?: number | null;
   } | null;
   price_sources?: Record<string, string | null> | null;
+  raw_metadata?: unknown | null;
+  raw_metadata_truncated?: boolean;
   catalog?: { id?: string; source?: string | null; reference?: string | null; url?: string | null } | null;
   already_imported: boolean;
 }
