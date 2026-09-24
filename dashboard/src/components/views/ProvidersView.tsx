@@ -253,6 +253,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         modalities: m.modalities || null,
         prices: m.prices || null,
         price_sources: m.price_sources || {},
+        raw_metadata: m.raw_metadata ?? null,
+        raw_metadata_truncated: m.raw_metadata_truncated ?? false,
         catalog: m.catalog || null,
         imported_from_discovery: true,
       },
