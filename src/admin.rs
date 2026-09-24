@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 
 use crate::adapters::{
     normalize_plugin_reasoning_capability_v1, normalize_reasoning_capability,
-    plugin_reasoning_support_v1, reasoning_metadata_declared, thinking_map_for_reasoning_with_wire,
-    UpstreamContext,
+    plugin_capability_flags_v1, plugin_reasoning_support_v1, reasoning_metadata_declared,
+    thinking_map_for_reasoning_with_wire, ModelCapabilityFlags, UpstreamContext,
 };
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
@@ -1058,6 +1058,9 @@ struct DiscoveredObservation {
     reasoning_support: Option<bool>,
     reasoning: Option<crate::adapters::ReasoningCapability>,
     thinking_map: Option<ThinkingMap>,
+    capabilities: ModelCapabilityFlags,
+    capability_sources: Value,
+    catalog: Option<Value>,
 }
 
 fn reasoning_wire_context(provider: &db::ProviderRow) -> WireFormat {
@@ -1082,6 +1085,72 @@ fn explicit_reasoning_support(metadata: &Value) -> Option<bool> {
                 .and_then(|reasoning| reasoning.get("supported"))
                 .and_then(Value::as_bool)
         })
+        // Gemini models.list exposes support as a top-level boolean while
+        // leaving supported thinking levels to the model documentation.
+        .or_else(|| metadata.get("thinking").and_then(Value::as_bool))
+}
+
+fn provider_capability_flags(metadata: &Value) -> ModelCapabilityFlags {
+    fn first_bool(metadata: &Value, pointers: &[&str]) -> Option<bool> {
+        pointers
+            .iter()
+            .find_map(|pointer| metadata.pointer(pointer).and_then(Value::as_bool))
+    }
+
+    ModelCapabilityFlags {
+        reasoning: explicit_reasoning_support(metadata),
+        vision: first_bool(
+            metadata,
+            &["/capabilities/vision", "/vision/input", "/vision"],
+        ),
+        tool_calling: first_bool(
+            metadata,
+            &[
+                "/capabilities/tool_calling",
+                "/capabilities/tools",
+                "/tools/supported",
+            ],
+        ),
+        structured_output: first_bool(
+            metadata,
+            &[
+                "/capabilities/structured_output",
+                "/structured_output/supported",
+            ],
+        ),
+    }
+}
+
+fn overlay_capability_flags(base: &mut ModelCapabilityFlags, overlay: &ModelCapabilityFlags) {
+    if overlay.reasoning.is_some() {
+        base.reasoning = overlay.reasoning;
+    }
+    if overlay.vision.is_some() {
+        base.vision = overlay.vision;
+    }
+    if overlay.tool_calling.is_some() {
+        base.tool_calling = overlay.tool_calling;
+    }
+    if overlay.structured_output.is_some() {
+        base.structured_output = overlay.structured_output;
+    }
+}
+
+fn capability_source(
+    provider: Option<bool>,
+    plugin: Option<bool>,
+    catalog: Option<bool>,
+    catalog_source: Option<&str>,
+) -> Option<String> {
+    if provider.is_some() {
+        Some("provider_metadata".to_string())
+    } else if plugin.is_some() {
+        Some("plugin_capabilities_json".to_string())
+    } else if catalog.is_some() {
+        catalog_source.map(str::to_string)
+    } else {
+        None
+    }
 }
 
 fn discovered_observation(
@@ -1090,40 +1159,195 @@ fn discovered_observation(
     fallback_metadata: Option<Value>,
     wire: WireFormat,
 ) -> DiscoveredObservation {
-    // capabilities_json is a strict, versioned normalized contract. Parse and
-    // validate the full v1 shape before consuming any of it; malformed or
-    // unsupported metadata remains opaque.
-    let fallback_reasoning = fallback_metadata
+    discovered_observation_with_catalog(model, provider_metadata, fallback_metadata, wire, None)
+}
+
+fn discovered_observation_with_catalog(
+    mut model: crate::adapters::DiscoveredModel,
+    provider_metadata: Option<Value>,
+    fallback_metadata: Option<Value>,
+    wire: WireFormat,
+    catalog: Option<crate::model_catalog::CatalogMatch>,
+) -> DiscoveredObservation {
+    let catalog_source = catalog.as_ref().map(|entry| entry.provenance().to_string());
+    let catalog_metadata = catalog.as_ref().map(|entry| &entry.capabilities_json);
+
+    let plugin_flags = fallback_metadata
+        .as_ref()
+        .and_then(plugin_capability_flags_v1)
+        .unwrap_or_default();
+    let catalog_flags = catalog_metadata
+        .and_then(plugin_capability_flags_v1)
+        .unwrap_or_default();
+    let provider_flags = provider_metadata
+        .as_ref()
+        .map(provider_capability_flags)
+        .unwrap_or_default();
+
+    let provider_declares_reasoning = provider_metadata
+        .as_ref()
+        .is_some_and(reasoning_metadata_declared);
+    let provider_reasoning = provider_metadata
+        .as_ref()
+        .filter(|_| provider_declares_reasoning)
+        .and_then(normalize_reasoning_capability);
+    let provider_support = provider_reasoning
+        .as_ref()
+        .map(|_| true)
+        .or(provider_flags.reasoning);
+
+    let plugin_reasoning = fallback_metadata
         .as_ref()
         .and_then(normalize_plugin_reasoning_capability_v1);
-    let fallback_support = fallback_metadata
+    let plugin_support = fallback_metadata
         .as_ref()
         .and_then(plugin_reasoning_support_v1);
-    let (reasoning, reasoning_support) = match provider_metadata.as_ref() {
-        Some(metadata) if reasoning_metadata_declared(metadata) => {
-            let reasoning = normalize_reasoning_capability(metadata);
-            let support = reasoning
-                .as_ref()
-                .map(|_| true)
-                .or_else(|| explicit_reasoning_support(metadata));
-            (reasoning, support)
+    let mut catalog_reasoning = catalog_metadata.and_then(normalize_plugin_reasoning_capability_v1);
+    if wire == WireFormat::Gemini {
+        if let Some(reasoning) = catalog_reasoning.as_mut() {
+            reasoning.upstream_format = "gemini_thinking_level".to_string();
         }
-        _ => (fallback_reasoning, fallback_support),
+    }
+    let catalog_support = catalog_metadata.and_then(plugin_reasoning_support_v1);
+
+    let provider_reasoning_is_authoritative =
+        provider_declares_reasoning || provider_flags.reasoning.is_some();
+    let (reasoning_support, support_source) = if provider_reasoning_is_authoritative {
+        (provider_support, Some("provider_metadata".to_string()))
+    } else if plugin_support.is_some() {
+        (plugin_support, Some("plugin_capabilities_json".to_string()))
+    } else {
+        (catalog_support, catalog_source.clone())
     };
+
+    fn has_reasoning_details(capability: &crate::adapters::ReasoningCapability) -> bool {
+        capability.mode.is_some() || !capability.levels.is_empty() || capability.default.is_some()
+    }
+
+    let detailed_reasoning = provider_reasoning
+        .as_ref()
+        .filter(|capability| has_reasoning_details(capability))
+        .cloned()
+        .map(|capability| (capability, "provider_metadata".to_string()))
+        .or_else(|| {
+            plugin_reasoning
+                .as_ref()
+                .filter(|capability| has_reasoning_details(capability))
+                .cloned()
+                .map(|capability| (capability, "plugin_capabilities_json".to_string()))
+        })
+        .or_else(|| {
+            catalog_reasoning
+                .as_ref()
+                .filter(|capability| has_reasoning_details(capability))
+                .cloned()
+                .zip(catalog_source.clone())
+        });
+
+    let supported_only_reasoning = provider_reasoning
+        .clone()
+        .map(|capability| (capability, "provider_metadata".to_string()))
+        .or_else(|| {
+            plugin_reasoning
+                .clone()
+                .map(|capability| (capability, "plugin_capabilities_json".to_string()))
+        })
+        .or_else(|| catalog_reasoning.clone().zip(catalog_source.clone()));
+
+    let provider_blocks_fallback = provider_declares_reasoning
+        && provider_reasoning.is_none()
+        && provider_flags.reasoning.is_none();
+    let (reasoning, reasoning_source) = if provider_blocks_fallback
+        || reasoning_support == Some(false)
+    {
+        (None, support_source)
+    } else if let Some((capability, detail_source)) =
+        detailed_reasoning.or(supported_only_reasoning)
+    {
+        let source = match support_source.as_deref() {
+            Some(support) if support != detail_source => Some(format!("{support}+{detail_source}")),
+            Some(support) => Some(support.to_string()),
+            None => Some(detail_source),
+        };
+        (Some(capability), source)
+    } else {
+        (None, support_source)
+    };
+
+    let context_source = if model.context_window.is_some() {
+        Some("upstream_discovery".to_string())
+    } else if let Some(value) = catalog.as_ref().and_then(|entry| entry.context_window) {
+        model.context_window = Some(value);
+        catalog_source.clone()
+    } else {
+        None
+    };
+    let max_output_source = if model.max_output_tokens.is_some() {
+        Some("upstream_discovery".to_string())
+    } else if let Some(value) = catalog.as_ref().and_then(|entry| entry.max_output_tokens) {
+        model.max_output_tokens = Some(value);
+        catalog_source.clone()
+    } else {
+        None
+    };
+
+    let mut capabilities = catalog_flags.clone();
+    overlay_capability_flags(&mut capabilities, &plugin_flags);
+    overlay_capability_flags(&mut capabilities, &provider_flags);
+    capabilities.reasoning = reasoning_support;
+
+    let capability_sources = json!({
+        "context_window": context_source,
+        "max_output_tokens": max_output_source,
+        "reasoning": reasoning_source,
+        "vision": capability_source(
+            provider_flags.vision,
+            plugin_flags.vision,
+            catalog_flags.vision,
+            catalog_source.as_deref(),
+        ),
+        "tool_calling": capability_source(
+            provider_flags.tool_calling,
+            plugin_flags.tool_calling,
+            catalog_flags.tool_calling,
+            catalog_source.as_deref(),
+        ),
+        "structured_output": capability_source(
+            provider_flags.structured_output,
+            plugin_flags.structured_output,
+            catalog_flags.structured_output,
+            catalog_source.as_deref(),
+        ),
+    });
+
+    let catalog = catalog.as_ref().map(|entry| {
+        json!({
+            "source": entry.provenance(),
+            "reference": entry.reference(),
+            "url": entry.source_url.as_deref(),
+        })
+    });
     let thinking_map = reasoning
         .as_ref()
         .and_then(|capability| thinking_map_for_reasoning_with_wire(capability, wire));
+
     DiscoveredObservation {
         model,
         reasoning_support,
         reasoning,
         thinking_map,
+        capabilities,
+        capability_sources,
+        catalog,
     }
 }
 
 fn discovered_capabilities(observation: &DiscoveredObservation) -> Value {
     json!({
-        "reasoning": observation.reasoning_support,
+        "reasoning": observation.capabilities.reasoning,
+        "vision": observation.capabilities.vision,
+        "tool_calling": observation.capabilities.tool_calling,
+        "structured_output": observation.capabilities.structured_output,
     })
 }
 
@@ -1196,85 +1420,91 @@ pub async fn discover_models(
     // plugin instead of the built-in adapter. A bound-but-unavailable plugin
     // fails closed rather than silently falling back to native discovery
     // (§6.0).
-    let discovered: Vec<DiscoveredObservation> =
-        if let Some(pref) = provider.model_source_plugin_ref() {
-            let manager = plugin_manager(&state)?;
-            let reference = format!("plugin:{}/{}", pref.plugin_id, pref.capability);
-            let account_aware = manager
-                .resolve_binding(&reference, crate::plugins::Capability::AccountModelSource)
-                .await
-                .is_some();
-            let legacy = manager
-                .resolve_binding(&reference, crate::plugins::Capability::ModelSource)
-                .await
-                .is_some();
-            if !account_aware && !legacy {
-                return Err(ApiError::bad(format!(
-                    "provider is bound to unavailable plugin model source '{reference}'"
-                )));
-            }
+    let discovered: Vec<DiscoveredObservation> = if let Some(pref) =
+        provider.model_source_plugin_ref()
+    {
+        let manager = plugin_manager(&state)?;
+        let reference = format!("plugin:{}/{}", pref.plugin_id, pref.capability);
+        let account_aware = manager
+            .resolve_binding(&reference, crate::plugins::Capability::AccountModelSource)
+            .await
+            .is_some();
+        let legacy = manager
+            .resolve_binding(&reference, crate::plugins::Capability::ModelSource)
+            .await
+            .is_some();
+        if !account_aware && !legacy {
+            return Err(ApiError::bad(format!(
+                "provider is bound to unavailable plugin model source '{reference}'"
+            )));
+        }
 
-            let models_path = provider.models_path.clone().unwrap_or_default();
-            let list = if account_aware {
-                let accounts = db::accounts_for_provider(&state.pool, &provider.id)
-                    .await
-                    .map_err(ApiError::internal)?;
-                let account = accounts
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| ApiError::bad("provider has no credentials to discover with"))?;
-                manager
-                    .account_model_discover(
-                        &pref.plugin_id,
-                        &provider.id,
-                        &account.id,
-                        &provider.base_url,
-                        &models_path,
-                    )
-                    .await
-            } else {
-                manager
-                    .model_discover(
-                        &pref.plugin_id,
-                        &provider.id,
-                        &provider.base_url,
-                        &models_path,
-                    )
-                    .await
-            }
-            .map_err(|f| {
-                ApiError::bad(format!(
-                    "plugin model discovery failed: {}",
-                    crate::crypto::redact(&f.message())
-                ))
-            })?;
-
-            list.into_iter()
-                .map(|m| {
-                    let provider_metadata = m
-                        .raw_metadata
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str::<Value>(value).ok());
-                    let fallback_metadata = m
-                        .capabilities_json
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str::<Value>(value).ok());
-                    discovered_observation(
-                        crate::adapters::DiscoveredModel {
-                            id: m.id,
-                            display_name: m.display_name,
-                            context_window: m.context_window.map(|v| v as i64),
-                            max_output_tokens: m.max_output_tokens.map(|v| v as i64),
-                        },
-                        provider_metadata,
-                        fallback_metadata,
-                        reasoning_wire_context(&provider),
-                    )
-                })
-                .collect()
+        let models_path = provider.models_path.clone().unwrap_or_default();
+        let list = if account_aware {
+            let accounts = db::accounts_for_provider(&state.pool, &provider.id)
+                .await
+                .map_err(ApiError::internal)?;
+            let account = accounts
+                .into_iter()
+                .next()
+                .ok_or_else(|| ApiError::bad("provider has no credentials to discover with"))?;
+            manager
+                .account_model_discover(
+                    &pref.plugin_id,
+                    &provider.id,
+                    &account.id,
+                    &provider.base_url,
+                    &models_path,
+                )
+                .await
         } else {
-            discover_models_native(&state, &provider).await?
-        };
+            manager
+                .model_discover(
+                    &pref.plugin_id,
+                    &provider.id,
+                    &provider.base_url,
+                    &models_path,
+                )
+                .await
+        }
+        .map_err(|f| {
+            ApiError::bad(format!(
+                "plugin model discovery failed: {}",
+                crate::crypto::redact(&f.message())
+            ))
+        })?;
+
+        let models_dev =
+            crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
+        list.into_iter()
+            .map(|m| {
+                let provider_metadata = m
+                    .raw_metadata
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok());
+                let fallback_metadata = m
+                    .capabilities_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok());
+                let catalog =
+                    crate::model_catalog::resolve(&provider.base_url, &m.id, models_dev.as_ref());
+                discovered_observation_with_catalog(
+                    crate::adapters::DiscoveredModel {
+                        id: m.id,
+                        display_name: m.display_name,
+                        context_window: m.context_window.map(|v| v as i64),
+                        max_output_tokens: m.max_output_tokens.map(|v| v as i64),
+                    },
+                    provider_metadata,
+                    fallback_metadata,
+                    reasoning_wire_context(&provider),
+                    catalog,
+                )
+            })
+            .collect()
+    } else {
+        discover_models_native(&state, &provider).await?
+    };
 
     // Mark which are already imported and record the observation (FR-10.5).
     // Discovery never overwrites admin-edited fields — only the `discovery`
@@ -1303,6 +1533,8 @@ pub async fn discover_models(
                     "capabilities": discovered_capabilities(observation),
                     "reasoning_capability": &observation.reasoning,
                     "thinking_map": &observation.thinking_map,
+                    "capability_sources": &observation.capability_sources,
+                    "catalog": &observation.catalog,
                     "disappeared": false,
                 }),
             )
@@ -1316,6 +1548,8 @@ pub async fn discover_models(
             "capabilities": discovered_capabilities(observation),
             "reasoning_capability": &observation.reasoning,
             "thinking_map": &observation.thinking_map,
+            "capability_sources": &observation.capability_sources,
+            "catalog": &observation.catalog,
             "already_imported": existing.iter().any(|e| e.upstream_id == m.id),
         }));
     }
@@ -1440,16 +1674,21 @@ async fn discover_models_native(
     }
     let parsed: Value = serde_json::from_str(&body_text)
         .map_err(|e| ApiError::bad(format!("invalid discovery response: {e}")))?;
+    let models_dev =
+        crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
     Ok(adapter
         .parse_model_list(&parsed)
         .into_iter()
         .map(|model| {
             let provider_metadata = raw_discovery_metadata(&parsed, &model.id).cloned();
-            discovered_observation(
+            let catalog =
+                crate::model_catalog::resolve(&provider.base_url, &model.id, models_dev.as_ref());
+            discovered_observation_with_catalog(
                 model,
                 provider_metadata,
                 None,
                 reasoning_wire_context(provider),
+                catalog,
             )
         })
         .collect())
@@ -1779,7 +2018,7 @@ fn model_json(m: &db::ModelRow, providers: &[db::ProviderRow]) -> Value {
         "enabled": m.enabled != 0,
         "context_window": m.context_window,
         "max_output_tokens": m.max_output_tokens,
-        "capabilities": m.caps(),
+        "capabilities": serde_json::from_str::<Value>(&m.capabilities).unwrap_or(json!({})),
         "prices": m.prices(),
         "parameters": m.params(),
         "thinking_map": m.thinking(),
@@ -1817,6 +2056,36 @@ fn default_true() -> bool {
     true
 }
 
+fn normalize_model_capabilities(value: &Value) -> Value {
+    let Some(input) = value.as_object() else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for (canonical, aliases) in [
+        ("text", &["text"][..]),
+        ("vision", &["vision"][..]),
+        ("reasoning", &["reasoning"][..]),
+        (
+            "tool_calling",
+            &["tool_calling", "toolCalling", "tools", "tool_calls"][..],
+        ),
+        ("audio", &["audio"][..]),
+        (
+            "structured_output",
+            &["structured_output", "structuredOutput"][..],
+        ),
+    ] {
+        if let Some(value) = aliases
+            .iter()
+            .find_map(|key| input.get(*key))
+            .and_then(Value::as_bool)
+        {
+            out.insert(canonical.to_string(), Value::Bool(value));
+        }
+    }
+    Value::Object(out)
+}
+
 fn validate_thinking_map(thinking_map: &ThinkingMap) -> Result<(), ApiError> {
     let problems = thinking_map.validation_errors();
     if problems.is_empty() {
@@ -1839,7 +2108,7 @@ pub async fn create_model(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
-    let caps: Capabilities = serde_json::from_value(body.capabilities.clone()).unwrap_or_default();
+    let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
 
@@ -1852,7 +2121,7 @@ pub async fn create_model(
             enabled: body.enabled,
             context_window: body.context_window,
             max_output_tokens: body.max_output_tokens,
-            capabilities: serde_json::to_value(&caps).unwrap(),
+            capabilities: caps,
             prices: serde_json::to_value(&prices).unwrap(),
             parameters: body.parameters.clone(),
             thinking_map: serde_json::to_value(&body.thinking_map)
@@ -1890,7 +2159,7 @@ pub async fn update_model(
     Path(id): Path<String>,
     Json(body): Json<ModelBody>,
 ) -> ApiResult {
-    let caps: Capabilities = serde_json::from_value(body.capabilities.clone()).unwrap_or_default();
+    let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
     db::update_model(
@@ -1900,7 +2169,7 @@ pub async fn update_model(
         body.enabled,
         body.context_window,
         body.max_output_tokens,
-        serde_json::to_value(&caps).unwrap(),
+        caps,
         serde_json::to_value(&prices).unwrap(),
         body.parameters.clone(),
         serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible"),
@@ -6286,6 +6555,383 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(discovery["import_source"], "dashboard");
         assert_eq!(discovery["disappeared"], false);
         assert!(discovery.get("last_seen").is_some());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn sparse_bai_model_is_enriched_from_catalog() {
+        let catalog =
+            crate::model_catalog::resolve("https://api.b.ai/v1/", "DeepSeek-V4.1-Flash", None)
+                .unwrap();
+        let observation = discovered_observation_with_catalog(
+            model("DeepSeek-V4.1-Flash"),
+            Some(json!({"id": "DeepSeek-V4.1-Flash", "object": "model"})),
+            None,
+            WireFormat::Openai,
+            Some(catalog),
+        );
+
+        assert_eq!(observation.model.context_window, Some(1_000_000));
+        assert_eq!(observation.model.max_output_tokens, Some(384_000));
+        assert_eq!(observation.capabilities.vision, Some(true));
+        assert_eq!(observation.capabilities.tool_calling, Some(true));
+        assert_eq!(observation.reasoning_support, Some(true));
+
+        let reasoning = observation.reasoning.as_ref().unwrap();
+        assert_eq!(
+            reasoning.levels,
+            vec!["low".to_string(), "high".to_string(), "max".to_string()]
+        );
+        assert_eq!(reasoning.default.as_deref(), Some("high"));
+        assert_eq!(reasoning.upstream_format, "provider_declared");
+        assert!(observation.thinking_map.is_none());
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("bundled_catalog")
+        );
+    }
+
+    #[test]
+    fn ai_studio_thinking_hint_is_enriched_with_models_dev_levels() {
+        let catalog = crate::model_catalog::CatalogMatch {
+            source: crate::model_catalog::CatalogSource::ModelsDev,
+            provider_id: "google".to_string(),
+            host: "generativelanguage.googleapis.com".to_string(),
+            model_id: "gemini-3.8-flash".to_string(),
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(65_536),
+            capabilities_json: json!({
+                "schema_version": 1,
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["low", "medium", "high"],
+                    "can_disable": false
+                },
+                "tools": {"supported": true},
+                "vision": {"input": true},
+                "structured_output": {"supported": true}
+            }),
+            source_url: Some("https://models.dev/api.json".to_string()),
+        };
+        let mut discovered = model("gemini-3.8-flash");
+        discovered.context_window = Some(1_048_576);
+        discovered.max_output_tokens = Some(65_536);
+        let observation = discovered_observation_with_catalog(
+            discovered,
+            Some(json!({
+                "name": "models/gemini-3.8-flash",
+                "inputTokenLimit": 1048576,
+                "outputTokenLimit": 65536,
+                "supportedGenerationMethods": ["generateContent", "countTokens"],
+                "thinking": true
+            })),
+            None,
+            WireFormat::Gemini,
+            Some(catalog),
+        );
+
+        assert_eq!(observation.model.context_window, Some(1_048_576));
+        assert_eq!(observation.model.max_output_tokens, Some(65_536));
+        assert_eq!(observation.reasoning_support, Some(true));
+        assert_eq!(observation.capabilities.vision, Some(true));
+        assert_eq!(observation.capabilities.tool_calling, Some(true));
+
+        let reasoning = observation.reasoning.as_ref().unwrap();
+        assert_eq!(
+            reasoning.levels,
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()]
+        );
+        assert_eq!(reasoning.default, None);
+        assert_eq!(reasoning.upstream_format, "gemini_thinking_level");
+        assert_eq!(
+            observation
+                .thinking_map
+                .as_ref()
+                .and_then(|map| map.level_field.as_deref()),
+            Some("thinkingConfig.thinkingLevel")
+        );
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("provider_metadata+models.dev")
+        );
+    }
+
+    #[test]
+    fn ai_studio_thinking_false_overrides_catalog() {
+        let catalog = crate::model_catalog::CatalogMatch {
+            source: crate::model_catalog::CatalogSource::ModelsDev,
+            provider_id: "google".to_string(),
+            host: "generativelanguage.googleapis.com".to_string(),
+            model_id: "gemini-3.8-flash".to_string(),
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(65_536),
+            capabilities_json: json!({
+                "schema_version": 1,
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["low", "medium", "high"],
+                    "can_disable": false
+                }
+            }),
+            source_url: Some("https://models.dev/api.json".to_string()),
+        };
+        let observation = discovered_observation_with_catalog(
+            model("gemini-3.8-flash"),
+            Some(json!({
+                "name": "models/gemini-3.8-flash",
+                "thinking": false
+            })),
+            None,
+            WireFormat::Gemini,
+            Some(catalog),
+        );
+
+        assert_eq!(observation.reasoning_support, Some(false));
+        assert!(observation.reasoning.is_none());
+        assert!(observation.thinking_map.is_none());
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("provider_metadata")
+        );
+    }
+
+    #[test]
+    fn provider_reasoning_metadata_overrides_catalog() {
+        let catalog =
+            crate::model_catalog::resolve("https://api.b.ai/v1", "DeepSeek-V4.1-Flash", None)
+                .unwrap();
+        let observation = discovered_observation_with_catalog(
+            model("DeepSeek-V4.1-Flash"),
+            Some(json!({
+                "id": "DeepSeek-V4.1-Flash",
+                "supportedThinkingEfforts": ["low", "high"]
+            })),
+            None,
+            WireFormat::Openai,
+            Some(catalog),
+        );
+
+        let reasoning = observation.reasoning.unwrap();
+        assert_eq!(
+            reasoning.levels,
+            vec!["low".to_string(), "high".to_string()]
+        );
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("provider_metadata")
+        );
+    }
+
+    #[test]
+    fn plugin_field_override_does_not_hide_catalog_reasoning() {
+        let catalog =
+            crate::model_catalog::resolve("https://api.b.ai/v1", "DeepSeek-V4.1-Flash", None)
+                .unwrap();
+        let observation = discovered_observation_with_catalog(
+            model("DeepSeek-V4.1-Flash"),
+            Some(json!({"id": "DeepSeek-V4.1-Flash"})),
+            Some(json!({
+                "schema_version": 1,
+                "vision": {"input": false}
+            })),
+            WireFormat::Openai,
+            Some(catalog),
+        );
+
+        assert_eq!(observation.capabilities.vision, Some(false));
+        assert_eq!(observation.reasoning_support, Some(true));
+        assert_eq!(
+            observation.capability_sources["vision"],
+            json!("plugin_capabilities_json")
+        );
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("bundled_catalog")
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_discovery_import_preserves_unknowns_through_runtime() {
+        use std::sync::Arc;
+
+        let home = std::env::temp_dir().join(format!(
+            "kinetix-sparse-import-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let db_path = home.join("kinetix.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let config = Arc::new(
+            crate::config::Config::build(crate::config::CliOverrides {
+                home: Some(home.clone()),
+                database_url: Some(database_url.clone()),
+                master_key: Some(hex::encode([9u8; 32])),
+                admin_token: Some("test-admin-password".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let provider_id = db::insert_provider(
+            &pool,
+            &db::NewProvider {
+                name: "sparse",
+                base_url: "https://example.invalid/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1000,
+                capability_mode: "strict",
+                models_path: Some("/models"),
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+            },
+        )
+        .await
+        .unwrap();
+
+        let observation = discovered_observation(
+            model("sparse-model"),
+            Some(json!({"id": "sparse-model"})),
+            Some(json!({
+                "schema_version": 1,
+                "structured_output": {"supported": true}
+            })),
+            WireFormat::Openai,
+        );
+        let discovery_caps = discovered_capabilities(&observation);
+        assert!(discovery_caps["vision"].is_null());
+        assert!(discovery_caps["tool_calling"].is_null());
+        assert_eq!(discovery_caps["structured_output"], true);
+
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry.clone(),
+            Arc::new(crate::crypto::Crypto::new(&[9u8; 32])),
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool.clone(), 16),
+            0,
+        );
+
+        let created = create_model(
+            State(state),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id),
+            Json(ModelBody {
+                upstream_id: "sparse-model".into(),
+                display_name: Some("Sparse Model".into()),
+                enabled: true,
+                context_window: observation.model.context_window,
+                max_output_tokens: observation.model.max_output_tokens,
+                capabilities: discovery_caps,
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({"imported_from_discovery": true}),
+            }),
+        )
+        .await
+        .unwrap();
+        let model_id = created.0["id"].as_str().unwrap();
+
+        let row = db::get_model(&pool, model_id).await.unwrap().unwrap();
+        assert_eq!(row.context_window, None);
+        assert_eq!(row.max_output_tokens, None);
+        assert_eq!(
+            serde_json::from_str::<Value>(&row.capabilities).unwrap(),
+            json!({"structured_output": true})
+        );
+        assert!(row.caps().structured_output);
+        assert!(!row.caps().vision);
+        assert!(!row.caps().tool_calling);
+
+        let body = crate::frontends::models::models_body(
+            FrontendFormat::OpenAi,
+            registry.as_ref(),
+            &["*".to_string()],
+        );
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "sparse-model")
+            .unwrap();
+        assert!(listed.get("context_window").is_none());
+        assert!(listed.get("max_output_tokens").is_none());
+        assert_eq!(listed["capabilities"], json!({"structured_output": true}));
+
+        let raw_capabilities = serde_json::from_str::<Value>(&row.capabilities).unwrap();
+        let caps = row.caps();
+        let target = crate::predicate::TargetFacts {
+            model_id: &row.id,
+            model_display: &row.display_name,
+            provider_id: &row.provider_id,
+            provider_name: "sparse",
+            capabilities: &caps,
+            capabilities_raw: &raw_capabilities,
+            context_window: row.context_window,
+            max_output_tokens: row.max_output_tokens,
+        };
+        let request = crate::predicate::RequestFacts {
+            frontend: "openai",
+            requested_model: "sparse-model",
+            requested_route: None,
+            key_tag: None,
+            has_tools: false,
+            has_images: false,
+            has_reasoning: false,
+            input_tokens: 1,
+        };
+
+        let vision = crate::predicate::TargetPredicate {
+            expr: Some(
+                serde_json::from_value(json!({
+                    "fact": {"name": "target_capability", "arg": "vision"},
+                    "op": "eq",
+                    "value": true
+                }))
+                .unwrap(),
+            ),
+            when_unknown: crate::predicate::WhenUnknown::Skip,
+        };
+        let vision_result = crate::predicate::eligibility(&vision, &request, &target);
+        assert_eq!(vision_result.result, crate::predicate::Tri::Unknown);
+        assert!(!vision_result.eligible);
+
+        let structured = crate::predicate::TargetPredicate {
+            expr: Some(
+                serde_json::from_value(json!({
+                    "fact": {"name": "target_capability", "arg": "structured_output"},
+                    "op": "eq",
+                    "value": true
+                }))
+                .unwrap(),
+            ),
+            when_unknown: crate::predicate::WhenUnknown::Skip,
+        };
+        let structured_result = crate::predicate::eligibility(&structured, &request, &target);
+        assert_eq!(structured_result.result, crate::predicate::Tri::True);
+        assert!(structured_result.eligible);
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(home);

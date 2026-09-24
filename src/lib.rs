@@ -31,6 +31,7 @@ pub mod frontends;
 pub mod limits;
 pub mod live;
 pub mod logqueue;
+pub mod model_catalog;
 pub mod net;
 pub mod outbound;
 pub mod passthrough;

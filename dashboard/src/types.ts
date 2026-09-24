@@ -69,11 +69,12 @@ export interface Account {
 }
 
 export interface ModelCapability {
-  text: boolean;
-  vision: boolean;
-  reasoning: boolean;
-  toolCalling: boolean;
-  audio: boolean;
+  text?: boolean;
+  vision?: boolean;
+  reasoning?: boolean;
+  toolCalling?: boolean;
+  audio?: boolean;
+  structuredOutput?: boolean;
 }
 
 export interface ModelPrice {
@@ -91,8 +92,8 @@ export interface ModelConfig {
   upstreamModelId: string;
   displayName: string;
   enabled: boolean;
-  contextWindow: number;
-  maxOutputTokens: number;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
   capabilities: ModelCapability;
   prices: ModelPrice;
   parameters: {
