@@ -563,11 +563,9 @@ mod reasoning_discovery_tests {
         assert!(!capability.can_disable);
         assert!(thinking_map_for_reasoning(&capability).is_none());
 
-        let map = thinking_map_for_reasoning_with_wire(
-            &capability,
-            crate::types::WireFormat::Openai,
-        )
-        .unwrap();
+        let map =
+            thinking_map_for_reasoning_with_wire(&capability, crate::types::WireFormat::Openai)
+                .unwrap();
         assert_eq!(map.level_field.as_deref(), Some("reasoning_effort"));
         assert_eq!(map.levels.get("high"), Some(&serde_json::json!("high")));
     }
