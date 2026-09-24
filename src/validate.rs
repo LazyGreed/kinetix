@@ -199,11 +199,12 @@ mod tests {
         );
         assert_eq!(v["valid"], true);
         assert_eq!(v["price_state"], "partial");
-        assert!(v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| warning.as_str().is_some_and(|warning| warning.contains("partially configured"))));
+        let warnings = v["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("partially configured"))
+        }));
     }
 
     #[test]
@@ -218,11 +219,12 @@ mod tests {
         );
         assert_eq!(v["valid"], true);
         assert_eq!(v["price_state"], "partial");
-        assert!(v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| warning.as_str().is_some_and(|warning| warning.contains("partially configured"))));
+        let warnings = v["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("partially configured"))
+        }));
     }
 
     #[test]
