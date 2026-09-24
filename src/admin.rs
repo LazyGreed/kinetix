@@ -27,6 +27,7 @@ use crate::types::{AuthScheme, Capabilities, Prices, ThinkingMap, WireFormat};
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
+#[derive(Debug)]
 pub struct ApiError(StatusCode, String);
 
 impl ApiError {
