@@ -139,6 +139,35 @@ async fn invokes_a_real_guest_capability_through_the_host_boundary() {
 }
 
 #[tokio::test]
+async fn invokes_real_guest_credential_rotation_through_host_boundary() {
+    let Some(path) = package_path() else {
+        eprintln!(
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+        );
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let (m, _pool) = manager().await;
+    m.install(&bytes, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.kinetix.antigravity-oauth")
+        .await
+        .unwrap();
+    m.enable("dev.kinetix.antigravity-oauth").await.unwrap();
+
+    let result = m
+        .credential_rotate(
+            "dev.kinetix.antigravity-oauth",
+            "antigravity",
+            "acc_missing",
+        )
+        .await;
+    match result {
+        Err(fault) => assert_eq!(fault.code(), "credential_expired", "got {fault:?}"),
+        Ok(()) => panic!("unexpectedly rotated a missing account"),
+    }
+}
+
+#[tokio::test]
 async fn a_real_guest_reports_usable_after_enable() {
     let Some(path) = package_path() else {
         eprintln!(

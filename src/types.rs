@@ -474,7 +474,8 @@ pub enum FailureKind {
     RateLimit,
     /// Key-level: quota exhausted. Mark exhausted until reset + retry another target.
     QuotaExhausted,
-    /// Credential-global: invalid/revoked credential. Disable this account.
+    /// Credential-global: invalid/revoked credential. Refreshable plugin
+    /// credentials get one forced rotation/retry before the account is disabled.
     AuthError,
     /// Provider/model-local: entitlement, model/project/region permission, or
     /// missing model/resource. Retry another logical target, but never poison

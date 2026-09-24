@@ -1606,6 +1606,32 @@ impl PluginManager {
         self.settle(id, "credential_strategy", started, res).await
     }
 
+    /// CredentialStrategy::rotate (§6.1). Forces the guest to renew the
+    /// account credential before core resolves a fresh lease.
+    pub async fn credential_rotate(
+        &self,
+        id: &str,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<(), PluginFault> {
+        let started = self.bump_invocation(id, "credential_strategy");
+        let _permits = self.acquire_invocation_permits(id).await;
+        let mut p = self
+            .prepare(id, true, "credential_strategy")
+            .await
+            .map_err(|e| PluginFault::Internal(e.to_string()))?;
+        let plugin = p.plugin;
+        let rt = self.inner.runtime.clone();
+        let _guard = rt.arm_deadline(&mut p.store, p.wall_time);
+        let res = plugin
+            .credential_strategy()
+            .call_rotate(&mut p.store, provider_id, account_id)
+            .await
+            .map_err(map_call_error)
+            .and_then(map_plugin_result);
+        self.settle(id, "credential_strategy", started, res).await
+    }
+
     /// ModelSource::discover (§6.2).
     pub async fn model_discover(
         &self,
@@ -2129,6 +2155,7 @@ fn map_plugin_result<T>(r: Result<T, wit::types::PluginError>) -> Result<T, Plug
         code: e.code,
         message: e.message,
         retryable: e.retryable,
+        retry_after: e.retry_after,
     })
 }
 
@@ -2142,6 +2169,7 @@ fn map_account_model_result<T>(
         code: e.code,
         message: e.message,
         retryable: e.retryable,
+        retry_after: e.retry_after,
     })
 }
 
@@ -2153,6 +2181,7 @@ fn map_auth_result<T>(
         code: e.code,
         message: e.message,
         retryable: e.retryable,
+        retry_after: e.retry_after,
     })
 }
 
@@ -2165,6 +2194,7 @@ fn map_adapter_result<T>(
         code: e.code,
         message: e.message,
         retryable: e.retryable,
+        retry_after: e.retry_after,
     })
 }
 

@@ -100,10 +100,14 @@ impl PluginAdapter {
             | PluginFault::Internal(_) => FailureKind::ServerError,
             PluginFault::Cancelled => FailureKind::ConnectionError,
         };
+        let retry_after_secs = match &fault {
+            PluginFault::PluginError { retry_after, .. } => *retry_after,
+            _ => None,
+        };
         UpstreamFailure {
             kind,
             status: None,
-            retry_after_secs: None,
+            retry_after_secs,
             message: format!("plugin adapter {stage}: {}", fault.message()),
             quota_reset_at: None,
         }
@@ -585,6 +589,7 @@ mod tests {
                 code: "server_error".into(),
                 message: "temporary".into(),
                 retryable: true,
+                retry_after: Some(5),
             },
         );
         assert_eq!(retryable.kind, FailureKind::ServerError);
@@ -595,6 +600,7 @@ mod tests {
                 code: "bad_request".into(),
                 message: "bad input".into(),
                 retryable: false,
+                retry_after: None,
             },
         );
         assert_eq!(request_error.kind, FailureKind::BadRequest);

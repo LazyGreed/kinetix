@@ -11,7 +11,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::credentials::{CredentialHealth, CredentialStrategy, ResolvedCredential};
+use crate::credentials::{
+    CredentialHealth, CredentialRotationError, CredentialStrategy, ResolvedCredential,
+};
 use crate::crypto::Crypto;
 use crate::db::{AccountRow, Pool};
 
@@ -19,6 +21,21 @@ use super::manager::PluginManager;
 
 /// The KV key prefix under which a plugin stores a leased secret.
 const LEASE_PREFIX: &str = "lease:";
+
+fn rotation_error(fault: super::runtime::PluginFault) -> CredentialRotationError {
+    match fault {
+        super::runtime::PluginFault::PluginError {
+            code,
+            message,
+            retryable,
+            retry_after,
+        } => CredentialRotationError::new(code, message, retryable, retry_after),
+        // Runtime/host faults are not evidence that the account credential was
+        // revoked. Treat them as transient so core never permanently poisons
+        // an account because the plugin host failed.
+        other => CredentialRotationError::new(other.code(), other.message(), true, None),
+    }
+}
 
 pub struct PluginCredentialStrategy {
     manager: Arc<PluginManager>,
@@ -81,6 +98,16 @@ impl CredentialStrategy for PluginCredentialStrategy {
         })
     }
 
+    async fn rotate(
+        &self,
+        account: &AccountRow,
+    ) -> std::result::Result<(), CredentialRotationError> {
+        self.manager
+            .credential_rotate(&self.plugin_id, &account.provider_id, &account.id)
+            .await
+            .map_err(rotation_error)
+    }
+
     async fn health(&self, account: &AccountRow) -> CredentialHealth {
         match self
             .manager
@@ -96,5 +123,39 @@ impl CredentialStrategy for PluginCredentialStrategy {
             },
             Err(f) => CredentialHealth::Unusable(f.message()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::runtime::PluginFault;
+
+    #[test]
+    fn rotation_error_preserves_retryable_plugin_evidence() {
+        let error = rotation_error(PluginFault::PluginError {
+            code: "upstream_unavailable".into(),
+            message: "refresh endpoint unavailable".into(),
+            retryable: true,
+            retry_after: Some(5),
+        });
+
+        assert_eq!(error.code, "upstream_unavailable");
+        assert_eq!(error.message, "refresh endpoint unavailable");
+        assert!(error.retryable);
+        assert_eq!(error.retry_after_secs, Some(5));
+        assert!(!error.invalid_credential());
+    }
+
+    #[test]
+    fn non_retryable_expired_credential_is_terminal() {
+        let error = rotation_error(PluginFault::PluginError {
+            code: "credential_expired".into(),
+            message: "refresh token revoked".into(),
+            retryable: false,
+            retry_after: None,
+        });
+
+        assert!(error.invalid_credential());
     }
 }
