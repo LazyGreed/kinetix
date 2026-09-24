@@ -394,7 +394,7 @@ fn add_nullable_type(
     ))
 }
 
-/// Normalize JSON Schema to Gemini's documented `parametersJsonSchema` subset.
+/// Normalize JSON Schema for Gemini `parametersJsonSchema`.
 ///
 /// Supported keywords are explicitly enumerated. Safe compatibility transforms:
 /// - legacy `definitions` -> `$defs` and matching local refs
