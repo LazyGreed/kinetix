@@ -4067,10 +4067,7 @@ mod route_policy_tests {
             Ok(Vec::new())
         }
 
-        fn parse_full_response(
-            &self,
-            _body: &Value,
-        ) -> Result<Vec<StreamEvent>, UpstreamFailure> {
+        fn parse_full_response(&self, _body: &Value) -> Result<Vec<StreamEvent>, UpstreamFailure> {
             Ok(Vec::new())
         }
     }

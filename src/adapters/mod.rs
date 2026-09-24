@@ -195,7 +195,10 @@ pub fn reasoning_metadata_declared(metadata: &serde_json::Value) -> bool {
     if metadata.get("reasoning_capability").is_some() {
         return true;
     }
-    if metadata.get("reasoning").is_some_and(serde_json::Value::is_boolean) {
+    if metadata
+        .get("reasoning")
+        .is_some_and(serde_json::Value::is_boolean)
+    {
         return true;
     }
     if metadata
@@ -350,9 +353,7 @@ impl ModelCapabilitiesV1 {
     }
 }
 
-fn parse_model_capabilities_v1(
-    metadata: &serde_json::Value,
-) -> Option<ModelCapabilitiesV1> {
+fn parse_model_capabilities_v1(metadata: &serde_json::Value) -> Option<ModelCapabilitiesV1> {
     let metadata: ModelCapabilitiesV1 = serde_json::from_value(metadata.clone()).ok()?;
     metadata.is_valid().then_some(metadata)
 }
