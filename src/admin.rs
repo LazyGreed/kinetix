@@ -11,7 +11,10 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::adapters::UpstreamContext;
+use crate::adapters::{
+    normalize_reasoning_capability, reasoning_metadata_declared, thinking_map_for_reasoning,
+    UpstreamContext,
+};
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
 use crate::crypto;
@@ -1047,6 +1050,60 @@ pub async fn delete_provider(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Debug, Clone)]
+struct DiscoveredObservation {
+    model: crate::adapters::DiscoveredModel,
+    reasoning: Option<crate::adapters::ReasoningCapability>,
+    thinking_map: Option<ThinkingMap>,
+}
+
+fn discovered_observation(
+    model: crate::adapters::DiscoveredModel,
+    provider_metadata: Option<Value>,
+    fallback_metadata: Option<Value>,
+) -> DiscoveredObservation {
+    let reasoning = match provider_metadata.as_ref() {
+        Some(metadata) if reasoning_metadata_declared(metadata) => {
+            normalize_reasoning_capability(metadata)
+        }
+        _ => fallback_metadata
+            .as_ref()
+            .and_then(normalize_reasoning_capability),
+    };
+    let thinking_map = reasoning.as_ref().and_then(thinking_map_for_reasoning);
+    DiscoveredObservation {
+        model,
+        reasoning,
+        thinking_map,
+    }
+}
+
+fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a Value> {
+    fn matches_model(value: &Value, model_id: &str) -> bool {
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("name").and_then(Value::as_str))
+            .is_some_and(|candidate| {
+                candidate == model_id
+                    || candidate
+                        .strip_prefix("models/")
+                        .is_some_and(|stripped| stripped == model_id)
+            })
+    }
+
+    for key in ["data", "models"] {
+        if let Some(values) = payload.get(key).and_then(Value::as_array) {
+            if let Some(value) = values.iter().find(|value| matches_model(value, model_id)) {
+                return Some(value);
+            }
+        }
+    }
+    payload
+        .as_array()
+        .and_then(|values| values.iter().find(|value| matches_model(value, model_id)))
+}
+
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
 pub async fn discover_models(
@@ -1063,7 +1120,7 @@ pub async fn discover_models(
     // plugin instead of the built-in adapter. A bound-but-unavailable plugin
     // fails closed rather than silently falling back to native discovery
     // (§6.0).
-    let discovered: Vec<crate::adapters::DiscoveredModel> =
+    let discovered: Vec<DiscoveredObservation> =
         if let Some(pref) = provider.model_source_plugin_ref() {
             let manager = plugin_manager(&state)?;
             let reference = format!("plugin:{}/{}", pref.plugin_id, pref.capability);
@@ -1117,11 +1174,25 @@ pub async fn discover_models(
             })?;
 
             list.into_iter()
-                .map(|m| crate::adapters::DiscoveredModel {
-                    id: m.id,
-                    display_name: m.display_name,
-                    context_window: m.context_window.map(|v| v as i64),
-                    max_output_tokens: m.max_output_tokens.map(|v| v as i64),
+                .map(|m| {
+                    let provider_metadata = m
+                        .raw_metadata
+                        .as_deref()
+                        .and_then(|value| serde_json::from_str::<Value>(value).ok());
+                    let fallback_metadata = m
+                        .capabilities_json
+                        .as_deref()
+                        .and_then(|value| serde_json::from_str::<Value>(value).ok());
+                    discovered_observation(
+                        crate::adapters::DiscoveredModel {
+                            id: m.id,
+                            display_name: m.display_name,
+                            context_window: m.context_window.map(|v| v as i64),
+                            max_output_tokens: m.max_output_tokens.map(|v| v as i64),
+                        },
+                        provider_metadata,
+                        fallback_metadata,
+                    )
                 })
                 .collect()
         } else {
@@ -1136,10 +1207,13 @@ pub async fn discover_models(
         .await
         .map_err(ApiError::internal)?;
     let now = db::now_iso();
-    let discovered_ids: std::collections::HashSet<String> =
-        discovered.iter().map(|m| m.id.clone()).collect();
+    let discovered_ids: std::collections::HashSet<String> = discovered
+        .iter()
+        .map(|item| item.model.id.clone())
+        .collect();
     let mut out: Vec<Value> = Vec::new();
-    for m in &discovered {
+    for observation in &discovered {
+        let m = &observation.model;
         if let Some(row) = existing.iter().find(|e| e.upstream_id == m.id) {
             let _ = db::set_model_discovery(
                 &state.pool,
@@ -1149,6 +1223,11 @@ pub async fn discover_models(
                     "context_window": m.context_window,
                     "max_output_tokens": m.max_output_tokens,
                     "display_name": m.display_name,
+                    "capabilities": {
+                        "reasoning": observation.reasoning.is_some(),
+                    },
+                    "reasoning_capability": &observation.reasoning,
+                    "thinking_map": &observation.thinking_map,
                     "disappeared": false,
                 }),
             )
@@ -1159,6 +1238,11 @@ pub async fn discover_models(
             "display_name": m.display_name,
             "context_window": m.context_window,
             "max_output_tokens": m.max_output_tokens,
+            "capabilities": {
+                "reasoning": observation.reasoning.is_some(),
+            },
+            "reasoning_capability": &observation.reasoning,
+            "thinking_map": &observation.thinking_map,
             "already_imported": existing.iter().any(|e| e.upstream_id == m.id),
         }));
     }
@@ -1188,7 +1272,7 @@ pub async fn discover_models(
 async fn discover_models_native(
     state: &AppState,
     provider: &db::ProviderRow,
-) -> Result<Vec<crate::adapters::DiscoveredModel>, ApiError> {
+) -> Result<Vec<DiscoveredObservation>, ApiError> {
     let accounts = db::accounts_for_provider(&state.pool, &provider.id)
         .await
         .map_err(ApiError::internal)?;
@@ -1279,7 +1363,14 @@ async fn discover_models_native(
     }
     let parsed: Value = serde_json::from_str(&body_text)
         .map_err(|e| ApiError::bad(format!("invalid discovery response: {e}")))?;
-    Ok(adapter.parse_model_list(&parsed))
+    Ok(adapter
+        .parse_model_list(&parsed)
+        .into_iter()
+        .map(|model| {
+            let provider_metadata = raw_discovery_metadata(&parsed, &model.id).cloned();
+            discovered_observation(model, provider_metadata, None)
+        })
+        .collect())
 }
 
 /// `POST /admin/api/providers/:id/test` — send a minimal probe (FR-10.11).
@@ -1636,6 +1727,8 @@ pub struct ModelBody {
     pub thinking_map: ThinkingMap,
     #[serde(default)]
     pub extra_request: Value,
+    #[serde(default)]
+    pub discovery: Value,
 }
 
 fn default_true() -> bool {
@@ -1683,7 +1776,7 @@ pub async fn create_model(
             thinking_map: serde_json::to_value(&body.thinking_map)
                 .expect("ThinkingMap serialization is infallible"),
             extra_request: body.extra_request.clone(),
-            discovery: json!({}),
+            discovery: body.discovery.clone(),
         },
     )
     .await
@@ -5659,4 +5752,115 @@ fn decode_key(k: &str) -> Option<[u8; 32]> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod reasoning_discovery_control_plane_tests {
+    use super::*;
+
+    fn model(id: &str) -> crate::adapters::DiscoveredModel {
+        crate::adapters::DiscoveredModel {
+            id: id.to_string(),
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+        }
+    }
+
+    #[test]
+    fn provider_metadata_precedes_plugin_fallback_metadata() {
+        let observation = discovered_observation(
+            model("reasoner"),
+            Some(json!({"supportedThinkingEfforts": ["low", "medium"]})),
+            Some(json!({
+                "reasoning": {
+                    "mode": "level",
+                    "levels": ["high"],
+                    "upstream_format": "openai_effort"
+                }
+            })),
+        );
+
+        let reasoning = observation.reasoning.unwrap();
+        assert_eq!(
+            reasoning.levels,
+            vec!["low".to_string(), "medium".to_string()]
+        );
+        assert_eq!(reasoning.upstream_format, "openai_effort");
+        assert_eq!(
+            observation.thinking_map.and_then(|map| map.level_field),
+            Some("reasoning_effort".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_provider_reasoning_does_not_fall_back_to_plugin_metadata() {
+        for provider_metadata in [
+            json!({"supportedThinkingEfforts": ["vendor_ultra"]}),
+            json!({"supportedThinkingEfforts": []}),
+        ] {
+            let observation = discovered_observation(
+                model("reasoner"),
+                Some(provider_metadata),
+                Some(json!({
+                    "reasoning": {
+                        "mode": "level",
+                        "levels": ["low", "high"],
+                        "upstream_format": "openai_effort"
+                    }
+                })),
+            );
+
+            assert!(observation.reasoning.is_none());
+            assert!(observation.thinking_map.is_none());
+        }
+    }
+
+    #[test]
+    fn plugin_capabilities_are_used_when_raw_metadata_has_no_reasoning_shape() {
+        let observation = discovered_observation(
+            model("reasoner"),
+            Some(json!({"id": "reasoner", "owned_by": "example"})),
+            Some(json!({
+                "reasoning": {
+                    "mode": "adaptive",
+                    "levels": ["low", "high", "max"],
+                    "can_disable": false,
+                    "upstream_format": "anthropic_effort"
+                }
+            })),
+        );
+
+        let reasoning = observation.reasoning.unwrap();
+        assert_eq!(reasoning.mode, crate::types::ThinkingMode::Adaptive);
+        assert_eq!(reasoning.upstream_format, "anthropic_effort");
+        assert!(observation.thinking_map.is_none());
+    }
+
+    #[test]
+    fn raw_metadata_matches_openai_and_gemini_model_ids() {
+        let openai = json!({
+            "data": [
+                {"id": "gpt-test", "supportedThinkingEfforts": ["low"]}
+            ]
+        });
+        assert_eq!(
+            raw_discovery_metadata(&openai, "gpt-test")
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str),
+            Some("gpt-test")
+        );
+
+        let gemini = json!({
+            "models": [
+                {"name": "models/gemini-test", "thinking": {"levels": ["high"]}}
+            ]
+        });
+        assert_eq!(
+            raw_discovery_metadata(&gemini, "gemini-test")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
+            Some("models/gemini-test")
+        );
+    }
 }

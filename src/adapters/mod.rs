@@ -111,6 +111,215 @@ pub struct DiscoveredModel {
     pub max_output_tokens: Option<i64>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ReasoningCapability {
+    pub mode: crate::types::ThinkingMode,
+    pub levels: Vec<String>,
+    pub can_disable: bool,
+    pub upstream_format: String,
+    #[serde(skip_serializing)]
+    upstream_levels: std::collections::HashMap<String, String>,
+}
+
+fn canonical_reasoning_levels(
+    value: &serde_json::Value,
+) -> (Vec<String>, std::collections::HashMap<String, String>) {
+    let Some(values) = value.as_array() else {
+        return (Vec::new(), std::collections::HashMap::new());
+    };
+    let mut levels = Vec::new();
+    let mut upstream_levels = std::collections::HashMap::new();
+    for value in values {
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        let normalized = match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => "off",
+            "minimal" => "minimal",
+            "low" => "low",
+            "medium" => "medium",
+            "high" => "high",
+            "xhigh" | "x-high" | "x_high" | "extra_high" => "xhigh",
+            "max" => "max",
+            _ => continue,
+        };
+        if !levels.iter().any(|level| level == normalized) {
+            levels.push(normalized.to_string());
+            upstream_levels.insert(normalized.to_string(), raw.to_string());
+        }
+    }
+    (levels, upstream_levels)
+}
+
+fn reasoning_capability(
+    levels: Vec<String>,
+    upstream_levels: std::collections::HashMap<String, String>,
+    mode: crate::types::ThinkingMode,
+    upstream_format: impl Into<String>,
+    can_disable: Option<bool>,
+) -> Option<ReasoningCapability> {
+    if levels.is_empty() {
+        return None;
+    }
+    let inferred_disable = levels.iter().any(|level| level == "off");
+    Some(ReasoningCapability {
+        mode,
+        levels,
+        can_disable: can_disable.unwrap_or(inferred_disable),
+        upstream_format: upstream_format.into(),
+        upstream_levels,
+    })
+}
+
+pub fn reasoning_metadata_declared(metadata: &serde_json::Value) -> bool {
+    if metadata.get("reasoning_capability").is_some() {
+        return true;
+    }
+    if metadata
+        .get("reasoning")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|reasoning| reasoning.contains_key("levels"))
+    {
+        return true;
+    }
+    [
+        "/supportedThinkingEfforts",
+        "/reasoning/supported_efforts",
+        "/supported_reasoning_levels",
+        "/thinking/levels",
+        "/capabilities/effort_tiers",
+    ]
+    .iter()
+    .any(|pointer| metadata.pointer(pointer).is_some())
+}
+
+/// Normalize provider/plugin discovery metadata into Kinetix's canonical
+/// reasoning capability. Unknown levels are discarded rather than invented.
+pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<ReasoningCapability> {
+    // Plugins may already return the normalized shape under
+    // capabilities_json.reasoning or reasoning_capability.
+    let normalized = metadata.get("reasoning_capability").or_else(|| {
+        metadata
+            .get("reasoning")
+            .filter(|value| value.get("levels").is_some())
+    });
+    if let Some(value) = normalized {
+        let (levels, mut upstream_levels) =
+            canonical_reasoning_levels(value.get("levels").unwrap_or(&serde_json::Value::Null));
+        let mode = match value.get("mode").and_then(serde_json::Value::as_str) {
+            Some("manual_budget") => crate::types::ThinkingMode::ManualBudget,
+            Some("adaptive") => crate::types::ThinkingMode::Adaptive,
+            _ => crate::types::ThinkingMode::Level,
+        };
+        let upstream_format = value
+            .get("upstream_format")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("provider_declared");
+
+        // Normalized plugin metadata contains canonical levels, so aliases are
+        // no longer recoverable from the level strings themselves. Apply
+        // dialect defaults for known formats, then allow plugins to provide an
+        // explicit canonical -> upstream token map for provider-specific aliases.
+        if matches!(upstream_format, "openai_effort" | "responses_effort")
+            && levels.iter().any(|level| level == "off")
+        {
+            upstream_levels.insert("off".to_string(), "none".to_string());
+        }
+        if let Some(explicit) = value
+            .get("upstream_levels")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (canonical, upstream) in explicit {
+                if levels.iter().any(|level| level == canonical) {
+                    if let Some(upstream) = upstream.as_str() {
+                        upstream_levels.insert(canonical.clone(), upstream.to_string());
+                    }
+                }
+            }
+        }
+
+        return reasoning_capability(
+            levels,
+            upstream_levels,
+            mode,
+            upstream_format,
+            value
+                .get("can_disable")
+                .and_then(serde_json::Value::as_bool),
+        );
+    }
+
+    let candidates = [
+        (
+            "/supportedThinkingEfforts",
+            "openai_effort",
+            crate::types::ThinkingMode::Level,
+        ),
+        (
+            "/reasoning/supported_efforts",
+            "provider_reasoning_supported_efforts",
+            crate::types::ThinkingMode::Level,
+        ),
+        (
+            "/supported_reasoning_levels",
+            "openai_effort",
+            crate::types::ThinkingMode::Level,
+        ),
+        (
+            "/thinking/levels",
+            "provider_thinking_levels",
+            crate::types::ThinkingMode::Level,
+        ),
+        (
+            "/capabilities/effort_tiers",
+            "provider_effort_tiers",
+            crate::types::ThinkingMode::Level,
+        ),
+    ];
+    for (pointer, upstream_format, mode) in candidates {
+        let Some(value) = metadata.pointer(pointer) else {
+            continue;
+        };
+        let (levels, upstream_levels) = canonical_reasoning_levels(value);
+        return reasoning_capability(levels, upstream_levels, mode, upstream_format, None);
+    }
+    None
+}
+
+/// Derive an executable legacy ThinkingMap only when the discovered dialect
+/// unambiguously identifies the upstream effort field. Other normalized
+/// capabilities stay descriptive until an adapter/registry supplies a mapping.
+pub fn thinking_map_for_reasoning(
+    capability: &ReasoningCapability,
+) -> Option<crate::types::ThinkingMap> {
+    if capability.mode != crate::types::ThinkingMode::Level {
+        return None;
+    }
+    let level_field = match capability.upstream_format.as_str() {
+        "openai_effort" => "reasoning_effort",
+        "responses_effort" => "reasoning.effort",
+        _ => return None,
+    };
+    let levels = capability
+        .levels
+        .iter()
+        .map(|level| {
+            let upstream = capability
+                .upstream_levels
+                .get(level)
+                .cloned()
+                .unwrap_or_else(|| level.clone());
+            (level.clone(), serde_json::Value::String(upstream))
+        })
+        .collect();
+    Some(crate::types::ThinkingMap {
+        levels,
+        mode: Some(crate::types::ThinkingMode::Level),
+        budget_field: None,
+        level_field: Some(level_field.to_string()),
+    })
+}
+
 /// An adapter registry: selects the built-in adapter for a wire format.
 /// Adding a new wire format (or a plugin) means adding an entry here; no
 /// frontend code changes (NFR-5.1).
@@ -250,5 +459,90 @@ impl Adapter for UnimplementedAdapter {
         _body: &serde_json::Value,
     ) -> Result<Vec<StreamEvent>, UpstreamFailure> {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod reasoning_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_supported_thinking_efforts_and_derives_openai_map() {
+        let metadata = serde_json::json!({
+            "supportedThinkingEfforts": ["low", "medium", "high"]
+        });
+        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        assert_eq!(
+            capability.levels,
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()]
+        );
+        assert_eq!(capability.upstream_format, "openai_effort");
+        assert!(!capability.can_disable);
+
+        let map = thinking_map_for_reasoning(&capability).unwrap();
+        assert_eq!(map.level_field.as_deref(), Some("reasoning_effort"));
+        assert_eq!(map.levels.get("high"), Some(&serde_json::json!("high")));
+    }
+
+    #[test]
+    fn nested_reasoning_efforts_do_not_infer_responses_request_dialect() {
+        let metadata = serde_json::json!({
+            "reasoning": {"supported_efforts": ["minimal", "low", "high"]}
+        });
+        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        assert_eq!(
+            capability.upstream_format,
+            "provider_reasoning_supported_efforts"
+        );
+        assert_eq!(
+            capability.levels,
+            vec!["minimal".to_string(), "low".to_string(), "high".to_string()]
+        );
+        assert!(thinking_map_for_reasoning(&capability).is_none());
+    }
+
+    #[test]
+    fn recognizes_all_common_metadata_shapes_conservatively() {
+        for metadata in [
+            serde_json::json!({"supported_reasoning_levels": ["low", "high"]}),
+            serde_json::json!({"thinking": {"levels": ["off", "medium", "xhigh"]}}),
+            serde_json::json!({"capabilities": {"effort_tiers": ["low", "medium", "high"]}}),
+        ] {
+            assert!(normalize_reasoning_capability(&metadata).is_some());
+        }
+
+        let thinking = normalize_reasoning_capability(
+            &serde_json::json!({"thinking": {"levels": ["off", "medium", "xhigh"]}}),
+        )
+        .unwrap();
+        assert!(thinking.can_disable);
+        assert!(thinking_map_for_reasoning(&thinking).is_none());
+    }
+
+    #[test]
+    fn provider_declared_shape_wins_and_unknown_levels_are_not_invented() {
+        let metadata = serde_json::json!({
+            "supportedThinkingEfforts": ["low", "vendor_ultra"],
+            "reasoning": {"supported_efforts": ["high"]}
+        });
+        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        assert_eq!(capability.levels, vec!["low".to_string()]);
+        assert_eq!(capability.upstream_format, "openai_effort");
+    }
+
+    #[test]
+    fn accepts_plugin_normalized_reasoning_capability() {
+        let metadata = serde_json::json!({
+            "reasoning": {
+                "mode": "adaptive",
+                "levels": ["low", "high", "max"],
+                "can_disable": false,
+                "upstream_format": "anthropic_effort"
+            }
+        });
+        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        assert_eq!(capability.mode, crate::types::ThinkingMode::Adaptive);
+        assert_eq!(capability.upstream_format, "anthropic_effort");
+        assert!(thinking_map_for_reasoning(&capability).is_none());
     }
 }

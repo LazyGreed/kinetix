@@ -367,6 +367,7 @@ export default function App() {
           budget_field: model.thinkingMap.budgetField || null,
           level_field: model.thinkingMap.levelField || null,
         },
+        discovery: model.discovery || {},
       }),
     );
 

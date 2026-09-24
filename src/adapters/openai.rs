@@ -708,6 +708,113 @@ mod tests {
     }
 
     #[test]
+    fn discovered_reasoning_aliases_emit_provider_tokens_through_build_body() {
+        let metadata = serde_json::json!({
+            "supportedThinkingEfforts": ["none", "low", "extra_high"]
+        });
+        let capability = crate::adapters::normalize_reasoning_capability(&metadata).unwrap();
+        let map = crate::adapters::thinking_map_for_reasoning(&capability).unwrap();
+
+        assert_eq!(map.levels.get("off"), Some(&serde_json::json!("none")));
+        assert_eq!(
+            map.levels.get("xhigh"),
+            Some(&serde_json::json!("extra_high"))
+        );
+
+        let p = provider();
+        let mut m = model();
+        m.thinking_map = serde_json::to_string(&map).unwrap();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let adapter = OpenAiAdapter;
+        let mut req = base_request();
+
+        for (level, expected) in [
+            (crate::types::ThinkingLevel::Off, "none"),
+            (crate::types::ThinkingLevel::XHigh, "extra_high"),
+        ] {
+            req.thinking = Some(level);
+            let body = adapter.build_body(&ctx, &req).unwrap();
+            assert_eq!(body["reasoning_effort"], expected);
+        }
+    }
+
+    #[test]
+    fn nested_discovery_efforts_do_not_emit_responses_field_on_chat_completions() {
+        let metadata = serde_json::json!({
+            "reasoning": {
+                "supported_efforts": ["minimal", "low", "high"]
+            }
+        });
+        let capability = crate::adapters::normalize_reasoning_capability(&metadata).unwrap();
+        assert!(crate::adapters::thinking_map_for_reasoning(&capability).is_none());
+
+        let p = provider();
+        let mut m = model();
+        m.thinking_map = serde_json::json!({"levels": {}}).to_string();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let adapter = OpenAiAdapter;
+        let mut req = base_request();
+        req.thinking = Some(crate::types::ThinkingLevel::High);
+
+        let body = adapter.build_body(&ctx, &req).unwrap();
+        assert!(body.pointer("/reasoning/effort").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn normalized_plugin_reasoning_emits_upstream_tokens_through_build_body() {
+        let metadata = serde_json::json!({
+            "reasoning": {
+                "mode": "level",
+                "levels": ["off", "xhigh"],
+                "upstream_format": "openai_effort",
+                "upstream_levels": {
+                    "xhigh": "extra_high"
+                }
+            }
+        });
+        let capability = crate::adapters::normalize_reasoning_capability(&metadata).unwrap();
+        let map = crate::adapters::thinking_map_for_reasoning(&capability).unwrap();
+
+        assert_eq!(map.levels.get("off"), Some(&serde_json::json!("none")));
+        assert_eq!(
+            map.levels.get("xhigh"),
+            Some(&serde_json::json!("extra_high"))
+        );
+
+        let p = provider();
+        let mut m = model();
+        m.thinking_map = serde_json::to_string(&map).unwrap();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let adapter = OpenAiAdapter;
+        let mut req = base_request();
+
+        for (level, expected) in [
+            (crate::types::ThinkingLevel::Off, "none"),
+            (crate::types::ThinkingLevel::XHigh, "extra_high"),
+        ] {
+            req.thinking = Some(level);
+            let body = adapter.build_body(&ctx, &req).unwrap();
+            assert_eq!(body["reasoning_effort"], expected);
+        }
+    }
+
+    #[test]
     fn wire_format_is_openai() {
         assert_eq!(OpenAiAdapter.wire_format(), "openai");
         let _ = AuthScheme::Bearer;

@@ -205,6 +205,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   };
 
   const handleImportDiscoveredModel = (m: DiscoveredModel) => {
+    const discoveredThinking = m.thinking_map;
     const newModel: ModelConfig = {
       id: '',
       providerId: activeProvider.id,
@@ -217,7 +218,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       capabilities: {
         text: true,
         vision: false,
-        reasoning: m.id.includes('pro') || m.id.includes('thinking'),
+        reasoning: !!m.capabilities?.reasoning || !!m.reasoning_capability,
         toolCalling: true,
         audio: false,
       },
@@ -229,7 +230,25 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         thinkingPer1M: 0,
       },
       parameters: {},
-      thinkingMap: { levels: {} },
+      thinkingMap: discoveredThinking
+        ? {
+            levels: { ...discoveredThinking.levels },
+            mode:
+              discoveredThinking.mode === 'manual_budget' ||
+              discoveredThinking.mode === 'level' ||
+              discoveredThinking.mode === 'adaptive'
+                ? discoveredThinking.mode
+                : undefined,
+            budgetField: discoveredThinking.budget_field || undefined,
+            levelField: discoveredThinking.level_field || undefined,
+          }
+        : { levels: {} },
+      discovery: {
+        capabilities: m.capabilities || {},
+        reasoning_capability: m.reasoning_capability || null,
+        thinking_map: m.thinking_map || null,
+        imported_from_discovery: true,
+      },
     };
 
     onAddModel(newModel);
@@ -822,6 +841,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         <span className="font-bold">{m.id}</span>
                         {m.context_window ? (
                           <span className="text-[var(--ink)]/50">{m.context_window.toLocaleString()} ctx</span>
+                        ) : null}
+                        {m.reasoning_capability ? (
+                          <span className="text-[var(--pen-blue)]">
+                            reasoning: {m.reasoning_capability.levels.join('/')}
+                          </span>
                         ) : null}
                         {m.already_imported ? (
                           <span className="text-[var(--pen-green)] font-bold">✓ imported</span>
@@ -1488,7 +1512,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                 </div>
 
                 {capReasoning && (
-                  <div className="space-y-3 bg-[var(--erased-soft)] p-3 border border-[var(--ink)] rounded">
+                  <details className="bg-[var(--erased-soft)] p-3 border border-[var(--ink)] rounded">
+                    <summary className="cursor-pointer text-sm font-heading font-bold text-[var(--ink)]">
+                      Advanced / Override reasoning mapping
+                    </summary>
+                    <div className="space-y-3 mt-3">
                     <div>
                       <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
                         Canonical Thinking Map
@@ -1561,7 +1589,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         </p>
                       </div>
                     )}
-                  </div>
+                    </div>
+                  </details>
                 )}
 
                 <div className="pt-2 flex justify-end gap-3">

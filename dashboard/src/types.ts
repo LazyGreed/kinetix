@@ -106,6 +106,7 @@ export interface ModelConfig {
     budgetField?: string;
     levelField?: string;
   };
+  discovery?: Record<string, unknown>;
 }
 
 export interface RouteTarget {
