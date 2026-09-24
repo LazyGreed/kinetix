@@ -615,7 +615,10 @@ mod reasoning_discovery_tests {
         });
         let capability = normalize_reasoning_capability(&metadata).unwrap();
         assert_eq!(capability.levels, vec!["low".to_string()]);
-        assert_eq!(capability.upstream_format, "openai_effort");
+        assert_eq!(
+            capability.upstream_format,
+            "provider_supported_thinking_efforts"
+        );
     }
 
     #[test]
