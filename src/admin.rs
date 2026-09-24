@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::adapters::{
-    normalize_reasoning_capability, reasoning_metadata_declared, thinking_map_for_reasoning,
-    UpstreamContext,
+    normalize_reasoning_capability, reasoning_metadata_declared,
+    thinking_map_for_reasoning_with_wire, UpstreamContext,
 };
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
@@ -1061,6 +1061,7 @@ fn discovered_observation(
     model: crate::adapters::DiscoveredModel,
     provider_metadata: Option<Value>,
     fallback_metadata: Option<Value>,
+    wire: WireFormat,
 ) -> DiscoveredObservation {
     let reasoning = match provider_metadata.as_ref() {
         Some(metadata) if reasoning_metadata_declared(metadata) => {
@@ -1070,7 +1071,9 @@ fn discovered_observation(
             .as_ref()
             .and_then(normalize_reasoning_capability),
     };
-    let thinking_map = reasoning.as_ref().and_then(thinking_map_for_reasoning);
+    let thinking_map = reasoning
+        .as_ref()
+        .and_then(|capability| thinking_map_for_reasoning_with_wire(capability, wire));
     DiscoveredObservation {
         model,
         reasoning,
@@ -1192,6 +1195,7 @@ pub async fn discover_models(
                         },
                         provider_metadata,
                         fallback_metadata,
+                        provider.wire(),
                     )
                 })
                 .collect()
@@ -1368,7 +1372,7 @@ async fn discover_models_native(
         .into_iter()
         .map(|model| {
             let provider_metadata = raw_discovery_metadata(&parsed, &model.id).cloned();
-            discovered_observation(model, provider_metadata, None)
+            discovered_observation(model, provider_metadata, None, provider.wire())
         })
         .collect())
 }
@@ -5779,6 +5783,7 @@ mod reasoning_discovery_control_plane_tests {
                     "upstream_format": "openai_effort"
                 }
             })),
+            WireFormat::Openai,
         );
 
         let reasoning = observation.reasoning.unwrap();
@@ -5786,11 +5791,31 @@ mod reasoning_discovery_control_plane_tests {
             reasoning.levels,
             vec!["low".to_string(), "medium".to_string()]
         );
-        assert_eq!(reasoning.upstream_format, "openai_effort");
+        assert_eq!(
+            reasoning.upstream_format,
+            "provider_supported_thinking_efforts"
+        );
         assert_eq!(
             observation.thinking_map.and_then(|map| map.level_field),
             Some("reasoning_effort".to_string())
         );
+    }
+
+    #[test]
+    fn generic_effort_metadata_is_not_executable_on_anthropic_transport() {
+        let observation = discovered_observation(
+            model("reasoner"),
+            Some(json!({"supportedThinkingEfforts": ["low", "high"]})),
+            None,
+            WireFormat::Anthropic,
+        );
+
+        let reasoning = observation.reasoning.unwrap();
+        assert_eq!(
+            reasoning.upstream_format,
+            "provider_supported_thinking_efforts"
+        );
+        assert!(observation.thinking_map.is_none());
     }
 
     #[test]
@@ -5809,6 +5834,7 @@ mod reasoning_discovery_control_plane_tests {
                         "upstream_format": "openai_effort"
                     }
                 })),
+                WireFormat::Openai,
             );
 
             assert!(observation.reasoning.is_none());
@@ -5829,6 +5855,7 @@ mod reasoning_discovery_control_plane_tests {
                     "upstream_format": "anthropic_effort"
                 }
             })),
+            WireFormat::Anthropic,
         );
 
         let reasoning = observation.reasoning.unwrap();
