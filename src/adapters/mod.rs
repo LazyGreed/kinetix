@@ -529,7 +529,7 @@ pub fn thinking_map_for_reasoning(
         "responses_effort" => return None,
         _ => return None,
     };
-    let levels = capability
+    let mut levels: std::collections::HashMap<String, serde_json::Value> = capability
         .levels
         .iter()
         .map(|level| {
@@ -541,6 +541,11 @@ pub fn thinking_map_for_reasoning(
             (level.clone(), serde_json::Value::String(upstream))
         })
         .collect();
+    if capability.can_disable && capability.upstream_format == "openai_effort" {
+        levels
+            .entry("off".to_string())
+            .or_insert_with(|| serde_json::Value::String("none".to_string()));
+    }
     Some(crate::types::ThinkingMap {
         levels,
         mode: Some(crate::types::ThinkingMode::Level),
@@ -571,7 +576,7 @@ pub fn thinking_map_for_reasoning_with_wire(
         _ => return None,
     };
 
-    let levels = capability
+    let mut levels: std::collections::HashMap<String, serde_json::Value> = capability
         .levels
         .iter()
         .map(|level| {
@@ -583,6 +588,11 @@ pub fn thinking_map_for_reasoning_with_wire(
             (level.clone(), serde_json::Value::String(upstream))
         })
         .collect();
+    if capability.can_disable && capability.upstream_format == "openai_effort" {
+        levels
+            .entry("off".to_string())
+            .or_insert_with(|| serde_json::Value::String("none".to_string()));
+    }
     Some(crate::types::ThinkingMap {
         levels,
         mode: Some(crate::types::ThinkingMode::Level),
