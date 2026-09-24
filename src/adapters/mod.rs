@@ -395,8 +395,8 @@ pub fn normalize_plugin_reasoning_capability_v1(
 /// reasoning capability. Versioned plugin capabilities_json uses the strict v1
 /// parser above. Unknown provider levels are discarded rather than invented.
 pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<ReasoningCapability> {
-    // Plugins may already return the normalized shape under
-    // capabilities_json.reasoning or reasoning_capability.
+    // Provider metadata may already expose a normalized-looking shape under
+    // reasoning or reasoning_capability.
     let normalized = metadata.get("reasoning_capability").or_else(|| {
         metadata.get("reasoning").filter(|value| {
             value.as_object().is_some_and(|reasoning| {
