@@ -125,6 +125,8 @@ pub struct ReasoningCapability {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<ReasoningCapabilityMode>,
     pub levels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
     pub can_disable: bool,
     pub upstream_format: String,
     #[serde(skip_serializing)]
@@ -175,6 +177,7 @@ fn reasoning_capability(
     Some(ReasoningCapability {
         mode: Some(mode),
         levels,
+        default: None,
         can_disable: can_disable.unwrap_or(inferred_disable),
         upstream_format: upstream_format.into(),
         upstream_levels,
@@ -205,6 +208,180 @@ pub fn reasoning_metadata_declared(metadata: &serde_json::Value) -> bool {
     ]
     .iter()
     .any(|pointer| metadata.pointer(pointer).is_some())
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelCapabilitiesV1 {
+    schema_version: u32,
+    transport: Option<TransportCapabilityV1>,
+    reasoning: Option<PluginReasoningCapabilityV1>,
+    #[serde(rename = "tools")]
+    _tools: Option<SupportCapabilityV1>,
+    #[serde(rename = "vision")]
+    _vision: Option<VisionCapabilityV1>,
+    #[serde(rename = "structured_output")]
+    _structured_output: Option<SupportCapabilityV1>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransportCapabilityV1 {
+    format: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupportCapabilityV1 {
+    #[serde(rename = "supported")]
+    _supported: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VisionCapabilityV1 {
+    #[serde(rename = "input")]
+    _input: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PluginReasoningModeV1 {
+    Toggle,
+    Level,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+enum PluginReasoningLevelV1 {
+    #[serde(rename = "minimal")]
+    Minimal,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    #[serde(rename = "max")]
+    Max,
+}
+
+impl PluginReasoningLevelV1 {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginReasoningCapabilityV1 {
+    supported: bool,
+    mode: Option<PluginReasoningModeV1>,
+    levels: Option<Vec<PluginReasoningLevelV1>>,
+    default: Option<PluginReasoningLevelV1>,
+    can_disable: Option<bool>,
+}
+
+impl PluginReasoningCapabilityV1 {
+    fn is_valid(&self) -> bool {
+        if !self.supported {
+            return self.mode.is_none()
+                && self.levels.is_none()
+                && self.default.is_none()
+                && self.can_disable.is_none();
+        }
+
+        match self.mode {
+            None => self.levels.is_none() && self.default.is_none(),
+            Some(PluginReasoningModeV1::Toggle) => {
+                self.levels.is_none() && self.default.is_none()
+            }
+            Some(PluginReasoningModeV1::Level) => {
+                let Some(levels) = self.levels.as_ref() else {
+                    return false;
+                };
+                if levels.is_empty() {
+                    return false;
+                }
+                let unique: std::collections::HashSet<_> = levels.iter().copied().collect();
+                if unique.len() != levels.len() {
+                    return false;
+                }
+                self.default.is_none_or(|default| levels.contains(&default))
+            }
+        }
+    }
+}
+
+impl ModelCapabilitiesV1 {
+    fn is_valid(&self) -> bool {
+        if self.schema_version != 1 {
+            return false;
+        }
+        if self
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.format.trim().is_empty())
+        {
+            return false;
+        }
+        self.reasoning
+            .as_ref()
+            .is_none_or(PluginReasoningCapabilityV1::is_valid)
+    }
+}
+
+pub fn normalize_plugin_reasoning_capability_v1(
+    metadata: &serde_json::Value,
+) -> Option<ReasoningCapability> {
+    let metadata: ModelCapabilitiesV1 = serde_json::from_value(metadata.clone()).ok()?;
+    if !metadata.is_valid() {
+        return None;
+    }
+
+    let reasoning = metadata.reasoning?;
+    if !reasoning.supported {
+        return None;
+    }
+
+    let mode = match reasoning.mode {
+        None => None,
+        Some(PluginReasoningModeV1::Toggle) => Some(ReasoningCapabilityMode::Toggle),
+        Some(PluginReasoningModeV1::Level) => Some(ReasoningCapabilityMode::Level),
+    };
+    let levels: Vec<String> = reasoning
+        .levels
+        .unwrap_or_default()
+        .into_iter()
+        .map(|level| level.as_str().to_string())
+        .collect();
+    let default = reasoning.default.map(|level| level.as_str().to_string());
+    let upstream_format = match metadata.transport.as_ref().map(|transport| transport.format.as_str()) {
+        Some("openai") => "openai_effort",
+        Some("openai-responses") => "responses_effort",
+        _ => "provider_declared",
+    };
+    let upstream_levels = levels
+        .iter()
+        .map(|level| (level.clone(), level.clone()))
+        .collect();
+
+    Some(ReasoningCapability {
+        mode,
+        levels,
+        default,
+        can_disable: reasoning.can_disable.unwrap_or(false),
+        upstream_format: upstream_format.to_string(),
+        upstream_levels,
+    })
 }
 
 /// Normalize provider/plugin discovery metadata into Kinetix's canonical
@@ -279,10 +456,16 @@ pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<Re
             }
         }
 
+        let default = value
+            .get("default")
+            .and_then(serde_json::Value::as_str)
+            .filter(|default| levels.iter().any(|level| level == default))
+            .map(ToString::to_string);
         let inferred_disable = levels.iter().any(|level| level == "off");
         return Some(ReasoningCapability {
             mode,
             levels,
+            default,
             can_disable: value
                 .get("can_disable")
                 .and_then(serde_json::Value::as_bool)
