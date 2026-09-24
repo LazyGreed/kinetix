@@ -5968,7 +5968,7 @@ mod reasoning_discovery_control_plane_tests {
                     "can_disable": false
                 }
             })),
-            WireFormat::Plugin,
+            WireFormat::Openai,
         );
 
         let reasoning = observation.reasoning.unwrap();
@@ -5981,6 +5981,31 @@ mod reasoning_discovery_control_plane_tests {
             observation.thinking_map.and_then(|map| map.level_field),
             Some("reasoning_effort".to_string())
         );
+    }
+
+    #[test]
+    fn responses_transport_stays_descriptive_on_openai_chat_dispatch() {
+        let observation = discovered_observation(
+            model("reasoner"),
+            Some(json!({"id": "reasoner", "owned_by": "example"})),
+            Some(json!({
+                "schema_version": 1,
+                "transport": {"format": "openai-responses"},
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["low", "high"],
+                    "default": "high",
+                    "can_disable": false
+                }
+            })),
+            WireFormat::Openai,
+        );
+
+        let reasoning = observation.reasoning.unwrap();
+        assert_eq!(reasoning.upstream_format, "responses_effort");
+        assert_eq!(reasoning.default.as_deref(), Some("high"));
+        assert!(observation.thinking_map.is_none());
     }
 
     #[test]
