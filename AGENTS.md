@@ -23,7 +23,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
     - `anthropic.rs`: Anthropic wire format.
     - `gemini.rs`: Google Gemini REST API wire format (`generateContent` & `streamGenerateContent`).
   - Ingests streaming chunks from upstreams and normalizes them into downstream SSE events and token accounting metrics.
-  - Gemini tool declarations use `parametersJsonSchema` with an explicit supported-key allowlist; supported JSON Schema constraints are preserved, while unsupported validation keywords fail closed before dispatch instead of being silently weakened.
+  - Gemini tool declarations use `parametersJsonSchema` with an explicit supported-key allowlist; supported constraints are preserved, a curated set of Gemini-rejected validation-only keywords is stripped recursively for compatibility, and unknown schema keywords still fail closed before dispatch.
 - **Control Plane & Storage (`src/db.rs`, `migrations/`, `src/admin.rs`)**:
   - SQLite database running with WAL mode (`PRAGMA journal_mode=WAL`) managed via SQLx migrations.
   - Persists providers, accounts, models, routes, virtual keys, request logs, token usage, cost accounting, and plugin state.
