@@ -127,6 +127,10 @@ export function mapModel(j: any): ModelConfig {
           ? thinkingMap.level_field
           : undefined,
     },
+    discovery:
+      j.discovery && typeof j.discovery === 'object' && !Array.isArray(j.discovery)
+        ? { ...j.discovery }
+        : {},
   };
 }
 

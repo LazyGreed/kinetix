@@ -24,18 +24,53 @@ use crate::types::{
     FailureKind, ImageData, InternalRequest, Part, ProxyError, StreamEvent, UpstreamFailure,
 };
 
+/// Register every provider adapter declared by one enabled plugin. This is the
+/// single production/E2E registration path so manifest capability flags cannot
+/// drift from runtime adapter behavior.
+pub async fn register_declared_adapters(
+    registry: &crate::adapters::AdapterRegistry,
+    manager: PluginManager,
+    plugin_id: &str,
+    provides: &crate::plugins::types::Provides,
+) -> anyhow::Result<()> {
+    if provides.provider_adapters.is_empty() {
+        return Ok(());
+    }
+
+    let adapter: Arc<dyn Adapter> = Arc::new(
+        PluginAdapter::new(
+            manager,
+            plugin_id.to_string(),
+            provides.thinking_translation,
+        )
+        .await?,
+    );
+    for name in &provides.provider_adapters {
+        registry.register_plugin(format!("plugin:{plugin_id}/{name}"), adapter.clone());
+    }
+    registry.register_plugin(plugin_id.to_string(), adapter);
+    Ok(())
+}
+
 /// A plugin-backed adapter bound to one `plugin:<id>/<capability>` reference.
 pub struct PluginAdapter {
     manager: PluginManager,
     plugin_id: String,
     /// The wire-format name the guest reported (cached at construction).
     wire_format: &'static str,
+    /// Explicit manifest opt-in: the guest consumes canonical thinking levels
+    /// and is responsible for translating or rejecting them.
+    thinking_translation: bool,
 }
 
 impl PluginAdapter {
     /// Probe the plugin's adapter world for its wire-format name, returning an
     /// error (so registration can fail closed) if the guest cannot answer.
-    pub async fn new(manager: PluginManager, plugin_id: String) -> anyhow::Result<Self> {
+    pub async fn new(
+        manager: PluginManager,
+        plugin_id: String,
+        thinking_translation: bool,
+    ) -> anyhow::Result<Self> {
         let wf = manager
             .adapter_wire_format(&plugin_id)
             .await
@@ -45,6 +80,7 @@ impl PluginAdapter {
             manager,
             plugin_id,
             wire_format,
+            thinking_translation,
         })
     }
 
@@ -128,6 +164,10 @@ impl PluginAdapter {
 impl Adapter for PluginAdapter {
     fn wire_format(&self) -> &'static str {
         self.wire_format
+    }
+
+    fn handles_thinking_translation(&self) -> bool {
+        self.thinking_translation
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {

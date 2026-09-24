@@ -27,11 +27,29 @@ export interface CreateKeyInput {
   monthly_budget?: number | null;
 }
 
+export interface DiscoveredReasoningCapability {
+  mode?: 'toggle' | 'manual_budget' | 'level' | 'adaptive' | null;
+  levels: string[];
+  default?: string | null;
+  can_disable: boolean;
+  upstream_format: string;
+}
+
+export interface DiscoveredThinkingMap {
+  levels: Record<string, unknown>;
+  mode?: 'manual_budget' | 'level' | 'adaptive' | null;
+  budget_field?: string | null;
+  level_field?: string | null;
+}
+
 export interface DiscoveredModel {
   id: string;
   display_name?: string | null;
   context_window?: number | null;
   max_output_tokens?: number | null;
+  capabilities?: { reasoning?: boolean | null } | null;
+  reasoning_capability?: DiscoveredReasoningCapability | null;
+  thinking_map?: DiscoveredThinkingMap | null;
   already_imported: boolean;
 }
 

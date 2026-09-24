@@ -12,9 +12,15 @@
 
 use std::sync::Arc;
 
+use kinetix::adapters::{AdapterRegistry, UpstreamContext};
 use kinetix::crypto::Crypto;
 use kinetix::db::{self, Pool};
-use kinetix::plugins::{Capability, HostPolicy, PluginManager};
+use kinetix::plugins::{
+    adapter::register_declared_adapters, Capability, HostPolicy, PluginManager,
+};
+use kinetix::types::{
+    InternalRequest, Message, Part, Role, SamplingParams, ThinkingLevel, WireFormat,
+};
 
 /// Path to an externally built `.kxp` used for host/guest conformance.
 fn package_path() -> Option<std::path::PathBuf> {
@@ -230,7 +236,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
     assert!(headers.contains("Bearer tok123"), "got {headers}");
     assert!(headers.contains("antigravity/ide/"));
 
-    let request = r#"{"requested_model":"gemini-3-flash","system":["be nice"],"messages":[{"role":"user","parts":[{"type":"text","text":"hi"}]}],"tools":[{"name":"my-tool!","description":"d","parameters":{"type":"object"}}],"stream":true}"#;
+    let request = r#"{"requested_model":"gemini-3-flash","system":["be nice"],"messages":[{"role":"user","parts":[{"type":"text","text":"hi"}]}],"tools":[{"name":"my-tool!","description":"d","parameters":{"type":"object"}}],"thinking":{"level":"high"},"stream":true}"#;
     let body = m
         .adapter_build_body(id, request, provider, model)
         .await
@@ -248,6 +254,103 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
     assert_eq!(
         v["request"]["tools"][0]["functionDeclarations"][0]["name"],
         "my-tool_"
+    );
+    assert_eq!(
+        v["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "high"
+    );
+
+    // The actual installed manifest drives the exact production adapter
+    // registration path. Missing the Antigravity opt-in must fail this before
+    // any request reaches the guest.
+    let row = m.get(id).await.unwrap().unwrap();
+    let manifest = row.manifest().expect("installed manifest should parse");
+    assert!(
+        manifest.provides.thinking_translation,
+        "Antigravity must explicitly opt in to canonical thinking translation"
+    );
+    let registry = AdapterRegistry::new();
+    register_declared_adapters(&registry, m.clone(), id, &manifest.provides)
+        .await
+        .expect("real Antigravity adapter should register");
+    let provider_row = db::ProviderRow {
+        id: "provider_antigravity".into(),
+        name: "Antigravity".into(),
+        base_url: "https://daily-cloudcode-pa.googleapis.com".into(),
+        wire_format: "plugin".into(),
+        auth_scheme: "bearer".into(),
+        custom_header_name: None,
+        custom_param_name: None,
+        extra_headers: serde_json::json!({
+            "x-antigravity-project": "test-project"
+        })
+        .to_string(),
+        timeout_ms: 120_000,
+        capability_mode: "permissive".into(),
+        models_path: None,
+        rate_limit_rules: "{}".into(),
+        enabled: 1,
+        follow_redirects: 0,
+        credential_hosts: String::new(),
+        allow_insecure_tls: 0,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        wire_plugin: format!("plugin:{id}/antigravity"),
+        credential_plugin: String::new(),
+        model_source_plugin: String::new(),
+    };
+    assert_eq!(provider_row.wire(), WireFormat::Plugin);
+    let registered = registry.for_provider(&provider_row);
+    assert!(
+        registered.handles_thinking_translation(),
+        "manifest opt-in must survive real adapter registration"
+    );
+
+    let model_row = db::ModelRow {
+        id: "model_antigravity".into(),
+        provider_id: provider_row.id.clone(),
+        upstream_id: "gemini-3-flash".into(),
+        display_name: "Gemini 3 Flash".into(),
+        enabled: 1,
+        context_window: None,
+        max_output_tokens: None,
+        capabilities: "{}".into(),
+        prices: "{}".into(),
+        parameters: "{}".into(),
+        thinking_map: "{}".into(),
+        extra_request: "{}".into(),
+        discovery: "{}".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        opaque_state_plugin: String::new(),
+    };
+    let canonical = InternalRequest {
+        requested_model: "gemini-3-flash".into(),
+        system: vec![],
+        messages: vec![Message {
+            role: Role::User,
+            parts: vec![Part::Text("hi".into())],
+        }],
+        tools: vec![],
+        tool_choice: None,
+        tool_choice_name: None,
+        params: SamplingParams::default(),
+        stream: true,
+        include_usage: false,
+        thinking: Some(ThinkingLevel::High),
+        extra: Default::default(),
+        raw_body: None,
+    };
+    let ctx = UpstreamContext {
+        provider: &provider_row,
+        model: &model_row,
+        account_id: Some("account_test"),
+        credential: "tok123".into(),
+    };
+    let registered_body = registered
+        .build_body(&ctx, &canonical)
+        .expect("registered Antigravity adapter should translate canonical thinking");
+    assert_eq!(
+        registered_body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "high"
     );
 
     // A real Antigravity SSE chunk parses to canonical events.

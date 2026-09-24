@@ -305,6 +305,10 @@ pub struct Provides {
     pub account_model_sources: Vec<String>,
     #[serde(default)]
     pub provider_adapters: Vec<String>,
+    /// Provider adapter accepts canonical `thinking.level` and owns its
+    /// translation/rejection. False by default for API-v1 compatibility.
+    #[serde(default)]
+    pub thinking_translation: bool,
     #[serde(default)]
     pub routing_facts: Vec<String>,
     #[serde(default)]

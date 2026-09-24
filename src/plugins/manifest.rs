@@ -92,6 +92,9 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
     for p in &provided {
         validate_capability_name(p.capability, &p.name)?;
     }
+    if manifest.provides.thinking_translation && manifest.provides.provider_adapters.is_empty() {
+        bail!("provides.thinking_translation requires at least one provider_adapter");
+    }
     // Hooks are not addressable by name in the same way; require at least a
     // recognizable hook name when hooks are declared.
     for h in &manifest.provides.hooks {
@@ -640,6 +643,29 @@ storage = "2MiB"
         // 128MiB request is clamped to the 64MiB host policy.
         assert_eq!(v.effective.memory, 64 * 1024 * 1024);
         assert_eq!(v.effective.storage, 2 * 1024 * 1024);
+        assert!(!v.manifest.provides.thinking_translation);
+    }
+
+    #[test]
+    fn thinking_translation_is_explicit_and_requires_provider_adapter() {
+        let opted_in = GOOD.replace(
+            "model_sources = [\"foo-models\"]",
+            "model_sources = [\"foo-models\"]\nprovider_adapters = [\"foo-adapter\"]\nthinking_translation = true",
+        );
+        let validated = parse_and_validate(&opted_in, HostPolicy::default()).unwrap();
+        assert!(validated.manifest.provides.thinking_translation);
+
+        let invalid = GOOD.replace(
+            "model_sources = [\"foo-models\"]",
+            "model_sources = [\"foo-models\"]\nthinking_translation = true",
+        );
+        let error = parse_and_validate(&invalid, HostPolicy::default()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("thinking_translation requires at least one provider_adapter"),
+            "{error}"
+        );
     }
 
     #[test]
