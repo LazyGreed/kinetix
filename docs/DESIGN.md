@@ -871,10 +871,14 @@ decisions and the evidence behind them are recorded under **Resolved issues** be
 - **Default non-portable-state policy:** `strip_with_warning` is the default (recorded in the Route
   Trace and surfaced via `X-Kinetix-Warning`); `reject` is available per Route. Silent stripping is
   forbidden in both.
-- **Canonical thinking-level scale:** fixed Kinetix enum `off | low | medium | high`, mapped per model
-  via `thinking_map` (with a `budget_field` for numeric-budget providers); exact inbound fields
-  (OpenAI `reasoning_effort`, Anthropic `thinking.budget_tokens`) are decoded and Gemini's thought
-  signatures are preserved as opaque state.
+- **Canonical thinking-level scale:** Kinetix models `off | minimal | low | medium | high | xhigh | max`,
+  plus an internal `default` state that preserves omitted adaptive effort without inventing a
+  model-specific level. Explicit levels execute only when present in each model's `thinking_map`;
+  `off` is also model-explicit because some always-on reasoning models cannot disable thinking.
+  Manual-budget models use `budget_field`; categorical level/effort models and adaptive models use
+  `level_field`, with adaptive mode reserved for providers that require an adaptive-thinking envelope.
+  OpenAI `reasoning_effort`, Anthropic manual budgets, and Anthropic adaptive `output_config.effort`
+  decode into the same canonical scale; Gemini thought signatures remain preserved as opaque state.
 - **Model-discovery response mapping:** wire-format default `models_path` plus an admin override, with
   per-model discovery observations that never overwrite admin edits; Gemini implemented first, then
   OpenAI-compatible.

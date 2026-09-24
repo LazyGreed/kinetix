@@ -102,7 +102,9 @@ export interface ModelConfig {
   };
   thinkingMap: {
     levels: Record<string, unknown>;
+    mode?: 'manual_budget' | 'level' | 'adaptive';
     budgetField?: string;
+    levelField?: string;
   };
 }
 

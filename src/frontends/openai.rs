@@ -299,9 +299,12 @@ fn inspect_openai_content(
 fn map_reasoning_effort(s: &str) -> Option<ThinkingLevel> {
     match s {
         "none" | "off" => Some(ThinkingLevel::Off),
-        "minimal" | "low" => Some(ThinkingLevel::Low),
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "low" => Some(ThinkingLevel::Low),
         "medium" => Some(ThinkingLevel::Medium),
         "high" => Some(ThinkingLevel::High),
+        "xhigh" => Some(ThinkingLevel::XHigh),
+        "max" => Some(ThinkingLevel::Max),
         _ => None,
     }
 }

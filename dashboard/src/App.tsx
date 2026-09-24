@@ -363,7 +363,9 @@ export default function App() {
         parameters: model.parameters,
         thinking_map: {
           levels: model.thinkingMap.levels,
+          mode: model.thinkingMap.mode || null,
           budget_field: model.thinkingMap.budgetField || null,
+          level_field: model.thinkingMap.levelField || null,
         },
       }),
     );
@@ -395,7 +397,9 @@ export default function App() {
         parameters: model.parameters,
         thinking_map: {
           levels: model.thinkingMap.levels,
+          mode: model.thinkingMap.mode || null,
           budget_field: model.thinkingMap.budgetField || null,
+          level_field: model.thinkingMap.levelField || null,
         },
       }),
     );
