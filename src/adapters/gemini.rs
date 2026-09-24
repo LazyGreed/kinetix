@@ -404,9 +404,8 @@ fn add_nullable_type(
 /// - OpenAPI `nullable` -> JSON Schema null type
 /// - lossless object-style `allOf` merges
 ///
-/// Known Gemini-unsupported validation-only keywords are dropped recursively so
-/// clients with richer JSON Schema dialects remain usable. Unknown keywords still
-/// fail closed instead of being forwarded to Google.
+/// Documented-supported validation keywords are preserved. Unknown validation
+/// keywords fail closed instead of being forwarded to Google or silently discarded.
 fn sanitize_schema(schema: &Value, root_path: &str) -> Result<Value, UpstreamFailure> {
     sanitize_schema_node(schema, root_path)
 }
@@ -531,12 +530,9 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
 
             "$id" | "$anchor" | "type" | "format" | "title" | "description" | "enum"
             | "minLength" | "maxLength" | "minItems" | "maxItems" | "minimum" | "maximum"
-            | "required" | "propertyOrdering" => {
+            | "pattern" | "minProperties" | "maxProperties" | "required" | "propertyOrdering" => {
                 out.insert(key.clone(), value.clone());
             }
-
-            "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf" | "propertyNames"
-            | "pattern" | "uniqueItems" | "minProperties" | "maxProperties" => {}
 
             other => {
                 return Err(schema_error(
@@ -1292,7 +1288,7 @@ mod schema_tests {
     }
 
     #[test]
-    fn sanitize_schema_strips_known_unsupported_validation_keywords_recursively() {
+    fn sanitize_schema_preserves_documented_validation_keywords() {
         let input = json!({
             "type": "object",
             "properties": {
@@ -1301,21 +1297,10 @@ mod schema_tests {
                     "pattern": "^[A-Za-z0-9_-]+$",
                     "minLength": 1
                 },
-                "values": {
-                    "type": "array",
-                    "uniqueItems": true,
-                    "items": {
-                        "type": "number",
-                        "exclusiveMinimum": 0,
-                        "exclusiveMaximum": 10,
-                        "multipleOf": 0.5
-                    }
-                },
                 "labels": {
                     "type": "object",
                     "minProperties": 1,
                     "maxProperties": 4,
-                    "propertyNames": {"pattern": "^[a-z]+$"},
                     "additionalProperties": {"type": "string"}
                 }
             },
@@ -1323,31 +1308,56 @@ mod schema_tests {
         });
         let got = sanitize_schema(&input, "tool 'SubagentWorkflow'").unwrap();
 
-        for pointer in [
-            "/properties/resumeFromRunId/pattern",
-            "/properties/values/uniqueItems",
-            "/properties/values/items/exclusiveMinimum",
-            "/properties/values/items/exclusiveMaximum",
-            "/properties/values/items/multipleOf",
-            "/properties/labels/minProperties",
-            "/properties/labels/maxProperties",
-            "/properties/labels/propertyNames",
-        ] {
-            assert!(
-                got.pointer(pointer).is_none(),
-                "expected {pointer} to be stripped: {got}"
-            );
-        }
-
+        assert_eq!(
+            got.pointer("/properties/resumeFromRunId/pattern"),
+            Some(&json!("^[A-Za-z0-9_-]+$"))
+        );
         assert_eq!(
             got.pointer("/properties/resumeFromRunId/minLength"),
             Some(&json!(1))
+        );
+        assert_eq!(
+            got.pointer("/properties/labels/minProperties"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            got.pointer("/properties/labels/maxProperties"),
+            Some(&json!(4))
         );
         assert_eq!(
             got.pointer("/properties/labels/additionalProperties/type"),
             Some(&json!("string"))
         );
         assert_eq!(got["required"], json!(["resumeFromRunId"]));
+    }
+
+    #[test]
+    fn sanitize_schema_rejects_unverified_validation_keywords() {
+        for (keyword, value) in [
+            ("exclusiveMinimum", json!(0)),
+            ("exclusiveMaximum", json!(10)),
+            ("multipleOf", json!(0.5)),
+            ("propertyNames", json!({"pattern":"^[a-z]+$"})),
+            ("uniqueItems", json!(true)),
+        ] {
+            let mut value_schema = json!({ "type": "string" });
+            value_schema
+                .as_object_mut()
+                .unwrap()
+                .insert(keyword.to_string(), value);
+            let input = json!({
+                "type": "object",
+                "properties": { "value": value_schema }
+            });
+            let err = sanitize_schema(&input, "tool 'agent'").unwrap_err();
+
+            assert_eq!(err.kind, FailureKind::BadRequest);
+            assert!(
+                err.message.contains(keyword),
+                "expected {keyword} in: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
@@ -1368,7 +1378,7 @@ mod schema_tests {
     }
 
     #[test]
-    fn build_tools_strips_subagent_workflow_pattern() {
+    fn build_tools_preserves_subagent_workflow_pattern() {
         let req = InternalRequest {
             requested_model: "gemini".into(),
             system: vec![],
@@ -1400,9 +1410,10 @@ mod schema_tests {
         let tools = GeminiAdapter::build_tools(&req).unwrap().unwrap();
         let schema = &tools[0]["functionDeclarations"][0]["parametersJsonSchema"];
 
-        assert!(schema
-            .pointer("/properties/resumeFromRunId/pattern")
-            .is_none());
+        assert_eq!(
+            schema.pointer("/properties/resumeFromRunId/pattern"),
+            Some(&json!("^[A-Za-z0-9_-]+$"))
+        );
         assert_eq!(
             schema.pointer("/properties/resumeFromRunId/description"),
             Some(&json!("run id"))
