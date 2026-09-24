@@ -30,6 +30,7 @@ export interface CreateKeyInput {
 export interface DiscoveredReasoningCapability {
   mode?: 'toggle' | 'manual_budget' | 'level' | 'adaptive' | null;
   levels: string[];
+  default?: string | null;
   can_disable: boolean;
   upstream_format: string;
 }
