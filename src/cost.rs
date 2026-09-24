@@ -32,10 +32,18 @@ pub fn compute_cost(prices: &Prices, usage: &TokenUsage) -> Option<f64> {
     let thinking = (usage.thinking.unwrap_or(0) as f64).min(output);
     let regular_output = output - thinking;
 
-    let input_price = prices.input_per_1m.unwrap_or(0.0);
+    let input_price = match prices.input_per_1m {
+        Some(price) => price,
+        None if input == 0.0 => 0.0,
+        None => return None,
+    };
     let cached_price = prices.cached_per_1m.unwrap_or(input_price);
     let cache_write_price = prices.cache_write_per_1m.unwrap_or(input_price);
-    let output_price = prices.output_per_1m.unwrap_or(0.0);
+    let output_price = match prices.output_per_1m {
+        Some(price) => price,
+        None if output == 0.0 => 0.0,
+        None => return None,
+    };
     let thinking_price = prices.thinking_per_1m.unwrap_or(output_price);
 
     let cost = (regular_input * input_price
@@ -55,6 +63,36 @@ mod tests {
     #[test]
     fn unknown_when_unpriced() {
         let p = Prices::default();
+        let u = TokenUsage {
+            input: Some(100),
+            output: Some(50),
+            ..Default::default()
+        };
+        assert!(compute_cost(&p, &u).is_none());
+    }
+
+    #[test]
+    fn input_known_output_unknown_is_unknown_when_output_is_consumed() {
+        let p = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: None,
+            ..Default::default()
+        };
+        let u = TokenUsage {
+            input: Some(100),
+            output: Some(50),
+            ..Default::default()
+        };
+        assert!(compute_cost(&p, &u).is_none());
+    }
+
+    #[test]
+    fn output_known_input_unknown_is_unknown_when_input_is_consumed() {
+        let p = Prices {
+            input_per_1m: None,
+            output_per_1m: Some(2.0),
+            ..Default::default()
+        };
         let u = TokenUsage {
             input: Some(100),
             output: Some(50),

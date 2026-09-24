@@ -142,6 +142,7 @@ pub struct ReasoningCapability {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelCapabilityFlags {
+    pub text: Option<bool>,
     pub reasoning: Option<bool>,
     pub vision: Option<bool>,
     pub tool_calling: Option<bool>,
@@ -236,10 +237,16 @@ pub fn reasoning_metadata_declared(metadata: &serde_json::Value) -> bool {
 struct ModelCapabilitiesV1 {
     schema_version: u32,
     transport: Option<TransportCapabilityV1>,
+    text: Option<SupportCapabilityV1>,
     reasoning: Option<PluginReasoningCapabilityV1>,
     tools: Option<SupportCapabilityV1>,
     vision: Option<VisionCapabilityV1>,
     structured_output: Option<SupportCapabilityV1>,
+    /// Canonical plugin-supplied pricing. Kept in the existing v1 JSON
+    /// envelope so old WIT components remain ABI-compatible.
+    prices: Option<serde_json::Value>,
+    /// Optional directional modality metadata from plugin discovery.
+    modalities: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -364,6 +371,7 @@ fn parse_model_capabilities_v1(metadata: &serde_json::Value) -> Option<ModelCapa
 pub fn plugin_capability_flags_v1(metadata: &serde_json::Value) -> Option<ModelCapabilityFlags> {
     let metadata = parse_model_capabilities_v1(metadata)?;
     Some(ModelCapabilityFlags {
+        text: metadata.text.as_ref().map(|text| text.supported),
         reasoning: metadata
             .reasoning
             .as_ref()

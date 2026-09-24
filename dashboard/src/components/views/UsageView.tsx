@@ -52,6 +52,9 @@ interface UsageViewProps {
   onRefreshExports?: () => Promise<void> | void;
 }
 
+const formatPrice = (value: number | null, digits: number): string =>
+  value == null ? '—' : `${value.toFixed(digits)}`;
+
 export const UsageView: React.FC<UsageViewProps> = ({
   keys,
   models,
@@ -380,12 +383,12 @@ export const UsageView: React.FC<UsageViewProps> = ({
               {models.map((m) => (
                 <tr key={m.id}>
                   <td className="p-2 font-bold">{m.displayName}</td>
-                  <td className="p-2">${m.prices.inputPer1M.toFixed(2)}</td>
-                  <td className="p-2">${m.prices.outputPer1M.toFixed(2)}</td>
-                  <td className="p-2">${m.prices.cachedPer1M.toFixed(4)}</td>
-                  <td className="p-2">${m.prices.cacheWritePer1M.toFixed(4)}</td>
+                  <td className="p-2">{formatPrice(m.prices.inputPer1M, 2)}</td>
+                  <td className="p-2">{formatPrice(m.prices.outputPer1M, 2)}</td>
+                  <td className="p-2">{formatPrice(m.prices.cachedPer1M, 4)}</td>
+                  <td className="p-2">{formatPrice(m.prices.cacheWritePer1M, 4)}</td>
                   <td className="p-2">
-                    {m.capabilities.reasoning ? `$${m.prices.thinkingPer1M.toFixed(2)}` : '—'}
+                    {m.capabilities.reasoning ? formatPrice(m.prices.thinkingPer1M, 2) : '—'}
                   </td>
                 </tr>
               ))}

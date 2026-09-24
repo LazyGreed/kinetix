@@ -106,11 +106,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [modelDisplayName, setModelDisplayName] = useState('');
   const [modelContextWindow, setModelContextWindow] = useState(DEFAULT_CONTEXT_WINDOW);
   const [modelMaxOutput, setModelMaxOutput] = useState(DEFAULT_MAX_OUTPUT);
-  const [modelInputPrice, setModelInputPrice] = useState(1.0);
-  const [modelOutputPrice, setModelOutputPrice] = useState(4.0);
-  const [modelCachedPrice, setModelCachedPrice] = useState(0);
-  const [modelCacheWritePrice, setModelCacheWritePrice] = useState(0);
-  const [modelThinkingPrice, setModelThinkingPrice] = useState(0);
+  const [modelInputPrice, setModelInputPrice] = useState<number | null>(1.0);
+  const [modelOutputPrice, setModelOutputPrice] = useState<number | null>(4.0);
+  const [modelCachedPrice, setModelCachedPrice] = useState<number | null>(0);
+  const [modelCacheWritePrice, setModelCacheWritePrice] = useState<number | null>(0);
+  const [modelThinkingPrice, setModelThinkingPrice] = useState<number | null>(0);
   const [capText, setCapText] = useState<boolean | undefined>(true);
   const [capVision, setCapVision] = useState<boolean | undefined>(true);
   const [capReasoning, setCapReasoning] = useState<boolean | undefined>(false);
@@ -205,6 +205,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
   const handleImportDiscoveredModel = (m: DiscoveredModel) => {
     const discoveredThinking = m.thinking_map;
+    const discoveredPrices = m.prices;
     const newModel: ModelConfig = {
       id: '',
       providerId: activeProvider.id,
@@ -215,6 +216,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       contextWindow: m.context_window ?? null,
       maxOutputTokens: m.max_output_tokens ?? null,
       capabilities: {
+        text: m.capabilities?.text ?? undefined,
         vision: m.capabilities?.vision ?? undefined,
         reasoning:
           m.capabilities?.reasoning ??
@@ -223,11 +225,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         structuredOutput: m.capabilities?.structured_output ?? undefined,
       },
       prices: {
-        inputPer1M: 0,
-        outputPer1M: 0,
-        cachedPer1M: 0,
-        cacheWritePer1M: 0,
-        thinkingPer1M: 0,
+        inputPer1M: discoveredPrices?.input_per_1m ?? null,
+        outputPer1M: discoveredPrices?.output_per_1m ?? null,
+        cachedPer1M: discoveredPrices?.cached_per_1m ?? null,
+        cacheWritePer1M: discoveredPrices?.cache_write_per_1m ?? null,
+        thinkingPer1M: discoveredPrices?.thinking_per_1m ?? null,
       },
       parameters: {},
       thinkingMap: discoveredThinking
@@ -248,6 +250,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         reasoning_capability: m.reasoning_capability || null,
         thinking_map: m.thinking_map || null,
         capability_sources: m.capability_sources || {},
+        modalities: m.modalities || null,
+        prices: m.prices || null,
+        price_sources: m.price_sources || {},
+        raw_metadata: m.raw_metadata ?? null,
+        raw_metadata_truncated: m.raw_metadata_truncated ?? false,
         catalog: m.catalog || null,
         imported_from_discovery: true,
       },
@@ -446,11 +453,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setModelDisplayName(m.displayName);
     setModelContextWindow(m.contextWindow ?? 0);
     setModelMaxOutput(m.maxOutputTokens ?? 0);
-    setModelInputPrice(m.prices.inputPer1M || 0);
-    setModelOutputPrice(m.prices.outputPer1M || 0);
-    setModelCachedPrice(m.prices.cachedPer1M || 0);
-    setModelCacheWritePrice(m.prices.cacheWritePer1M || 0);
-    setModelThinkingPrice(m.prices.thinkingPer1M || 0);
+    setModelInputPrice(m.prices.inputPer1M);
+    setModelOutputPrice(m.prices.outputPer1M);
+    setModelCachedPrice(m.prices.cachedPer1M);
+    setModelCacheWritePrice(m.prices.cacheWritePer1M);
+    setModelThinkingPrice(m.prices.thinkingPer1M);
     setCapText(m.capabilities.text);
     setCapVision(m.capabilities.vision);
     setCapReasoning(m.capabilities.reasoning);
@@ -502,6 +509,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setModelValidation(null);
   };
 
+  const normalizedPrice = (value: number | null): number | null =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+
   const handleCreateCustomModel = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!modelUpstreamId.trim()) return;
@@ -529,11 +539,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         structuredOutput: capStructuredOutput,
       },
       prices: {
-        inputPer1M: Number(modelInputPrice) || 0,
-        outputPer1M: Number(modelOutputPrice) || 0,
-        cachedPer1M: Number(modelCachedPrice) || 0,
-        cacheWritePer1M: Number(modelCacheWritePrice) || 0,
-        thinkingPer1M: Number(modelThinkingPrice) || 0,
+        inputPer1M: normalizedPrice(modelInputPrice),
+        outputPer1M: normalizedPrice(modelOutputPrice),
+        cachedPer1M: normalizedPrice(modelCachedPrice),
+        cacheWritePer1M: normalizedPrice(modelCacheWritePrice),
+        thinkingPer1M: normalizedPrice(modelThinkingPrice),
       },
       parameters: {},
       thinkingMap: currentThinkingMap(),
@@ -570,11 +580,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         structured_output: capStructuredOutput,
       },
       prices: {
-        input_per_1m: Number(modelInputPrice) || null,
-        output_per_1m: Number(modelOutputPrice) || null,
-        cached_per_1m: Number(modelCachedPrice) || null,
-        cache_write_per_1m: Number(modelCacheWritePrice) || null,
-        thinking_per_1m: Number(modelThinkingPrice) || null,
+        input_per_1m: normalizedPrice(modelInputPrice),
+        output_per_1m: normalizedPrice(modelOutputPrice),
+        cached_per_1m: normalizedPrice(modelCachedPrice),
+        cache_write_per_1m: normalizedPrice(modelCacheWritePrice),
+        thinking_per_1m: normalizedPrice(modelThinkingPrice),
       },
       thinking_map: {
         levels: thinkingMap.levels,
@@ -1017,12 +1027,12 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                             <strong className="font-heading text-sm text-[var(--ink)] block mb-1">
                               💵 Token Pricing (Admin Defined)
                             </strong>
-                            <div>Input: ${m.prices.inputPer1M} / 1M</div>
-                            <div>Output: ${m.prices.outputPer1M} / 1M</div>
-                            <div>Cache read: ${m.prices.cachedPer1M} / 1M</div>
-                            <div>Cache write: ${m.prices.cacheWritePer1M} / 1M</div>
+                            <div>Input: {m.prices.inputPer1M == null ? 'unknown' : `${m.prices.inputPer1M} / 1M`}</div>
+                            <div>Output: {m.prices.outputPer1M == null ? 'unknown' : `${m.prices.outputPer1M} / 1M`}</div>
+                            <div>Cache read: {m.prices.cachedPer1M == null ? 'unknown' : `${m.prices.cachedPer1M} / 1M`}</div>
+                            <div>Cache write: {m.prices.cacheWritePer1M == null ? 'unknown' : `${m.prices.cacheWritePer1M} / 1M`}</div>
                             {m.capabilities.reasoning && (
-                              <div>Thinking: ${m.prices.thinkingPer1M} / 1M</div>
+                              <div>Thinking: {m.prices.thinkingPer1M == null ? 'output-rate fallback' : `${m.prices.thinkingPer1M} / 1M`}</div>
                             )}
                           </div>
 
@@ -1470,13 +1480,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
                 {/* Token Pricing */}
                 <div className="grid grid-cols-2 gap-3 bg-[var(--erased-soft)] p-3 border border-[var(--ink)] rounded">
-                  {[
+                  {([
                     ['Input Price ($ / 1M)', modelInputPrice, setModelInputPrice],
                     ['Output Price ($ / 1M)', modelOutputPrice, setModelOutputPrice],
                     ['Cache Read ($ / 1M)', modelCachedPrice, setModelCachedPrice],
                     ['Cache Write ($ / 1M)', modelCacheWritePrice, setModelCacheWritePrice],
                     ['Thinking ($ / 1M)', modelThinkingPrice, setModelThinkingPrice],
-                  ].map(([label, value, setter]) => (
+                  ] as const).map(([label, value, setter]) => (
                     <div key={String(label)}>
                       <label className="block text-xs font-heading font-bold text-[var(--ink)] mb-1">
                         {String(label)}
@@ -1485,8 +1495,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         type="number"
                         step={0.01}
                         min={0}
-                        value={Number(value)}
-                        onChange={(e) => (setter as React.Dispatch<React.SetStateAction<number>>)(Number(e.target.value))}
+                        value={value ?? ''}
+                        placeholder="unknown"
+                        onChange={(e) =>
+                          (setter as React.Dispatch<React.SetStateAction<number | null>>)(
+                            e.target.value === '' ? null : Number(e.target.value),
+                          )
+                        }
                         className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 text-sm font-mono focus:outline-none rounded"
                       />
                     </div>

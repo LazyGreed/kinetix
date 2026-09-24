@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::types::Prices;
+
 const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
 const MAX_MODELS_DEV_BYTES: usize = 16 * 1024 * 1024;
 const BUNDLED_CATALOG_JSON: &str = include_str!("../data/model_capabilities.json");
@@ -35,6 +37,8 @@ pub struct CatalogMatch {
     pub context_window: Option<i64>,
     pub max_output_tokens: Option<i64>,
     pub capabilities_json: Value,
+    pub modalities: Option<Value>,
+    pub prices: Prices,
     pub source_url: Option<String>,
 }
 
@@ -162,6 +166,43 @@ fn should_skip_external_lookup(base_url: &str) -> bool {
         })
 }
 
+fn valid_price(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn normalized_modalities(model: &Value) -> Option<Value> {
+    fn direction(model: &Value, pointer: &str) -> Option<Vec<String>> {
+        let values = model.pointer(pointer)?.as_array()?;
+        let mut out = Vec::new();
+        for value in values {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            let normalized = value.trim().to_ascii_lowercase();
+            if matches!(
+                normalized.as_str(),
+                "text" | "image" | "audio" | "video" | "pdf"
+            ) && !out.iter().any(|existing| existing == &normalized)
+            {
+                out.push(normalized);
+            }
+        }
+        Some(out)
+    }
+
+    let input = direction(model, "/modalities/input");
+    let output = direction(model, "/modalities/output");
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(json!({
+        "input": input,
+        "output": output,
+    }))
+}
+
 fn models_dev_match(
     base_url: &str,
     provider_id: &str,
@@ -231,8 +272,26 @@ fn models_dev_match(
         });
     }
 
+    let modalities = normalized_modalities(model);
+    let input_modalities = modalities
+        .as_ref()
+        .and_then(|value| value.get("input"))
+        .and_then(Value::as_array);
+    let output_modalities = modalities
+        .as_ref()
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_array);
+
     let mut capabilities = serde_json::Map::new();
     capabilities.insert("schema_version".to_string(), json!(1));
+    if let (Some(inputs), Some(outputs)) = (input_modalities, output_modalities) {
+        let text_input = inputs.iter().any(|input| input.as_str() == Some("text"));
+        let text_output = outputs.iter().any(|output| output.as_str() == Some("text"));
+        capabilities.insert(
+            "text".to_string(),
+            json!({"supported": text_input && text_output}),
+        );
+    }
     if let Some(reasoning) = reasoning_json {
         capabilities.insert("reasoning".to_string(), reasoning);
     }
@@ -245,16 +304,22 @@ fn models_dev_match(
             json!({"supported": structured_output}),
         );
     }
-    if let Some(inputs) = model.pointer("/modalities/input").and_then(Value::as_array) {
+    if let Some(inputs) = input_modalities {
         capabilities.insert(
             "vision".to_string(),
             json!({
-                "input": inputs
-                    .iter()
-                    .any(|input| input.as_str().is_some_and(|input| input == "image"))
+                "input": inputs.iter().any(|input| input.as_str() == Some("image"))
             }),
         );
     }
+
+    let prices = Prices {
+        input_per_1m: valid_price(model.pointer("/cost/input")),
+        output_per_1m: valid_price(model.pointer("/cost/output")),
+        cached_per_1m: valid_price(model.pointer("/cost/cache_read")),
+        cache_write_per_1m: valid_price(model.pointer("/cost/cache_write")),
+        thinking_per_1m: valid_price(model.pointer("/cost/reasoning")),
+    };
 
     Some(CatalogMatch {
         source: CatalogSource::ModelsDev,
@@ -264,6 +329,8 @@ fn models_dev_match(
         context_window: model.pointer("/limit/context").and_then(Value::as_i64),
         max_output_tokens: model.pointer("/limit/output").and_then(Value::as_i64),
         capabilities_json: Value::Object(capabilities),
+        modalities,
+        prices,
         source_url: Some(MODELS_DEV_API_URL.to_string()),
     })
 }
@@ -289,6 +356,10 @@ struct BundledCatalogModel {
     context_window: Option<i64>,
     max_output_tokens: Option<i64>,
     capabilities_json: Value,
+    #[serde(default)]
+    modalities: Option<Value>,
+    #[serde(default)]
+    prices: Prices,
     source_url: Option<String>,
 }
 
@@ -326,6 +397,8 @@ fn lookup_bundled_from_str(
             context_window: model.context_window,
             max_output_tokens: model.max_output_tokens,
             capabilities_json: model.capabilities_json,
+            modalities: model.modalities,
+            prices: model.prices,
             source_url: model.source_url,
         });
     }
@@ -386,6 +459,11 @@ mod tests {
                         "tool_call": true,
                         "structured_output": true,
                         "modalities": {"input": ["text", "image"], "output": ["text"]},
+                        "cost": {
+                            "input": 0.75,
+                            "output": 3.75,
+                            "cache_read": 0.075
+                        },
                         "limit": {"context": 1048576, "output": 65536}
                     }
                 }
@@ -454,7 +532,81 @@ mod tests {
             model.capabilities_json["reasoning"]["levels"],
             json!(["low", "medium", "high"])
         );
+        assert_eq!(model.capabilities_json["text"]["supported"], true);
         assert_eq!(model.capabilities_json["vision"]["input"], true);
+        assert_eq!(
+            model.modalities.as_ref().unwrap()["input"],
+            json!(["text", "image"])
+        );
+        assert_eq!(
+            model.modalities.as_ref().unwrap()["output"],
+            json!(["text"])
+        );
+        assert_eq!(model.prices.input_per_1m, Some(0.75));
+        assert_eq!(model.prices.output_per_1m, Some(3.75));
+        assert_eq!(model.prices.cached_per_1m, Some(0.075));
+        assert_eq!(model.prices.cache_write_per_1m, None);
+        assert_eq!(model.prices.thinking_per_1m, None);
+    }
+
+    #[test]
+    fn models_dev_maps_all_token_price_dimensions_and_filters_modalities() {
+        let catalog = ModelsDevCatalog::from_value(json!({
+            "openrouter": {
+                "id": "openrouter",
+                "api": "https://openrouter.ai/api/v1",
+                "models": {
+                    "priced-model": {
+                        "id": "priced-model",
+                        "modalities": {
+                            "input": ["text", "audio", "unknown-input"],
+                            "output": ["text", "video", "unknown-output"]
+                        },
+                        "cost": {
+                            "input": 1.0,
+                            "output": 2.0,
+                            "cache_read": 0.25,
+                            "cache_write": 0.5,
+                            "reasoning": 3.0,
+                            "cache_storage": 99.0
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let model = catalog
+            .lookup("https://openrouter.ai/api/v1", "priced-model")
+            .unwrap();
+
+        assert_eq!(model.prices.input_per_1m, Some(1.0));
+        assert_eq!(model.prices.output_per_1m, Some(2.0));
+        assert_eq!(model.prices.cached_per_1m, Some(0.25));
+        assert_eq!(model.prices.cache_write_per_1m, Some(0.5));
+        assert_eq!(model.prices.thinking_per_1m, Some(3.0));
+        assert_eq!(
+            model.modalities.as_ref().unwrap()["input"],
+            json!(["text", "audio"])
+        );
+        assert_eq!(
+            model.modalities.as_ref().unwrap()["output"],
+            json!(["text", "video"])
+        );
+        assert_eq!(model.capabilities_json["text"]["supported"], true);
+    }
+
+    #[test]
+    fn models_dev_missing_prices_remain_unknown_not_zero() {
+        let catalog = models_dev_fixture();
+        let model = catalog
+            .lookup("https://openrouter.ai/api/v1", "shared-model")
+            .unwrap();
+
+        assert_eq!(model.prices.input_per_1m, None);
+        assert_eq!(model.prices.output_per_1m, None);
+        assert_eq!(model.prices.cached_per_1m, None);
+        assert_eq!(model.prices.cache_write_per_1m, None);
+        assert_eq!(model.prices.thinking_per_1m, None);
     }
 
     #[test]
@@ -486,6 +638,10 @@ mod tests {
                 "schema_version": 1,
                 "reasoning": {"supported": false}
               },
+              "prices": {
+                "input_per_1m": 99.0,
+                "output_per_1m": 99.0
+              },
               "source_url": "https://example.invalid/bundled"
             }]
           }]
@@ -500,6 +656,8 @@ mod tests {
         assert_eq!(model.provenance(), "models.dev");
         assert_eq!(model.context_window, Some(1_048_576));
         assert_eq!(model.capabilities_json["reasoning"]["supported"], true);
+        assert_eq!(model.prices.input_per_1m, Some(0.75));
+        assert_eq!(model.prices.output_per_1m, Some(3.75));
     }
 
     #[test]
