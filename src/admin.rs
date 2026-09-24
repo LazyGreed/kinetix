@@ -1063,6 +1063,8 @@ struct DiscoveredObservation {
     modalities: Option<Value>,
     prices: Prices,
     price_sources: Value,
+    raw_metadata: Option<Value>,
+    raw_metadata_truncated: bool,
     catalog: Option<Value>,
 }
 
@@ -1228,6 +1230,20 @@ fn price_source(
     }
 }
 
+const MAX_RAW_DISCOVERY_METADATA_BYTES: usize = 4 * 1024 * 1024;
+
+fn bounded_raw_metadata(metadata: Option<&Value>) -> (Option<Value>, bool) {
+    let Some(metadata) = metadata else {
+        return (None, false);
+    };
+    match serde_json::to_vec(metadata) {
+        Ok(encoded) if encoded.len() <= MAX_RAW_DISCOVERY_METADATA_BYTES => {
+            (Some(metadata.clone()), false)
+        }
+        Ok(_) | Err(_) => (None, true),
+    }
+}
+
 fn normalized_modalities(metadata: &Value) -> Option<Value> {
     fn direction(metadata: &Value, key: &str) -> Option<Vec<String>> {
         let values = metadata.get("modalities")?.get(key)?.as_array()?;
@@ -1338,6 +1354,8 @@ fn discovered_observation_with_catalog(
         .and_then(normalized_modalities)
         .or_else(|| fallback_metadata.as_ref().and_then(normalized_modalities))
         .or_else(|| catalog.as_ref().and_then(|entry| entry.modalities.clone()));
+    let (raw_metadata, raw_metadata_truncated) =
+        bounded_raw_metadata(provider_metadata.as_ref());
 
     let provider_declares_reasoning = provider_metadata
         .as_ref()
@@ -1502,6 +1520,8 @@ fn discovered_observation_with_catalog(
         modalities,
         prices,
         price_sources,
+        raw_metadata,
+        raw_metadata_truncated,
         catalog,
     }
 }
@@ -1643,10 +1663,10 @@ pub async fn discover_models(
             crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
         list.into_iter()
             .map(|m| {
-                let provider_metadata = m
-                    .raw_metadata
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str::<Value>(value).ok());
+                let provider_metadata = m.raw_metadata.as_deref().map(|value| {
+                    serde_json::from_str::<Value>(value)
+                        .unwrap_or_else(|_| Value::String(value.to_string()))
+                });
                 let fallback_metadata = m
                     .capabilities_json
                     .as_deref()
@@ -1702,6 +1722,8 @@ pub async fn discover_models(
                     "modalities": &observation.modalities,
                     "prices": &observation.prices,
                     "price_sources": &observation.price_sources,
+                    "raw_metadata": &observation.raw_metadata,
+                    "raw_metadata_truncated": observation.raw_metadata_truncated,
                     "catalog": &observation.catalog,
                     "disappeared": false,
                 }),
@@ -1720,6 +1742,8 @@ pub async fn discover_models(
             "modalities": &observation.modalities,
             "prices": &observation.prices,
             "price_sources": &observation.price_sources,
+            "raw_metadata": &observation.raw_metadata,
+            "raw_metadata_truncated": observation.raw_metadata_truncated,
             "catalog": &observation.catalog,
             "already_imported": existing.iter().any(|e| e.upstream_id == m.id),
         }));
@@ -6835,6 +6859,17 @@ mod reasoning_discovery_control_plane_tests {
         .unwrap();
         assert_eq!(response.0["models"][0]["id"], "reasoner");
         assert_eq!(response.0["models"][0]["already_imported"], true);
+        assert_eq!(
+            response.0["models"][0]["raw_metadata"],
+            json!({
+                "id": "reasoner",
+                "supportedThinkingEfforts": ["low", "high"]
+            })
+        );
+        assert_eq!(
+            response.0["models"][0]["raw_metadata_truncated"],
+            json!(false)
+        );
 
         server.await.unwrap();
 
@@ -6844,6 +6879,14 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(discovery["import_source"], "dashboard");
         assert_eq!(discovery["disappeared"], false);
         assert!(discovery.get("last_seen").is_some());
+        assert_eq!(
+            discovery["raw_metadata"],
+            json!({
+                "id": "reasoner",
+                "supportedThinkingEfforts": ["low", "high"]
+            })
+        );
+        assert_eq!(discovery["raw_metadata_truncated"], false);
 
         assert_eq!(rediscovered.context_window, Some(4096));
         assert_eq!(rediscovered.max_output_tokens, Some(1024));
@@ -7271,6 +7314,22 @@ mod reasoning_discovery_control_plane_tests {
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn raw_metadata_is_bounded_for_admin_inspection() {
+        let small = json!({"id": "small", "provider_field": "visible"});
+        let (raw, truncated) = bounded_raw_metadata(Some(&small));
+        assert_eq!(raw, Some(small));
+        assert!(!truncated);
+
+        let oversized = json!({
+            "id": "oversized",
+            "payload": "x".repeat(MAX_RAW_DISCOVERY_METADATA_BYTES)
+        });
+        let (raw, truncated) = bounded_raw_metadata(Some(&oversized));
+        assert!(raw.is_none());
+        assert!(truncated);
     }
 
     #[test]
