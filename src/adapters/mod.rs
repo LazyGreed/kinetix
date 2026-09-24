@@ -140,6 +140,14 @@ pub struct ReasoningCapability {
     upstream_levels: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelCapabilityFlags {
+    pub reasoning: Option<bool>,
+    pub vision: Option<bool>,
+    pub tool_calling: Option<bool>,
+    pub structured_output: Option<bool>,
+}
+
 fn canonical_reasoning_levels(
     value: &serde_json::Value,
 ) -> (Vec<String>, std::collections::HashMap<String, String>) {
@@ -229,12 +237,9 @@ struct ModelCapabilitiesV1 {
     schema_version: u32,
     transport: Option<TransportCapabilityV1>,
     reasoning: Option<PluginReasoningCapabilityV1>,
-    #[serde(rename = "tools")]
-    _tools: Option<SupportCapabilityV1>,
-    #[serde(rename = "vision")]
-    _vision: Option<VisionCapabilityV1>,
-    #[serde(rename = "structured_output")]
-    _structured_output: Option<SupportCapabilityV1>,
+    tools: Option<SupportCapabilityV1>,
+    vision: Option<VisionCapabilityV1>,
+    structured_output: Option<SupportCapabilityV1>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -246,15 +251,13 @@ struct TransportCapabilityV1 {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SupportCapabilityV1 {
-    #[serde(rename = "supported")]
-    _supported: bool,
+    supported: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VisionCapabilityV1 {
-    #[serde(rename = "input")]
-    _input: bool,
+    input: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
@@ -358,6 +361,22 @@ fn parse_model_capabilities_v1(metadata: &serde_json::Value) -> Option<ModelCapa
     metadata.is_valid().then_some(metadata)
 }
 
+pub fn plugin_capability_flags_v1(metadata: &serde_json::Value) -> Option<ModelCapabilityFlags> {
+    let metadata = parse_model_capabilities_v1(metadata)?;
+    Some(ModelCapabilityFlags {
+        reasoning: metadata
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.supported),
+        vision: metadata.vision.as_ref().map(|vision| vision.input),
+        tool_calling: metadata.tools.as_ref().map(|tools| tools.supported),
+        structured_output: metadata
+            .structured_output
+            .as_ref()
+            .map(|structured| structured.supported),
+    })
+}
+
 pub fn plugin_reasoning_support_v1(metadata: &serde_json::Value) -> Option<bool> {
     parse_model_capabilities_v1(metadata)?
         .reasoning
@@ -392,6 +411,7 @@ pub fn normalize_plugin_reasoning_capability_v1(
     {
         Some("openai") => "openai_effort",
         Some("openai-responses") => "responses_effort",
+        Some("gemini") => "gemini_thinking_level",
         _ => "provider_declared",
     };
     let upstream_levels = levels
@@ -582,17 +602,19 @@ pub fn thinking_map_for_reasoning_with_wire(
         return None;
     }
 
-    if wire != crate::types::WireFormat::Openai {
-        return None;
-    }
-
-    let level_field = match capability.upstream_format.as_str() {
-        "openai_effort"
-        | "provider_supported_thinking_efforts"
-        | "provider_supported_reasoning_levels" => "reasoning_effort",
+    let level_field = match (wire, capability.upstream_format.as_str()) {
+        (
+            crate::types::WireFormat::Openai,
+            "openai_effort"
+            | "provider_supported_thinking_efforts"
+            | "provider_supported_reasoning_levels",
+        ) => "reasoning_effort",
+        (crate::types::WireFormat::Gemini, "gemini_thinking_level") => {
+            "thinkingConfig.thinkingLevel"
+        }
         // Per-model Responses transport is descriptive until runtime adapter
         // selection can actually dispatch this model through the Responses API.
-        "responses_effort" => return None,
+        (crate::types::WireFormat::Openai, "responses_effort") => return None,
         _ => return None,
     };
 
@@ -900,6 +922,22 @@ mod reasoning_discovery_tests {
     }
 
     #[test]
+    fn strict_plugin_v1_exposes_non_reasoning_capabilities() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "reasoning": {"supported": false},
+            "tools": {"supported": true},
+            "vision": {"input": true},
+            "structured_output": {"supported": true}
+        });
+        let flags = plugin_capability_flags_v1(&metadata).unwrap();
+        assert_eq!(flags.reasoning, Some(false));
+        assert_eq!(flags.vision, Some(true));
+        assert_eq!(flags.tool_calling, Some(true));
+        assert_eq!(flags.structured_output, Some(true));
+    }
+
+    #[test]
     fn strict_plugin_v1_preserves_reasoning_default() {
         let metadata = serde_json::json!({
             "schema_version": 1,
@@ -915,6 +953,31 @@ mod reasoning_discovery_tests {
         let capability = normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
         assert_eq!(capability.default.as_deref(), Some("max"));
         assert_eq!(capability.upstream_format, "openai_effort");
+    }
+
+    #[test]
+    fn strict_plugin_v1_derives_gemini_thinking_level_map() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "transport": {"format": "gemini"},
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["low", "medium", "high"],
+                "default": "medium",
+                "can_disable": false
+            }
+        });
+        let capability = normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
+        assert_eq!(capability.upstream_format, "gemini_thinking_level");
+        let map =
+            thinking_map_for_reasoning_with_wire(&capability, crate::types::WireFormat::Gemini)
+                .unwrap();
+        assert_eq!(
+            map.level_field.as_deref(),
+            Some("thinkingConfig.thinkingLevel")
+        );
+        assert_eq!(map.levels.get("medium"), Some(&serde_json::json!("medium")));
     }
 
     #[test]

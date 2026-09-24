@@ -6,10 +6,8 @@ import { DESIGN_TOKENS } from '../../lib/designSystem';
 import { Kinetix, DiscoveredModel } from '../../lib/resources';
 
 /**
- * Fallback token metadata used when an upstream does not declare a context
- * window / max output. Applied both as the model form's initial values and as
- * the final fallback when creating, importing, or rendering a model, so an
- * "unknown" value never round-trips as 0.
+ * Defaults for newly configured manual models. Imported/discovered sparse
+ * metadata remains null/undefined until the operator explicitly sets it.
  */
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const DEFAULT_MAX_OUTPUT = 8192;
@@ -113,10 +111,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [modelCachedPrice, setModelCachedPrice] = useState(0);
   const [modelCacheWritePrice, setModelCacheWritePrice] = useState(0);
   const [modelThinkingPrice, setModelThinkingPrice] = useState(0);
-  const [capText, setCapText] = useState(true);
-  const [capVision, setCapVision] = useState(true);
-  const [capReasoning, setCapReasoning] = useState(false);
-  const [capTools, setCapTools] = useState(true);
+  const [capText, setCapText] = useState<boolean | undefined>(true);
+  const [capVision, setCapVision] = useState<boolean | undefined>(true);
+  const [capReasoning, setCapReasoning] = useState<boolean | undefined>(false);
+  const [capTools, setCapTools] = useState<boolean | undefined>(true);
+  const [capStructuredOutput, setCapStructuredOutput] = useState<boolean | undefined>(false);
   const [modelThinkingOff, setModelThinkingOff] = useState('');
   const [modelThinkingMinimal, setModelThinkingMinimal] = useState('');
   const [modelThinkingLow, setModelThinkingLow] = useState('');
@@ -213,14 +212,15 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       upstreamModelId: m.id,
       displayName: m.display_name || m.id,
       enabled: true,
-      contextWindow: m.context_window ?? DEFAULT_CONTEXT_WINDOW,
-      maxOutputTokens: m.max_output_tokens ?? DEFAULT_MAX_OUTPUT,
+      contextWindow: m.context_window ?? null,
+      maxOutputTokens: m.max_output_tokens ?? null,
       capabilities: {
-        text: true,
-        vision: false,
-        reasoning: !!m.capabilities?.reasoning || !!m.reasoning_capability,
-        toolCalling: true,
-        audio: false,
+        vision: m.capabilities?.vision ?? undefined,
+        reasoning:
+          m.capabilities?.reasoning ??
+          (m.reasoning_capability ? true : undefined),
+        toolCalling: m.capabilities?.tool_calling ?? undefined,
+        structuredOutput: m.capabilities?.structured_output ?? undefined,
       },
       prices: {
         inputPer1M: 0,
@@ -247,6 +247,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         capabilities: m.capabilities || {},
         reasoning_capability: m.reasoning_capability || null,
         thinking_map: m.thinking_map || null,
+        capability_sources: m.capability_sources || {},
+        catalog: m.catalog || null,
         imported_from_discovery: true,
       },
     };
@@ -442,8 +444,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setEditingModelId(m.id);
     setModelUpstreamId(m.upstreamModelId);
     setModelDisplayName(m.displayName);
-    setModelContextWindow(m.contextWindow || DEFAULT_CONTEXT_WINDOW);
-    setModelMaxOutput(m.maxOutputTokens || DEFAULT_MAX_OUTPUT);
+    setModelContextWindow(m.contextWindow ?? 0);
+    setModelMaxOutput(m.maxOutputTokens ?? 0);
     setModelInputPrice(m.prices.inputPer1M || 0);
     setModelOutputPrice(m.prices.outputPer1M || 0);
     setModelCachedPrice(m.prices.cachedPer1M || 0);
@@ -453,6 +455,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapVision(m.capabilities.vision);
     setCapReasoning(m.capabilities.reasoning);
     setCapTools(m.capabilities.toolCalling);
+    setCapStructuredOutput(m.capabilities.structuredOutput);
     const { off, minimal, low, medium, high, xhigh, max, ...extraLevels } = m.thinkingMap.levels;
     setModelThinkingOff(thinkingValueToInput(off));
     setModelThinkingMinimal(thinkingValueToInput(minimal));
@@ -484,6 +487,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapVision(true);
     setCapReasoning(false);
     setCapTools(true);
+    setCapStructuredOutput(false);
     setModelThinkingOff('');
     setModelThinkingMinimal('');
     setModelThinkingLow('');
@@ -502,23 +506,27 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     e.preventDefault();
     if (!modelUpstreamId.trim()) return;
 
+    const editingModel = editingModelId
+      ? models.find((model) => model.id === editingModelId)
+      : undefined;
     const newModel: ModelConfig = {
       id: editingModelId || '',
       providerId: activeProvider.id,
       providerName: activeProvider.name,
       upstreamModelId: modelUpstreamId.trim(),
       displayName: modelDisplayName.trim() || modelUpstreamId.trim(),
-      enabled: editingModelId
-        ? (models.find((m) => m.id === editingModelId)?.enabled ?? true)
-        : true,
-      contextWindow: Number(modelContextWindow) || DEFAULT_CONTEXT_WINDOW,
-      maxOutputTokens: Number(modelMaxOutput) || DEFAULT_MAX_OUTPUT,
+      enabled: editingModel?.enabled ?? true,
+      contextWindow:
+        Number(modelContextWindow) || (editingModelId ? null : DEFAULT_CONTEXT_WINDOW),
+      maxOutputTokens:
+        Number(modelMaxOutput) || (editingModelId ? null : DEFAULT_MAX_OUTPUT),
       capabilities: {
         text: capText,
         vision: capVision,
         reasoning: capReasoning,
         toolCalling: capTools,
-        audio: false,
+        audio: editingModelId ? editingModel?.capabilities.audio : false,
+        structuredOutput: capStructuredOutput,
       },
       prices: {
         inputPer1M: Number(modelInputPrice) || 0,
@@ -542,13 +550,25 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
   const modelBody = () => {
     const thinkingMap = currentThinkingMap();
+    const editingModel = editingModelId
+      ? models.find((model) => model.id === editingModelId)
+      : undefined;
     return {
       upstream_id: modelUpstreamId.trim(),
       display_name: modelDisplayName.trim() || modelUpstreamId.trim(),
       enabled: true,
-      context_window: Number(modelContextWindow) || DEFAULT_CONTEXT_WINDOW,
-      max_output_tokens: Number(modelMaxOutput) || DEFAULT_MAX_OUTPUT,
-      capabilities: { text: capText, vision: capVision, reasoning: capReasoning, tool_calling: capTools, audio: false },
+      context_window:
+        Number(modelContextWindow) || (editingModelId ? null : DEFAULT_CONTEXT_WINDOW),
+      max_output_tokens:
+        Number(modelMaxOutput) || (editingModelId ? null : DEFAULT_MAX_OUTPUT),
+      capabilities: {
+        text: capText,
+        vision: capVision,
+        reasoning: capReasoning,
+        tool_calling: capTools,
+        audio: editingModelId ? editingModel?.capabilities.audio : false,
+        structured_output: capStructuredOutput,
+      },
       prices: {
         input_per_1m: Number(modelInputPrice) || null,
         output_per_1m: Number(modelOutputPrice) || null,
@@ -847,6 +867,12 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                             reasoning: {m.reasoning_capability.levels.join('/')}
                           </span>
                         ) : null}
+                        {m.capabilities?.vision ? (
+                          <span className="text-[var(--pen-blue)]">vision</span>
+                        ) : null}
+                        {m.capabilities?.tool_calling ? (
+                          <span className="text-[var(--pen-blue)]">tools</span>
+                        ) : null}
                         {m.already_imported ? (
                           <span className="text-[var(--pen-green)] font-bold">✓ imported</span>
                         ) : (
@@ -929,7 +955,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               </span>
                             </div>
                             <span className="text-xs font-mono text-[var(--ink)]/70">
-                              Context: {(m.contextWindow || DEFAULT_CONTEXT_WINDOW).toLocaleString()} tokens • Max Output: {m.maxOutputTokens || DEFAULT_MAX_OUTPUT}
+                              Context: {m.contextWindow?.toLocaleString() ?? 'unknown'} tokens • Max Output: {m.maxOutputTokens ?? 'unknown'}
                             </span>
                           </div>
 
@@ -940,6 +966,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               {m.capabilities.vision && <SketchBadge variant="blue">Vision</SketchBadge>}
                               {m.capabilities.reasoning && <SketchBadge variant="yellow">Reasoning</SketchBadge>}
                               {m.capabilities.toolCalling && <SketchBadge variant="green">Tools</SketchBadge>}
+                              {m.capabilities.structuredOutput && <SketchBadge variant="blue">Structured</SketchBadge>}
                             </div>
 
                             {confirmDeleteModelId === m.id ? (
@@ -1437,8 +1464,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                 </div>
 
                 <p className="text-xs font-body text-[var(--ink)]/60">
-                  If a value is unknown, leave it as 0 (or blank) to apply the defaults:{' '}
-                  {DEFAULT_CONTEXT_WINDOW.toLocaleString()} context window · {DEFAULT_MAX_OUTPUT.toLocaleString()} max output.
+                  New manual models use {DEFAULT_CONTEXT_WINDOW.toLocaleString()} context ·{' '}
+                  {DEFAULT_MAX_OUTPUT.toLocaleString()} max output when blank. Imported models keep blank values unknown.
                 </p>
 
                 {/* Token Pricing */}
@@ -1475,7 +1502,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capText}
+                        checked={capText ?? false}
                         onChange={(e) => setCapText(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
@@ -1484,7 +1511,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capVision}
+                        checked={capVision ?? false}
                         onChange={(e) => setCapVision(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
@@ -1493,7 +1520,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capReasoning}
+                        checked={capReasoning ?? false}
                         onChange={(e) => setCapReasoning(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
@@ -1502,11 +1529,20 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
-                        checked={capTools}
+                        checked={capTools ?? false}
                         onChange={(e) => setCapTools(e.target.checked)}
                         className="w-4 h-4 accent-[var(--marker-red)]"
                       />
-                      <span>Tool Calling / JSON</span>
+                      <span>Tool Calling</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={capStructuredOutput ?? false}
+                        onChange={(e) => setCapStructuredOutput(e.target.checked)}
+                        className="w-4 h-4 accent-[var(--marker-red)]"
+                      />
+                      <span>Structured Output / JSON</span>
                     </label>
                   </div>
                 </div>

@@ -331,6 +331,7 @@ fn capability_flag(caps: &Capabilities, name: &str) -> bool {
         "reasoning" => caps.reasoning,
         "tool_calling" | "tools" => caps.tool_calling,
         "audio" => caps.audio,
+        "structured_output" => caps.structured_output,
         _ => false,
     }
 }
@@ -339,6 +340,7 @@ fn capability_flag(caps: &Capabilities, name: &str) -> bool {
 fn capabilities_declared(raw: &Value, name: &str) -> bool {
     let keys: &[&str] = match name {
         "tool_calling" => &["tool_calling", "tools", "tool_calls"],
+        "structured_output" => &["structured_output", "structuredOutput"],
         other => &[other],
     };
     keys.iter().any(|k| raw.get(k).is_some())

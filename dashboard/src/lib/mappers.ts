@@ -16,6 +16,10 @@ import {
 } from '../types';
 
 const num = (v: any, d = 0): number => (typeof v === 'number' && isFinite(v) ? v : d);
+const optionalBool = (v: any): boolean | undefined =>
+  typeof v === 'boolean' ? v : undefined;
+const optionalNum = (v: any): number | null =>
+  typeof v === 'number' && isFinite(v) ? v : null;
 const str = (v: any, d = ''): string => (typeof v === 'string' ? v : d);
 
 export function mapKey(j: any): VirtualKey {
@@ -97,14 +101,15 @@ export function mapModel(j: any): ModelConfig {
     upstreamModelId: str(j.upstream_id),
     displayName: str(j.display_name),
     enabled: !!j.enabled,
-    contextWindow: num(j.context_window, 0),
-    maxOutputTokens: num(j.max_output_tokens, 0),
+    contextWindow: optionalNum(j.context_window),
+    maxOutputTokens: optionalNum(j.max_output_tokens),
     capabilities: {
-      text: !!c.text,
-      vision: !!c.vision,
-      reasoning: !!c.reasoning,
-      toolCalling: !!c.tool_calling,
-      audio: !!c.audio,
+      text: optionalBool(c.text),
+      vision: optionalBool(c.vision),
+      reasoning: optionalBool(c.reasoning),
+      toolCalling: optionalBool(c.tool_calling),
+      audio: optionalBool(c.audio),
+      structuredOutput: optionalBool(c.structured_output),
     },
     prices,
     parameters: (j.parameters && typeof j.parameters === 'object'

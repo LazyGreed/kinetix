@@ -72,6 +72,8 @@ pub struct Capabilities {
     pub tool_calling: bool,
     #[serde(default)]
     pub audio: bool,
+    #[serde(default, alias = "structuredOutput")]
+    pub structured_output: bool,
 }
 
 impl Capabilities {
@@ -85,6 +87,7 @@ impl Capabilities {
                 "reasoning" => c.reasoning = true,
                 "tool_calling" | "tools" => c.tool_calling = true,
                 "audio" => c.audio = true,
+                "structured_output" | "structuredOutput" => c.structured_output = true,
                 _ => {}
             }
         }
@@ -736,6 +739,7 @@ mod tests {
             reasoning: false,
             tool_calling: true,
             audio: false,
+            structured_output: false,
         };
         let reasoning_needed = CapabilityNeeds {
             vision: false,

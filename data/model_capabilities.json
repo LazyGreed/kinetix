@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "base_urls": [
+        "https://api.b.ai/v1"
+      ],
+      "models": [
+        {
+          "id": "DeepSeek-V4.1-Flash",
+          "context_window": 1000000,
+          "max_output_tokens": 384000,
+          "capabilities_json": {
+            "schema_version": 1,
+            "reasoning": {
+              "supported": true,
+              "mode": "level",
+              "levels": [
+                "low",
+                "high",
+                "max"
+              ],
+              "default": "high",
+              "can_disable": false
+            },
+            "tools": {
+              "supported": true
+            },
+            "vision": {
+              "input": true
+            },
+            "structured_output": {
+              "supported": true
+            }
+          },
+          "source_url": "https://docs.b.ai/llmservice/models/deepseek-v4-1-flash/"
+        }
+      ]
+    }
+  ]
+}

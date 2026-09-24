@@ -47,9 +47,16 @@ export interface DiscoveredModel {
   display_name?: string | null;
   context_window?: number | null;
   max_output_tokens?: number | null;
-  capabilities?: { reasoning?: boolean | null } | null;
+  capabilities?: {
+    reasoning?: boolean | null;
+    vision?: boolean | null;
+    tool_calling?: boolean | null;
+    structured_output?: boolean | null;
+  } | null;
   reasoning_capability?: DiscoveredReasoningCapability | null;
   thinking_map?: DiscoveredThinkingMap | null;
+  capability_sources?: Record<string, string | null> | null;
+  catalog?: { id: string; source?: string | null } | null;
   already_imported: boolean;
 }
 

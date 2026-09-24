@@ -338,6 +338,23 @@ export default function App() {
 
   const handleDeleteProvider = (providerId: string) =>
     withRefresh(() => Kinetix.deleteProvider(providerId));
+
+  const modelCapabilitiesPayload = (model: ModelConfig): Record<string, boolean> => {
+    const out: Record<string, boolean> = {};
+    const fields: [string, boolean | undefined][] = [
+      ['text', model.capabilities.text],
+      ['vision', model.capabilities.vision],
+      ['reasoning', model.capabilities.reasoning],
+      ['tool_calling', model.capabilities.toolCalling],
+      ['audio', model.capabilities.audio],
+      ['structured_output', model.capabilities.structuredOutput],
+    ];
+    for (const [key, value] of fields) {
+      if (typeof value === 'boolean') out[key] = value;
+    }
+    return out;
+  };
+
   const handleAddModel = (model: ModelConfig) =>
     withRefresh(() =>
       Kinetix.createModel(model.providerId, {
@@ -346,13 +363,7 @@ export default function App() {
         enabled: model.enabled,
         context_window: model.contextWindow,
         max_output_tokens: model.maxOutputTokens,
-        capabilities: {
-          text: model.capabilities.text,
-          vision: model.capabilities.vision,
-          reasoning: model.capabilities.reasoning,
-          tool_calling: model.capabilities.toolCalling,
-          audio: model.capabilities.audio,
-        },
+        capabilities: modelCapabilitiesPayload(model),
         prices: {
           input_per_1m: model.prices.inputPer1M,
           output_per_1m: model.prices.outputPer1M,
@@ -381,13 +392,7 @@ export default function App() {
         enabled: model.enabled,
         context_window: model.contextWindow,
         max_output_tokens: model.maxOutputTokens,
-        capabilities: {
-          text: model.capabilities.text,
-          vision: model.capabilities.vision,
-          reasoning: model.capabilities.reasoning,
-          tool_calling: model.capabilities.toolCalling,
-          audio: model.capabilities.audio,
-        },
+        capabilities: modelCapabilitiesPayload(model),
         prices: {
           input_per_1m: model.prices.inputPer1M,
           output_per_1m: model.prices.outputPer1M,
