@@ -1071,6 +1071,15 @@ fn discovered_observation(
     fallback_metadata: Option<Value>,
     wire: WireFormat,
 ) -> DiscoveredObservation {
+    // capabilities_json is a versioned normalized contract. Only v1 is
+    // understood here; unsupported, missing, or malformed versions stay
+    // opaque instead of being interpreted with v1 semantics.
+    let fallback_metadata = fallback_metadata.filter(|metadata| {
+        metadata
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            == Some(1)
+    });
     let reasoning = match provider_metadata.as_ref() {
         Some(metadata) if reasoning_metadata_declared(metadata) => {
             normalize_reasoning_capability(metadata)
@@ -5790,6 +5799,7 @@ mod reasoning_discovery_control_plane_tests {
             model("reasoner"),
             Some(json!({"supportedThinkingEfforts": ["low", "medium"]})),
             Some(json!({
+                "schema_version": 1,
                 "reasoning": {
                     "mode": "level",
                     "levels": ["high"],
@@ -5841,6 +5851,7 @@ mod reasoning_discovery_control_plane_tests {
                 model("reasoner"),
                 Some(provider_metadata),
                 Some(json!({
+                    "schema_version": 1,
                     "reasoning": {
                         "mode": "level",
                         "levels": ["low", "high"],
@@ -5861,6 +5872,7 @@ mod reasoning_discovery_control_plane_tests {
             model("reasoner"),
             Some(json!({"id": "reasoner", "owned_by": "example"})),
             Some(json!({
+                "schema_version": 1,
                 "reasoning": {
                     "mode": "adaptive",
                     "levels": ["low", "high", "max"],
@@ -5902,6 +5914,41 @@ mod reasoning_discovery_control_plane_tests {
             let reasoning = observation.reasoning.unwrap();
             assert_eq!(reasoning.mode, expected_mode);
             assert!(reasoning.levels.is_empty());
+            assert!(observation.thinking_map.is_none());
+        }
+    }
+
+    #[test]
+    fn unsupported_plugin_capability_schema_is_ignored() {
+        for metadata in [
+            json!({
+                "schema_version": 2,
+                "reasoning": {
+                    "supported": true,
+                    "mode": "toggle",
+                    "can_disable": true
+                }
+            }),
+            json!({
+                "schema_version": "1",
+                "reasoning": {
+                    "supported": true
+                }
+            }),
+            json!({
+                "reasoning": {
+                    "supported": true
+                }
+            }),
+        ] {
+            let observation = discovered_observation(
+                model("reasoner"),
+                Some(json!({"id": "reasoner", "owned_by": "example"})),
+                Some(metadata),
+                WireFormat::Plugin,
+            );
+
+            assert!(observation.reasoning.is_none());
             assert!(observation.thinking_map.is_none());
         }
     }
