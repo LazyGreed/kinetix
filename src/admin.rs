@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::adapters::{
-    normalize_reasoning_capability, reasoning_metadata_declared,
-    thinking_map_for_reasoning_with_wire, UpstreamContext,
+    normalize_plugin_reasoning_capability_v1, normalize_reasoning_capability,
+    reasoning_metadata_declared, thinking_map_for_reasoning_with_wire, UpstreamContext,
 };
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
@@ -1071,18 +1071,17 @@ fn discovered_observation(
     fallback_metadata: Option<Value>,
     wire: WireFormat,
 ) -> DiscoveredObservation {
-    // capabilities_json is a versioned normalized contract. Only v1 is
-    // understood here; unsupported, missing, or malformed versions stay
-    // opaque instead of being interpreted with v1 semantics.
-    let fallback_metadata = fallback_metadata
-        .filter(|metadata| metadata.get("schema_version").and_then(Value::as_u64) == Some(1));
+    // capabilities_json is a strict, versioned normalized contract. Parse and
+    // validate the full v1 shape before consuming any of it; malformed or
+    // unsupported metadata remains opaque.
+    let fallback_reasoning = fallback_metadata
+        .as_ref()
+        .and_then(normalize_plugin_reasoning_capability_v1);
     let reasoning = match provider_metadata.as_ref() {
         Some(metadata) if reasoning_metadata_declared(metadata) => {
             normalize_reasoning_capability(metadata)
         }
-        _ => fallback_metadata
-            .as_ref()
-            .and_then(normalize_reasoning_capability),
+        _ => fallback_reasoning,
     };
     let thinking_map = reasoning
         .as_ref()
@@ -5797,9 +5796,9 @@ mod reasoning_discovery_control_plane_tests {
             Some(json!({
                 "schema_version": 1,
                 "reasoning": {
+                    "supported": true,
                     "mode": "level",
-                    "levels": ["high"],
-                    "upstream_format": "openai_effort"
+                    "levels": ["high"]
                 }
             })),
             WireFormat::Openai,
@@ -5849,9 +5848,9 @@ mod reasoning_discovery_control_plane_tests {
                 Some(json!({
                     "schema_version": 1,
                     "reasoning": {
+                        "supported": true,
                         "mode": "level",
-                        "levels": ["low", "high"],
-                        "upstream_format": "openai_effort"
+                        "levels": ["low", "high"]
                     }
                 })),
                 WireFormat::Openai,
@@ -5869,11 +5868,13 @@ mod reasoning_discovery_control_plane_tests {
             Some(json!({"id": "reasoner", "owned_by": "example"})),
             Some(json!({
                 "schema_version": 1,
+                "transport": {"format": "claude"},
                 "reasoning": {
-                    "mode": "adaptive",
+                    "supported": true,
+                    "mode": "level",
                     "levels": ["low", "high", "max"],
-                    "can_disable": false,
-                    "upstream_format": "anthropic_effort"
+                    "default": "high",
+                    "can_disable": false
                 }
             })),
             WireFormat::Anthropic,
@@ -5882,9 +5883,10 @@ mod reasoning_discovery_control_plane_tests {
         let reasoning = observation.reasoning.unwrap();
         assert_eq!(
             reasoning.mode,
-            Some(crate::adapters::ReasoningCapabilityMode::Adaptive)
+            Some(crate::adapters::ReasoningCapabilityMode::Level)
         );
-        assert_eq!(reasoning.upstream_format, "anthropic_effort");
+        assert_eq!(reasoning.default.as_deref(), Some("high"));
+        assert_eq!(reasoning.upstream_format, "provider_declared");
         assert!(observation.thinking_map.is_none());
     }
 
@@ -5912,6 +5914,73 @@ mod reasoning_discovery_control_plane_tests {
             assert!(reasoning.levels.is_empty());
             assert!(observation.thinking_map.is_none());
         }
+    }
+
+    #[test]
+    fn invalid_plugin_v1_contract_is_ignored() {
+        for metadata in [
+            json!({
+                "schema_version": 1,
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["low"],
+                    "default": "max"
+                }
+            }),
+            json!({
+                "schema_version": 1,
+                "unknown": true
+            }),
+            json!({
+                "schema_version": 1,
+                "reasoning": {
+                    "supported": true,
+                    "unknown": true
+                }
+            }),
+        ] {
+            let observation = discovered_observation(
+                model("reasoner"),
+                Some(json!({"id": "reasoner", "owned_by": "example"})),
+                Some(metadata),
+                WireFormat::Plugin,
+            );
+
+            assert!(observation.reasoning.is_none());
+            assert!(observation.thinking_map.is_none());
+        }
+    }
+
+    #[test]
+    fn valid_plugin_reasoning_default_survives_discovery() {
+        let observation = discovered_observation(
+            model("reasoner"),
+            Some(json!({"id": "reasoner", "owned_by": "example"})),
+            Some(json!({
+                "schema_version": 1,
+                "transport": {"format": "openai"},
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["low", "max"],
+                    "default": "max",
+                    "can_disable": false
+                }
+            })),
+            WireFormat::Plugin,
+        );
+
+        let reasoning = observation.reasoning.unwrap();
+        assert_eq!(reasoning.default.as_deref(), Some("max"));
+        assert_eq!(
+            serde_json::to_value(&reasoning).unwrap()["default"],
+            json!("max")
+        );
+        assert_eq!(
+            observation.thinking_map.and_then(|map| map.level_field),
+            Some("reasoning_effort".to_string())
+        );
     }
 
     #[test]
