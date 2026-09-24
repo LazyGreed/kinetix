@@ -301,9 +301,7 @@ impl PluginReasoningCapabilityV1 {
 
         match self.mode {
             None => self.levels.is_none() && self.default.is_none(),
-            Some(PluginReasoningModeV1::Toggle) => {
-                self.levels.is_none() && self.default.is_none()
-            }
+            Some(PluginReasoningModeV1::Toggle) => self.levels.is_none() && self.default.is_none(),
             Some(PluginReasoningModeV1::Level) => {
                 let Some(levels) = self.levels.as_ref() else {
                     return false;
