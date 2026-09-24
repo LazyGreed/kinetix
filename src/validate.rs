@@ -97,16 +97,24 @@ pub fn validate_model(
     }
 
     let parsed_prices: Prices = serde_json::from_value(prices.clone()).unwrap_or_default();
-    let price_state = if parsed_prices.is_configured() {
-        "known"
-    } else {
-        "unknown"
+    let price_state = match (
+        parsed_prices.input_per_1m.is_some(),
+        parsed_prices.output_per_1m.is_some(),
+    ) {
+        (true, true) => "known",
+        (false, false) => "unknown",
+        _ => "partial",
     };
-    if price_state == "unknown" {
-        warnings.push(
+    match price_state {
+        "unknown" => warnings.push(
             "prices are not configured: cost will be recorded as unknown and USD budgets cannot be enforced for this model (FR-6.3)"
                 .into(),
-        );
+        ),
+        "partial" => warnings.push(
+            "prices are only partially configured: both input_per_1m and output_per_1m are required for known cost; requests that consume an unpriced base dimension will record unknown cost and USD budgets cannot be reliably enforced for this model (FR-6.3)"
+                .into(),
+        ),
+        _ => {}
     }
 
     // Parameter specs: flag declared-but-inconsistent entries.
@@ -177,6 +185,44 @@ mod tests {
         assert_eq!(v["valid"], true);
         assert_eq!(v["price_state"], "unknown");
         assert!(!v["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn model_validation_reports_partial_when_output_price_is_unknown() {
+        let v = validate_model(
+            "up",
+            Some(1000),
+            Some(100),
+            &json!({"text": true}),
+            &json!({"input_per_1m": 1.0, "output_per_1m": null}),
+            &json!({}),
+        );
+        assert_eq!(v["valid"], true);
+        assert_eq!(v["price_state"], "partial");
+        assert!(v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(|warning| warning.contains("partially configured"))));
+    }
+
+    #[test]
+    fn model_validation_reports_partial_when_input_price_is_unknown() {
+        let v = validate_model(
+            "up",
+            Some(1000),
+            Some(100),
+            &json!({"text": true}),
+            &json!({"input_per_1m": null, "output_per_1m": 2.0}),
+            &json!({}),
+        );
+        assert_eq!(v["valid"], true);
+        assert_eq!(v["price_state"], "partial");
+        assert!(v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(|warning| warning.contains("partially configured"))));
     }
 
     #[test]
