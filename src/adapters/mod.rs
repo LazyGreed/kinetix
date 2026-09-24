@@ -524,7 +524,9 @@ pub fn thinking_map_for_reasoning(
     }
     let level_field = match capability.upstream_format.as_str() {
         "openai_effort" => "reasoning_effort",
-        "responses_effort" => "reasoning.effort",
+        // Responses transport is descriptive until runtime model transport
+        // selection can dispatch it through a Responses-capable adapter.
+        "responses_effort" => return None,
         _ => return None,
     };
     let levels = capability
