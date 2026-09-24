@@ -252,7 +252,7 @@ pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<Re
     let candidates = [
         (
             "/supportedThinkingEfforts",
-            "openai_effort",
+            "provider_supported_thinking_efforts",
             crate::types::ThinkingMode::Level,
         ),
         (
@@ -262,7 +262,7 @@ pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<Re
         ),
         (
             "/supported_reasoning_levels",
-            "openai_effort",
+            "provider_supported_reasoning_levels",
             crate::types::ThinkingMode::Level,
         ),
         (
@@ -317,6 +317,43 @@ pub fn thinking_map_for_reasoning(
         mode: Some(crate::types::ThinkingMode::Level),
         budget_field: None,
         level_field: Some(level_field.to_string()),
+    })
+}
+
+pub fn thinking_map_for_reasoning_with_wire(
+    capability: &ReasoningCapability,
+    wire: crate::types::WireFormat,
+) -> Option<crate::types::ThinkingMap> {
+    if let Some(map) = thinking_map_for_reasoning(capability) {
+        return Some(map);
+    }
+    if capability.mode != crate::types::ThinkingMode::Level
+        || wire != crate::types::WireFormat::Openai
+        || !matches!(
+            capability.upstream_format.as_str(),
+            "provider_supported_thinking_efforts" | "provider_supported_reasoning_levels"
+        )
+    {
+        return None;
+    }
+
+    let levels = capability
+        .levels
+        .iter()
+        .map(|level| {
+            let upstream = capability
+                .upstream_levels
+                .get(level)
+                .cloned()
+                .unwrap_or_else(|| level.clone());
+            (level.clone(), serde_json::Value::String(upstream))
+        })
+        .collect();
+    Some(crate::types::ThinkingMap {
+        levels,
+        mode: Some(crate::types::ThinkingMode::Level),
+        budget_field: None,
+        level_field: Some("reasoning_effort".to_string()),
     })
 }
 
@@ -476,10 +513,18 @@ mod reasoning_discovery_tests {
             capability.levels,
             vec!["low".to_string(), "medium".to_string(), "high".to_string()]
         );
-        assert_eq!(capability.upstream_format, "openai_effort");
+        assert_eq!(
+            capability.upstream_format,
+            "provider_supported_thinking_efforts"
+        );
         assert!(!capability.can_disable);
+        assert!(thinking_map_for_reasoning(&capability).is_none());
 
-        let map = thinking_map_for_reasoning(&capability).unwrap();
+        let map = thinking_map_for_reasoning_with_wire(
+            &capability,
+            crate::types::WireFormat::Openai,
+        )
+        .unwrap();
         assert_eq!(map.level_field.as_deref(), Some("reasoning_effort"));
         assert_eq!(map.levels.get("high"), Some(&serde_json::json!("high")));
     }
