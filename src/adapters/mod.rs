@@ -38,9 +38,9 @@ pub trait Adapter: Send + Sync {
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError>;
 
     /// Whether this adapter owns translation/validation of canonical thinking
-    /// levels for this model. Built-in adapters rely on an executable core
-    /// ThinkingMap; plugin adapters must explicitly opt in per discovered model.
-    fn handles_thinking_translation(&self, _model: &crate::db::ModelRow) -> bool {
+    /// levels. Built-in adapters rely on an executable core ThinkingMap;
+    /// plugin adapters must explicitly opt in through their manifest.
+    fn handles_thinking_translation(&self) -> bool {
         false
     }
 

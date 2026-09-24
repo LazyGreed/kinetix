@@ -92,6 +92,9 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
     for p in &provided {
         validate_capability_name(p.capability, &p.name)?;
     }
+    if manifest.provides.thinking_translation && manifest.provides.provider_adapters.is_empty() {
+        bail!("provides.thinking_translation requires at least one provider_adapter");
+    }
     // Hooks are not addressable by name in the same way; require at least a
     // recognizable hook name when hooks are declared.
     for h in &manifest.provides.hooks {

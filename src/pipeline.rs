@@ -2405,7 +2405,7 @@ fn check_thinking_translation_for_adapter(
     target: &ResolvedTarget,
     req: &InternalRequest,
 ) -> Result<(), ProxyError> {
-    if req.thinking.is_some() && adapter.handles_thinking_translation(&target.model) {
+    if req.thinking.is_some() && adapter.handles_thinking_translation() {
         return Ok(());
     }
     check_thinking_translation(target, req)
@@ -4004,7 +4004,9 @@ mod route_policy_tests {
         }
     }
 
-    struct PluginThinkingTestAdapter;
+    struct PluginThinkingTestAdapter {
+        handles_thinking: bool,
+    }
 
     #[async_trait::async_trait]
     impl Adapter for PluginThinkingTestAdapter {
@@ -4012,8 +4014,8 @@ mod route_policy_tests {
             "test-plugin"
         }
 
-        fn handles_thinking_translation(&self, model: &db::ModelRow) -> bool {
-            crate::plugins::adapter::model_handles_thinking_translation(model)
+        fn handles_thinking_translation(&self) -> bool {
+            self.handles_thinking
         }
 
         fn build_url(&self, _ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
@@ -4519,7 +4521,6 @@ mod route_policy_tests {
         target.provider.wire_format = "plugin".into();
         target.provider.wire_plugin = "plugin:test/provider-adapter".into();
         target.model.discovery = serde_json::json!({
-            "capabilities": {"reasoning": true},
             "reasoning_capability": capability
         })
         .to_string();
@@ -4527,10 +4528,12 @@ mod route_policy_tests {
         let registry = crate::adapters::AdapterRegistry::new();
         registry.register_plugin(
             "plugin:test/provider-adapter",
-            Arc::new(PluginThinkingTestAdapter),
+            Arc::new(PluginThinkingTestAdapter {
+                handles_thinking: true,
+            }),
         );
         let adapter = registry.for_provider(&target.provider);
-        assert!(adapter.handles_thinking_translation(&target.model));
+        assert!(adapter.handles_thinking_translation());
 
         let mut req = request();
         req.thinking = Some(crate::types::ThinkingLevel::High);
@@ -4556,18 +4559,15 @@ mod route_policy_tests {
         let mut target = target();
         target.provider.wire_format = "plugin".into();
         target.provider.wire_plugin = "plugin:test/provider-adapter".into();
-        target.model.discovery = serde_json::json!({
-            "capabilities": {"reasoning": false}
-        })
-        .to_string();
-
         let registry = crate::adapters::AdapterRegistry::new();
         registry.register_plugin(
             "plugin:test/provider-adapter",
-            Arc::new(PluginThinkingTestAdapter),
+            Arc::new(PluginThinkingTestAdapter {
+                handles_thinking: false,
+            }),
         );
         let adapter = registry.for_provider(&target.provider);
-        assert!(!adapter.handles_thinking_translation(&target.model));
+        assert!(!adapter.handles_thinking_translation());
 
         let mut req = request();
         req.thinking = Some(crate::types::ThinkingLevel::High);

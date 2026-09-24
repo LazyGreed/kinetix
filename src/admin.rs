@@ -4045,7 +4045,12 @@ pub(crate) async fn register_enabled_plugin_capabilities(state: &AppState, id: &
     // `plugin-adapter` world imports no network capability, so registering it
     // does not widen the plugin's authority.
     if !provides.provider_adapters.is_empty() {
-        match crate::plugins::adapter::PluginAdapter::new((*manager).clone(), id.to_string()).await
+        match crate::plugins::adapter::PluginAdapter::new(
+            (*manager).clone(),
+            id.to_string(),
+            provides.thinking_translation,
+        )
+        .await
         {
             Ok(adapter) => {
                 let adapter: std::sync::Arc<dyn crate::adapters::Adapter> =
