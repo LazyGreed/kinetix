@@ -557,15 +557,17 @@ pub fn thinking_map_for_reasoning_with_wire(
         return None;
     }
 
-    let level_field = match (capability.upstream_format.as_str(), wire) {
-        ("openai_effort", crate::types::WireFormat::Openai)
-        | (
-            "provider_supported_thinking_efforts" | "provider_supported_reasoning_levels",
-            crate::types::WireFormat::Openai,
-        ) => "reasoning_effort",
+    if wire != crate::types::WireFormat::Openai {
+        return None;
+    }
+
+    let level_field = match capability.upstream_format.as_str() {
+        "openai_effort"
+        | "provider_supported_thinking_efforts"
+        | "provider_supported_reasoning_levels" => "reasoning_effort",
         // Per-model Responses transport is descriptive until runtime adapter
         // selection can actually dispatch this model through the Responses API.
-        ("responses_effort", _) => return None,
+        "responses_effort" => return None,
         _ => return None,
     };
 
