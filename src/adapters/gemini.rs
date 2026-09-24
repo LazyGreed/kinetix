@@ -535,14 +535,8 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
                 out.insert(key.clone(), value.clone());
             }
 
-            "exclusiveMinimum"
-            | "exclusiveMaximum"
-            | "multipleOf"
-            | "propertyNames"
-            | "pattern"
-            | "uniqueItems"
-            | "minProperties"
-            | "maxProperties" => {}
+            "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf" | "propertyNames"
+            | "pattern" | "uniqueItems" | "minProperties" | "maxProperties" => {}
 
             other => {
                 return Err(schema_error(
