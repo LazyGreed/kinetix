@@ -15,7 +15,9 @@ use std::sync::Arc;
 use kinetix::adapters::{AdapterRegistry, UpstreamContext};
 use kinetix::crypto::Crypto;
 use kinetix::db::{self, Pool};
-use kinetix::plugins::{adapter::register_declared_adapters, Capability, HostPolicy, PluginManager};
+use kinetix::plugins::{
+    adapter::register_declared_adapters, Capability, HostPolicy, PluginManager,
+};
 use kinetix::types::{
     InternalRequest, Message, Part, Role, SamplingParams, ThinkingLevel, WireFormat,
 };
