@@ -1354,8 +1354,7 @@ fn discovered_observation_with_catalog(
         .and_then(normalized_modalities)
         .or_else(|| fallback_metadata.as_ref().and_then(normalized_modalities))
         .or_else(|| catalog.as_ref().and_then(|entry| entry.modalities.clone()));
-    let (raw_metadata, raw_metadata_truncated) =
-        bounded_raw_metadata(provider_metadata.as_ref());
+    let (raw_metadata, raw_metadata_truncated) = bounded_raw_metadata(provider_metadata.as_ref());
 
     let provider_declares_reasoning = provider_metadata
         .as_ref()
