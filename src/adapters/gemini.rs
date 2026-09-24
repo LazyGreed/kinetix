@@ -394,7 +394,7 @@ fn add_nullable_type(
     ))
 }
 
-/// Normalize JSON Schema to Gemini's documented `parametersJsonSchema` subset.
+/// Normalize JSON Schema for Gemini `parametersJsonSchema`.
 ///
 /// Supported keywords are explicitly enumerated. Safe compatibility transforms:
 /// - legacy `definitions` -> `$defs` and matching local refs
@@ -404,8 +404,8 @@ fn add_nullable_type(
 /// - OpenAPI `nullable` -> JSON Schema null type
 /// - lossless object-style `allOf` merges
 ///
-/// Unknown validation keywords fail closed instead of being forwarded to Google
-/// or silently discarded.
+/// Documented-supported validation keywords are preserved. Unknown validation
+/// keywords fail closed instead of being forwarded to Google or silently discarded.
 fn sanitize_schema(schema: &Value, root_path: &str) -> Result<Value, UpstreamFailure> {
     sanitize_schema_node(schema, root_path)
 }
@@ -530,7 +530,7 @@ fn sanitize_schema_node(node: &Value, path: &str) -> Result<Value, UpstreamFailu
 
             "$id" | "$anchor" | "type" | "format" | "title" | "description" | "enum"
             | "minLength" | "maxLength" | "minItems" | "maxItems" | "minimum" | "maximum"
-            | "required" | "propertyOrdering" => {
+            | "pattern" | "minProperties" | "maxProperties" | "required" | "propertyOrdering" => {
                 out.insert(key.clone(), value.clone());
             }
 
@@ -1288,16 +1288,57 @@ mod schema_tests {
     }
 
     #[test]
-    fn sanitize_schema_rejects_unsupported_validation_keywords() {
+    fn sanitize_schema_preserves_documented_validation_keywords() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "resumeFromRunId": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]+$",
+                    "minLength": 1
+                },
+                "labels": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 4,
+                    "additionalProperties": {"type": "string"}
+                }
+            },
+            "required": ["resumeFromRunId"]
+        });
+        let got = sanitize_schema(&input, "tool 'SubagentWorkflow'").unwrap();
+
+        assert_eq!(
+            got.pointer("/properties/resumeFromRunId/pattern"),
+            Some(&json!("^[A-Za-z0-9_-]+$"))
+        );
+        assert_eq!(
+            got.pointer("/properties/resumeFromRunId/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            got.pointer("/properties/labels/minProperties"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            got.pointer("/properties/labels/maxProperties"),
+            Some(&json!(4))
+        );
+        assert_eq!(
+            got.pointer("/properties/labels/additionalProperties/type"),
+            Some(&json!("string"))
+        );
+        assert_eq!(got["required"], json!(["resumeFromRunId"]));
+    }
+
+    #[test]
+    fn sanitize_schema_rejects_unverified_validation_keywords() {
         for (keyword, value) in [
             ("exclusiveMinimum", json!(0)),
             ("exclusiveMaximum", json!(10)),
             ("multipleOf", json!(0.5)),
             ("propertyNames", json!({"pattern":"^[a-z]+$"})),
-            ("pattern", json!("^[a-z]+$")),
             ("uniqueItems", json!(true)),
-            ("minProperties", json!(1)),
-            ("maxProperties", json!(4)),
         ] {
             let mut value_schema = json!({ "type": "string" });
             value_schema
@@ -1309,6 +1350,7 @@ mod schema_tests {
                 "properties": { "value": value_schema }
             });
             let err = sanitize_schema(&input, "tool 'agent'").unwrap_err();
+
             assert_eq!(err.kind, FailureKind::BadRequest);
             assert!(
                 err.message.contains(keyword),
@@ -1316,6 +1358,66 @@ mod schema_tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn sanitize_schema_still_rejects_unknown_keywords() {
+        let input = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "x-unknown-validation": true
+                }
+            }
+        });
+        let err = sanitize_schema(&input, "tool 'agent'").unwrap_err();
+
+        assert_eq!(err.kind, FailureKind::BadRequest);
+        assert!(err.message.contains("x-unknown-validation"));
+    }
+
+    #[test]
+    fn build_tools_preserves_subagent_workflow_pattern() {
+        let req = InternalRequest {
+            requested_model: "gemini".into(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![crate::types::ToolDef {
+                name: "SubagentWorkflow".into(),
+                description: Some("resume a subagent workflow".into()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "resumeFromRunId": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z0-9_-]+$",
+                            "description": "run id"
+                        }
+                    }
+                }),
+            }],
+            tool_choice: None,
+            tool_choice_name: None,
+            params: Default::default(),
+            stream: true,
+            include_usage: false,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        };
+
+        let tools = GeminiAdapter::build_tools(&req).unwrap().unwrap();
+        let schema = &tools[0]["functionDeclarations"][0]["parametersJsonSchema"];
+
+        assert_eq!(
+            schema.pointer("/properties/resumeFromRunId/pattern"),
+            Some(&json!("^[A-Za-z0-9_-]+$"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/resumeFromRunId/description"),
+            Some(&json!("run id"))
+        );
     }
 
     #[test]
