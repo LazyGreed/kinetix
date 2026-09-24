@@ -111,9 +111,19 @@ pub struct DiscoveredModel {
     pub max_output_tokens: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningCapabilityMode {
+    Toggle,
+    Level,
+    ManualBudget,
+    Adaptive,
+}
+
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct ReasoningCapability {
-    pub mode: crate::types::ThinkingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ReasoningCapabilityMode>,
     pub levels: Vec<String>,
     pub can_disable: bool,
     pub upstream_format: String,
@@ -154,7 +164,7 @@ fn canonical_reasoning_levels(
 fn reasoning_capability(
     levels: Vec<String>,
     upstream_levels: std::collections::HashMap<String, String>,
-    mode: crate::types::ThinkingMode,
+    mode: ReasoningCapabilityMode,
     upstream_format: impl Into<String>,
     can_disable: Option<bool>,
 ) -> Option<ReasoningCapability> {
@@ -163,7 +173,7 @@ fn reasoning_capability(
     }
     let inferred_disable = levels.iter().any(|level| level == "off");
     Some(ReasoningCapability {
-        mode,
+        mode: Some(mode),
         levels,
         can_disable: can_disable.unwrap_or(inferred_disable),
         upstream_format: upstream_format.into(),
@@ -178,7 +188,11 @@ pub fn reasoning_metadata_declared(metadata: &serde_json::Value) -> bool {
     if metadata
         .get("reasoning")
         .and_then(serde_json::Value::as_object)
-        .is_some_and(|reasoning| reasoning.contains_key("levels"))
+        .is_some_and(|reasoning| {
+            reasoning.contains_key("supported")
+                || reasoning.contains_key("mode")
+                || reasoning.contains_key("levels")
+        })
     {
         return true;
     }
@@ -199,18 +213,45 @@ pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<Re
     // Plugins may already return the normalized shape under
     // capabilities_json.reasoning or reasoning_capability.
     let normalized = metadata.get("reasoning_capability").or_else(|| {
-        metadata
-            .get("reasoning")
-            .filter(|value| value.get("levels").is_some())
+        metadata.get("reasoning").filter(|value| {
+            value.as_object().is_some_and(|reasoning| {
+                reasoning.contains_key("supported")
+                    || reasoning.contains_key("mode")
+                    || reasoning.contains_key("levels")
+            })
+        })
     });
     if let Some(value) = normalized {
+        if value.get("supported").and_then(serde_json::Value::as_bool) == Some(false) {
+            return None;
+        }
+
         let (levels, mut upstream_levels) =
             canonical_reasoning_levels(value.get("levels").unwrap_or(&serde_json::Value::Null));
         let mode = match value.get("mode").and_then(serde_json::Value::as_str) {
-            Some("manual_budget") => crate::types::ThinkingMode::ManualBudget,
-            Some("adaptive") => crate::types::ThinkingMode::Adaptive,
-            _ => crate::types::ThinkingMode::Level,
+            Some("toggle") => Some(ReasoningCapabilityMode::Toggle),
+            Some("level") => Some(ReasoningCapabilityMode::Level),
+            Some("manual_budget") => Some(ReasoningCapabilityMode::ManualBudget),
+            Some("adaptive") => Some(ReasoningCapabilityMode::Adaptive),
+            Some(_) => return None,
+            None if levels.is_empty() => None,
+            None => Some(ReasoningCapabilityMode::Level),
         };
+        if matches!(mode, Some(ReasoningCapabilityMode::Toggle)) && !levels.is_empty() {
+            return None;
+        }
+        if matches!(
+            mode,
+            Some(
+                ReasoningCapabilityMode::Level
+                    | ReasoningCapabilityMode::ManualBudget
+                    | ReasoningCapabilityMode::Adaptive
+            )
+        ) && levels.is_empty()
+        {
+            return None;
+        }
+
         let upstream_format = value
             .get("upstream_format")
             .and_then(serde_json::Value::as_str)
@@ -238,42 +279,44 @@ pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<Re
             }
         }
 
-        return reasoning_capability(
-            levels,
-            upstream_levels,
+        let inferred_disable = levels.iter().any(|level| level == "off");
+        return Some(ReasoningCapability {
             mode,
-            upstream_format,
-            value
+            levels,
+            can_disable: value
                 .get("can_disable")
-                .and_then(serde_json::Value::as_bool),
-        );
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(inferred_disable),
+            upstream_format: upstream_format.to_string(),
+            upstream_levels,
+        });
     }
 
     let candidates = [
         (
             "/supportedThinkingEfforts",
             "provider_supported_thinking_efforts",
-            crate::types::ThinkingMode::Level,
+            ReasoningCapabilityMode::Level,
         ),
         (
             "/reasoning/supported_efforts",
             "provider_reasoning_supported_efforts",
-            crate::types::ThinkingMode::Level,
+            ReasoningCapabilityMode::Level,
         ),
         (
             "/supported_reasoning_levels",
             "provider_supported_reasoning_levels",
-            crate::types::ThinkingMode::Level,
+            ReasoningCapabilityMode::Level,
         ),
         (
             "/thinking/levels",
             "provider_thinking_levels",
-            crate::types::ThinkingMode::Level,
+            ReasoningCapabilityMode::Level,
         ),
         (
             "/capabilities/effort_tiers",
             "provider_effort_tiers",
-            crate::types::ThinkingMode::Level,
+            ReasoningCapabilityMode::Level,
         ),
     ];
     for (pointer, upstream_format, mode) in candidates {
@@ -292,7 +335,7 @@ pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<Re
 pub fn thinking_map_for_reasoning(
     capability: &ReasoningCapability,
 ) -> Option<crate::types::ThinkingMap> {
-    if capability.mode != crate::types::ThinkingMode::Level {
+    if capability.mode != Some(ReasoningCapabilityMode::Level) {
         return None;
     }
     let level_field = match capability.upstream_format.as_str() {
@@ -327,7 +370,7 @@ pub fn thinking_map_for_reasoning_with_wire(
     if let Some(map) = thinking_map_for_reasoning(capability) {
         return Some(map);
     }
-    if capability.mode != crate::types::ThinkingMode::Level
+    if capability.mode != Some(ReasoningCapabilityMode::Level)
         || wire != crate::types::WireFormat::Openai
         || !matches!(
             capability.upstream_format.as_str(),
@@ -576,6 +619,37 @@ mod reasoning_discovery_tests {
     }
 
     #[test]
+    fn preserves_supported_only_plugin_reasoning() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "reasoning": {
+                "supported": true
+            }
+        });
+        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        assert_eq!(capability.mode, None);
+        assert!(capability.levels.is_empty());
+        assert!(thinking_map_for_reasoning(&capability).is_none());
+    }
+
+    #[test]
+    fn preserves_toggle_only_plugin_reasoning() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "reasoning": {
+                "supported": true,
+                "mode": "toggle",
+                "can_disable": true
+            }
+        });
+        let capability = normalize_reasoning_capability(&metadata).unwrap();
+        assert_eq!(capability.mode, Some(ReasoningCapabilityMode::Toggle));
+        assert!(capability.levels.is_empty());
+        assert!(capability.can_disable);
+        assert!(thinking_map_for_reasoning(&capability).is_none());
+    }
+
+    #[test]
     fn accepts_plugin_normalized_reasoning_capability() {
         let metadata = serde_json::json!({
             "reasoning": {
@@ -586,7 +660,10 @@ mod reasoning_discovery_tests {
             }
         });
         let capability = normalize_reasoning_capability(&metadata).unwrap();
-        assert_eq!(capability.mode, crate::types::ThinkingMode::Adaptive);
+        assert_eq!(
+            capability.mode,
+            Some(ReasoningCapabilityMode::Adaptive)
+        );
         assert_eq!(capability.upstream_format, "anthropic_effort");
         assert!(thinking_map_for_reasoning(&capability).is_none());
     }
