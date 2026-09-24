@@ -6087,9 +6087,7 @@ mod reasoning_discovery_control_plane_tests {
         let db_path = home.join("kinetix.db");
         let database_url = format!("sqlite://{}", db_path.display());
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
