@@ -439,11 +439,19 @@ fn conservative_cost(prices: &Prices, input: u64, output: u64) -> Option<f64> {
     if !prices.is_configured() {
         return None;
     }
-    let input_base = prices.input_per_1m.unwrap_or(0.0);
+    let input_base = match prices.input_per_1m {
+        Some(price) => price,
+        None if input == 0 => 0.0,
+        None => return None,
+    };
     let input_rate = input_base
         .max(prices.cached_per_1m.unwrap_or(input_base))
         .max(prices.cache_write_per_1m.unwrap_or(input_base));
-    let output_base = prices.output_per_1m.unwrap_or(0.0);
+    let output_base = match prices.output_per_1m {
+        Some(price) => price,
+        None if output == 0 => 0.0,
+        None => return None,
+    };
     let output_rate = output_base.max(prices.thinking_per_1m.unwrap_or(output_base));
     Some((input as f64 * input_rate + output as f64 * output_rate) / 1_000_000.0)
 }
@@ -573,6 +581,26 @@ mod tests {
             .into_iter()
             .filter_map(|handle| handle.join().unwrap().ok())
             .collect()
+    }
+
+    #[test]
+    fn conservative_cost_is_unknown_with_input_known_output_unknown() {
+        let prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: None,
+            ..Default::default()
+        };
+        assert!(conservative_cost(&prices, 100, 50).is_none());
+    }
+
+    #[test]
+    fn conservative_cost_is_unknown_with_output_known_input_unknown() {
+        let prices = Prices {
+            input_per_1m: None,
+            output_per_1m: Some(2.0),
+            ..Default::default()
+        };
+        assert!(conservative_cost(&prices, 100, 50).is_none());
     }
 
     #[test]
