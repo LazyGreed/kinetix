@@ -583,24 +583,69 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn conservative_cost_is_unknown_with_input_known_output_unknown() {
-        let prices = Prices {
-            input_per_1m: Some(1.0),
-            output_per_1m: None,
-            ..Default::default()
+    fn request(model: &str) -> InternalRequest {
+        InternalRequest {
+            requested_model: model.into(),
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_choice_name: None,
+            params: crate::types::SamplingParams {
+                max_tokens: Some(50),
+                ..Default::default()
+            },
+            stream: false,
+            include_usage: false,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        }
+    }
+
+    fn snapshot_with_prices(prices: Prices) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        let model = ModelRow {
+            id: "model".into(),
+            provider_id: "provider".into(),
+            upstream_id: "priced".into(),
+            display_name: "Priced".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: Some(50),
+            capabilities: "{}".into(),
+            prices: serde_json::to_string(&prices).unwrap(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: String::new(),
+            opaque_state_plugin: String::new(),
         };
-        assert!(conservative_cost(&prices, 100, 50).is_none());
+        snapshot.models.insert(model.id.clone(), model);
+        snapshot
     }
 
     #[test]
-    fn conservative_cost_is_unknown_with_output_known_input_unknown() {
-        let prices = Prices {
+    fn estimate_is_unknown_with_input_known_output_unknown() {
+        let snapshot = snapshot_with_prices(Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: None,
+            ..Default::default()
+        });
+        let estimate = estimate_request(&snapshot, &key(), &request("priced")).unwrap();
+        assert!(estimate.cost.is_none());
+    }
+
+    #[test]
+    fn estimate_is_unknown_with_output_known_input_unknown() {
+        let snapshot = snapshot_with_prices(Prices {
             input_per_1m: None,
             output_per_1m: Some(2.0),
             ..Default::default()
-        };
-        assert!(conservative_cost(&prices, 100, 50).is_none());
+        });
+        let estimate = estimate_request(&snapshot, &key(), &request("priced")).unwrap();
+        assert!(estimate.cost.is_none());
     }
 
     #[test]
