@@ -4415,6 +4415,45 @@ mod route_policy_tests {
     }
 
     #[test]
+    fn discovered_v1_openai_disable_is_executable_and_emits_none() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "transport": {"format": "openai"},
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["low", "high"],
+                "can_disable": true
+            }
+        });
+        let capability =
+            crate::adapters::normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
+        let map = crate::adapters::thinking_map_for_reasoning_with_wire(
+            &capability,
+            crate::types::WireFormat::Openai,
+        )
+        .unwrap();
+        assert_eq!(map.levels.get("off"), Some(&serde_json::json!("none")));
+
+        let mut target = target();
+        target.model = model(serde_json::to_value(&map).unwrap());
+        let mut req = request();
+        req.thinking = Some(crate::types::ThinkingLevel::Off);
+
+        assert!(check_thinking_translation(&target, &req).is_ok());
+
+        let ctx = UpstreamContext {
+            provider: &target.provider,
+            model: &target.model,
+            account_id: Some(target.account.id.as_str()),
+            credential: "test".into(),
+        };
+        let adapter = crate::adapters::openai::OpenAiAdapter::new();
+        let body = adapter.build_body(&ctx, &req).unwrap();
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
     fn translated_thinking_requires_an_explicit_model_mapping() {
         let mut req = request();
         let mut target = target();
