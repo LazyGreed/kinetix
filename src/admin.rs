@@ -6075,20 +6075,56 @@ mod reasoning_discovery_control_plane_tests {
     }
 
     #[tokio::test]
-    async fn import_then_rediscover_preserves_discovery_provenance() {
-        let db_path = std::env::temp_dir().join(format!(
-            "kinetix-discovery-provenance-{}.db",
+    async fn admin_rediscovery_preserves_import_provenance() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let home = std::env::temp_dir().join(format!(
+            "kinetix-admin-rediscovery-{}",
             uuid::Uuid::new_v4().simple()
         ));
+        std::fs::create_dir_all(&home).unwrap();
+        let db_path = home.join("kinetix.db");
         let database_url = format!("sqlite://{}", db_path.display());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = r#"{"data":[{"id":"reasoner","supportedThinkingEfforts":["low","high"]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let config = Arc::new(
+            crate::config::Config::build(crate::config::CliOverrides {
+                home: Some(home.clone()),
+                database_url: Some(database_url.clone()),
+                master_key: Some(hex::encode([7u8; 32])),
+                admin_token: Some("test-admin-password".into()),
+                allow_private_upstreams: Some(true),
+                allow_insecure_tls: Some(true),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
         let pool = db::connect(&database_url).await.unwrap();
         db::migrate(&pool).await.unwrap();
 
+        let crypto = Arc::new(crate::crypto::Crypto::new(&config.master_key));
         let provider_id = db::insert_provider(
             &pool,
             &db::NewProvider {
                 name: "test",
-                base_url: "https://api.example.com",
+                base_url: &format!("http://{address}"),
                 wire_format: WireFormat::Openai,
                 auth_scheme: AuthScheme::Bearer,
                 custom_header_name: None,
@@ -6096,15 +6132,30 @@ mod reasoning_discovery_control_plane_tests {
                 extra_headers: json!({}),
                 timeout_ms: 1000,
                 capability_mode: "permissive",
-                models_path: None,
+                models_path: Some("/models"),
                 rate_limit_rules: json!({}),
                 follow_redirects: false,
                 credential_hosts: "",
-                allow_insecure_tls: false,
+                allow_insecure_tls: true,
                 wire_plugin: "",
                 credential_plugin: "",
                 model_source_plugin: "",
             },
+        )
+        .await
+        .unwrap();
+
+        let encrypted = crypto.encrypt("test-api-key").unwrap();
+        db::insert_account(
+            &pool,
+            &provider_id,
+            "default",
+            &encrypted,
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
         )
         .await
         .unwrap();
@@ -6132,30 +6183,42 @@ mod reasoning_discovery_control_plane_tests {
         .await
         .unwrap();
 
-        let imported = db::get_model(&pool, &model_id).await.unwrap().unwrap();
-        persist_model_discovery_update(
-            &pool,
-            &imported,
-            json!({
-                "last_seen": "2026-09-24T00:00:00Z",
-                "context_window": 200000,
-                "disappeared": false
-            }),
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry,
+            crypto,
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool.clone(), 16),
+            0,
+        );
+
+        let response = discover_models(
+            State(state),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id),
         )
         .await
         .unwrap();
+        assert_eq!(response.0["models"][0]["id"], "reasoner");
+        assert_eq!(response.0["models"][0]["already_imported"], true);
+
+        server.await.unwrap();
 
         let rediscovered = db::get_model(&pool, &model_id).await.unwrap().unwrap();
         let discovery: Value = serde_json::from_str(&rediscovered.discovery).unwrap();
         assert_eq!(discovery["imported_from_discovery"], true);
         assert_eq!(discovery["import_source"], "dashboard");
-        assert_eq!(discovery["context_window"], 200000);
         assert_eq!(discovery["disappeared"], false);
+        assert!(discovery.get("last_seen").is_some());
 
         pool.close().await;
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
-        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
