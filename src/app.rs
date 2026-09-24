@@ -7,7 +7,7 @@ use dashmap::DashMap;
 
 use crate::adapters::AdapterRegistry;
 use crate::config::Config;
-use crate::credentials::StaticKeyStrategy;
+use crate::credentials::{CredentialRotationError, StaticKeyStrategy};
 use crate::crypto::Crypto;
 use crate::db::Pool;
 use crate::logqueue::UsageLogQueue;
@@ -28,6 +28,9 @@ pub struct AppState {
     /// before falling back to the static strategy.
     pub plugin_credentials:
         Arc<dashmap::DashMap<String, Arc<dyn crate::credentials::CredentialStrategy>>>,
+    /// Account-scoped forced-rotation singleflight gates. The key set is
+    /// bounded by configured plugin-backed accounts.
+    credential_rotation_gates: Arc<DashMap<String, Arc<CredentialRotationGate>>>,
     pub adapters: AdapterRegistry,
     pub http: reqwest::Client,
     /// Pinned provider clients keyed by validated host/address set. This keeps
@@ -72,6 +75,22 @@ pub struct AppState {
     /// run off the request path; if the queue is full a hook is dropped rather
     /// than delaying a client request.
     hook_tx: tokio::sync::mpsc::Sender<HookJob>,
+}
+
+struct CredentialRotationGate {
+    lock: tokio::sync::Mutex<()>,
+    generation: AtomicU64,
+    last_result: parking_lot::Mutex<Option<std::result::Result<bool, CredentialRotationError>>>,
+}
+
+impl CredentialRotationGate {
+    fn new() -> Self {
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+            generation: AtomicU64::new(0),
+            last_result: parking_lot::Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -127,6 +146,7 @@ impl AppState {
             crypto,
             credentials,
             plugin_credentials: Arc::new(DashMap::new()),
+            credential_rotation_gates: Arc::new(DashMap::new()),
             adapters: AdapterRegistry::new(),
             http,
             outbound_clients: Arc::new(DashMap::new()),
@@ -238,6 +258,65 @@ impl AppState {
             return strategy.resolve(account).await;
         }
         self.credentials.resolve(account).await
+    }
+
+    /// Force renewal for a plugin-backed credential after an upstream auth
+    /// failure. Calls are serialized per account. A waiter re-resolves under
+    /// the lock and skips a second rotation when another request already
+    /// replaced the credential that failed upstream.
+    pub async fn rotate_credential_after_auth_error(
+        &self,
+        provider: &crate::db::ProviderRow,
+        account: &crate::db::AccountRow,
+        failed_secret: &str,
+    ) -> std::result::Result<bool, CredentialRotationError> {
+        use crate::credentials::CredentialStrategy;
+        let Some(r) = provider.credential_plugin_ref() else {
+            return Ok(false);
+        };
+        let strategy = self
+            .plugin_credentials
+            .get(&r.plugin_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| {
+                CredentialRotationError::new(
+                    "plugin_internal",
+                    format!(
+                        "provider '{}' is bound to unavailable plugin credential strategy '{}'",
+                        provider.name,
+                        r.to_string_ref()
+                    ),
+                    true,
+                    None,
+                )
+            })?;
+
+        let gate_key = format!("{}:{}", provider.id, account.id);
+        let gate = self
+            .credential_rotation_gates
+            .entry(gate_key)
+            .or_insert_with(|| Arc::new(CredentialRotationGate::new()))
+            .clone();
+
+        // Capture the generation before waiting. If it changes while this
+        // request is queued, the in-flight caller already completed the
+        // singleflight operation and we reuse that exact result.
+        let observed_generation = gate.generation.load(Ordering::Acquire);
+        let _guard = gate.lock.lock().await;
+        if gate.generation.load(Ordering::Acquire) != observed_generation {
+            if let Some(result) = gate.last_result.lock().clone() {
+                return result;
+            }
+        }
+
+        let result = match strategy.resolve(account).await {
+            Ok(current) if current.secret != failed_secret => Ok(true),
+            _ => strategy.rotate(account).await.map(|()| true),
+        };
+
+        *gate.last_result.lock() = Some(result.clone());
+        gate.generation.fetch_add(1, Ordering::Release);
+        result
     }
 
     /// Count a route target skipped during eligibility filtering.

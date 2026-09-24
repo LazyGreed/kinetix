@@ -88,6 +88,7 @@ pub enum PluginFault {
         code: String,
         message: String,
         retryable: bool,
+        retry_after: Option<u64>,
     },
     /// The client disconnected and the invocation was terminated (§7.2). This
     /// is deliberately not a fault and never counts against the circuit.
@@ -1196,6 +1197,7 @@ mod tests {
             code: "rate_limited".into(),
             message: "429".into(),
             retryable: true,
+            retry_after: Some(5),
         };
         assert!(!e.counts_against_circuit());
         assert_eq!(e.code(), "rate_limited");

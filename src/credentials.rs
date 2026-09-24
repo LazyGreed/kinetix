@@ -33,6 +33,46 @@ pub struct ResolvedCredential {
     pub rotated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRotationError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl CredentialRotationError {
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retryable: bool,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable,
+            retry_after_secs,
+        }
+    }
+
+    pub fn invalid_credential(&self) -> bool {
+        !self.retryable
+            && matches!(
+                self.code.as_str(),
+                "credential_expired" | "unauthorized" | "auth_error"
+            )
+    }
+}
+
+impl std::fmt::Display for CredentialRotationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for CredentialRotationError {}
+
 impl ResolvedCredential {
     fn static_key(secret: String) -> Self {
         ResolvedCredential {
@@ -62,12 +102,20 @@ pub trait CredentialStrategy: Send + Sync {
     }
 
     /// Force a rotation of the credential (FR-11.2 rotation). Static strategies
-    /// cannot rotate and report an error.
-    async fn rotate(&self, _account: &AccountRow) -> Result<()> {
-        anyhow::bail!(
-            "credential strategy '{}' does not support rotation",
-            self.name()
-        )
+    /// cannot rotate and report a non-retryable configuration error.
+    async fn rotate(
+        &self,
+        _account: &AccountRow,
+    ) -> std::result::Result<(), CredentialRotationError> {
+        Err(CredentialRotationError::new(
+            "invalid_configuration",
+            format!(
+                "credential strategy '{}' does not support rotation",
+                self.name()
+            ),
+            false,
+            None,
+        ))
     }
 }
 

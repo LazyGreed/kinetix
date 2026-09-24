@@ -733,7 +733,11 @@ pub async fn run(
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
-    for target in targets.iter() {
+    let mut pending_targets: std::collections::VecDeque<_> = targets.into();
+    let mut auth_retried_accounts = std::collections::HashSet::new();
+
+    while let Some(target_owned) = pending_targets.pop_front() {
+        let target = &target_owned;
         if let (Some(skip), Some(target_id)) = (
             skip_logical_target.as_deref(),
             target.route_target_id.as_deref(),
@@ -1140,6 +1144,102 @@ pub async fn run(
                     "upstream_error",
                     format!("HTTP {status} {:?}", failure.kind),
                 );
+
+                if failure.kind == FailureKind::AuthError
+                    && !auth_retried_accounts.contains(&target.account.id)
+                {
+                    match state
+                        .rotate_credential_after_auth_error(
+                            &target.provider,
+                            &target.account,
+                            &ctx.credential,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            auth_retried_accounts.insert(target.account.id.clone());
+                            // Credential renewal is part of this logical target
+                            // attempt, not a route fallback hop.
+                            attempts_done = attempts_done.saturating_sub(1);
+                            pending_targets.push_front(target_owned.clone());
+                            trace.step(
+                                "attempt",
+                                Some(target.account.label.clone()),
+                                "auth failed; refreshed plugin credential and retrying same target",
+                            );
+                            state.flight.record(
+                                &meta.request_id,
+                                started.elapsed().as_millis() as u64,
+                                "credential_rotated_retry",
+                                target.account.label.clone(),
+                            );
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) if error.invalid_credential() => {
+                            crate::alerts::record_credential_failure();
+                            tracing::warn!(
+                                account = %target.account.id,
+                                code = %error.code,
+                                "credential rotation confirmed a non-retryable invalid credential"
+                            );
+                            // Fall through to the original AuthError handling,
+                            // which disables the account and tries another one.
+                        }
+                        Err(error) => {
+                            crate::alerts::record_credential_failure();
+                            let cooldown = error
+                                .retry_after_secs
+                                .unwrap_or(if error.retryable { 5 } else { 30 })
+                                .min(3600);
+                            let message = format!("credential refresh failed: {}", error.message);
+                            let _ = pool::mark_rate_limited(
+                                &state.pool,
+                                &target.account.id,
+                                cooldown,
+                                &message,
+                            )
+                            .await;
+                            // Keep the request planner's in-memory snapshot in
+                            // sync with the cooldown written above.
+                            let _ = state.registry.reload(&state.pool).await;
+                            let detail = format!(
+                                "{}:credential_refresh(cooldown {}s)",
+                                target.account.label, cooldown
+                            );
+                            meta.fallback_path.push(detail.clone());
+                            trace.step("attempt", Some(target.account.label.clone()), detail);
+                            tracing::warn!(
+                                account = %target.account.id,
+                                code = %error.code,
+                                retryable = error.retryable,
+                                cooldown,
+                                "credential rotation failed; cooling down account"
+                            );
+
+                            let refresh_error = ProxyError::all_unavailable(
+                                "credential refresh temporarily unavailable",
+                                Some(cooldown),
+                            );
+                            let can_fallback = allow_fallback
+                                && route_allows_fallback(route.as_ref(), FailureKind::AuthError);
+                            if !can_fallback {
+                                trace.finish("failed");
+                                state.live.finish(
+                                    &meta.request_id,
+                                    "failed",
+                                    started.elapsed().as_millis() as u64,
+                                    None,
+                                    None,
+                                );
+                                let _ = db::insert_route_trace(&state.pool, &trace).await;
+                                return Err(refresh_error);
+                            }
+                            last_error = Some(refresh_error);
+                            continue;
+                        }
+                    }
+                }
 
                 handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
                 let client_error = preserve_anthropic_error(
