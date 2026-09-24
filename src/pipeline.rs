@@ -4518,7 +4518,6 @@ mod route_policy_tests {
         )
         .is_none());
 
-        let adapter = PluginThinkingTestAdapter;
         let mut target = target();
         target.provider.wire_format = "plugin".into();
         target.provider.wire_plugin = "plugin:test/provider-adapter".into();
@@ -4527,12 +4526,20 @@ mod route_policy_tests {
         })
         .to_string();
 
+        let registry = crate::adapters::AdapterRegistry::new();
+        registry.register_plugin(
+            "plugin:test/provider-adapter",
+            Arc::new(PluginThinkingTestAdapter),
+        );
+        let adapter = registry.for_provider(&target.provider);
+        assert!(adapter.handles_thinking_translation());
+
         let mut req = request();
         req.thinking = Some(crate::types::ThinkingLevel::High);
 
         assert!(check_thinking_translation(&target, &req).is_err());
         assert!(
-            check_thinking_translation_for_adapter(&adapter, &target, &req).is_ok(),
+            check_thinking_translation_for_adapter(adapter.as_ref(), &target, &req).is_ok(),
             "plugin-owned thinking must reach the adapter even without a core ThinkingMap"
         );
 
@@ -4542,7 +4549,7 @@ mod route_policy_tests {
             account_id: Some(target.account.id.as_str()),
             credential: "test".into(),
         };
-        let body = build_upstream_body(&adapter, &ctx, &req, false).unwrap();
+        let body = build_upstream_body(adapter.as_ref(), &ctx, &req, false).unwrap();
         assert_eq!(body["reasoning_effort"], "high");
     }
 

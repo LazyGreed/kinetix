@@ -1120,6 +1120,12 @@ fn discovered_observation(
     }
 }
 
+fn discovered_capabilities(observation: &DiscoveredObservation) -> Value {
+    json!({
+        "reasoning": observation.reasoning_support,
+    })
+}
+
 fn merge_model_discovery(existing: &str, fresh: Value) -> Value {
     let mut merged = serde_json::from_str::<Value>(existing)
         .ok()
@@ -1293,9 +1299,7 @@ pub async fn discover_models(
                     "context_window": m.context_window,
                     "max_output_tokens": m.max_output_tokens,
                     "display_name": m.display_name,
-                    "capabilities": {
-                        "reasoning": observation.reasoning_support,
-                    },
+                    "capabilities": discovered_capabilities(observation),
                     "reasoning_capability": &observation.reasoning,
                     "thinking_map": &observation.thinking_map,
                     "disappeared": false,
@@ -1308,9 +1312,7 @@ pub async fn discover_models(
             "display_name": m.display_name,
             "context_window": m.context_window,
             "max_output_tokens": m.max_output_tokens,
-            "capabilities": {
-                "reasoning": observation.reasoning_support,
-            },
+            "capabilities": discovered_capabilities(observation),
             "reasoning_capability": &observation.reasoning,
             "thinking_map": &observation.thinking_map,
             "already_imported": existing.iter().any(|e| e.upstream_id == m.id),
@@ -6013,14 +6015,12 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(supported.reasoning_support, Some(true));
         assert!(supported.reasoning.is_some());
 
-        let encoded = json!({
-            "unknown": unknown.reasoning_support,
-            "unsupported": unsupported.reasoning_support,
-            "supported": supported.reasoning_support,
-        });
-        assert!(encoded["unknown"].is_null());
-        assert_eq!(encoded["unsupported"], false);
-        assert_eq!(encoded["supported"], true);
+        let unknown_capabilities = discovered_capabilities(&unknown);
+        let unsupported_capabilities = discovered_capabilities(&unsupported);
+        let supported_capabilities = discovered_capabilities(&supported);
+        assert!(unknown_capabilities["reasoning"].is_null());
+        assert_eq!(unsupported_capabilities["reasoning"], false);
+        assert_eq!(supported_capabilities["reasoning"], true);
     }
 
     #[test]
