@@ -663,10 +663,7 @@ mod reasoning_discovery_tests {
             }
         });
         let capability = normalize_reasoning_capability(&metadata).unwrap();
-        assert_eq!(
-            capability.mode,
-            Some(ReasoningCapabilityMode::Adaptive)
-        );
+        assert_eq!(capability.mode, Some(ReasoningCapabilityMode::Adaptive));
         assert_eq!(capability.upstream_format, "anthropic_effort");
         assert!(thinking_map_for_reasoning(&capability).is_none());
     }

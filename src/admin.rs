@@ -5883,10 +5883,7 @@ mod reasoning_discovery_control_plane_tests {
     #[test]
     fn plugin_descriptive_reasoning_survives_discovery() {
         for (reasoning, expected_mode) in [
-            (
-                json!({"supported": true}),
-                None,
-            ),
+            (json!({"supported": true}), None),
             (
                 json!({"supported": true, "mode": "toggle", "can_disable": true}),
                 Some(crate::adapters::ReasoningCapabilityMode::Toggle),
