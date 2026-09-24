@@ -1057,6 +1057,14 @@ struct DiscoveredObservation {
     thinking_map: Option<ThinkingMap>,
 }
 
+fn reasoning_wire_context(provider: &db::ProviderRow) -> WireFormat {
+    if provider.wire_plugin_ref().is_some() {
+        WireFormat::Plugin
+    } else {
+        provider.wire()
+    }
+}
+
 fn discovered_observation(
     model: crate::adapters::DiscoveredModel,
     provider_metadata: Option<Value>,
@@ -1195,7 +1203,7 @@ pub async fn discover_models(
                         },
                         provider_metadata,
                         fallback_metadata,
-                        provider.wire(),
+                        reasoning_wire_context(&provider),
                     )
                 })
                 .collect()
@@ -1372,7 +1380,12 @@ async fn discover_models_native(
         .into_iter()
         .map(|model| {
             let provider_metadata = raw_discovery_metadata(&parsed, &model.id).cloned();
-            discovered_observation(model, provider_metadata, None, provider.wire())
+            discovered_observation(
+                model,
+                provider_metadata,
+                None,
+                reasoning_wire_context(provider),
+            )
         })
         .collect())
 }
