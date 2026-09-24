@@ -551,18 +551,21 @@ pub fn thinking_map_for_reasoning_with_wire(
     capability: &ReasoningCapability,
     wire: crate::types::WireFormat,
 ) -> Option<crate::types::ThinkingMap> {
-    if let Some(map) = thinking_map_for_reasoning(capability) {
-        return Some(map);
-    }
-    if capability.mode != Some(ReasoningCapabilityMode::Level)
-        || wire != crate::types::WireFormat::Openai
-        || !matches!(
-            capability.upstream_format.as_str(),
-            "provider_supported_thinking_efforts" | "provider_supported_reasoning_levels"
-        )
-    {
+    if capability.mode != Some(ReasoningCapabilityMode::Level) {
         return None;
     }
+
+    let level_field = match (capability.upstream_format.as_str(), wire) {
+        ("openai_effort", crate::types::WireFormat::Openai)
+        | (
+            "provider_supported_thinking_efforts" | "provider_supported_reasoning_levels",
+            crate::types::WireFormat::Openai,
+        ) => "reasoning_effort",
+        // Per-model Responses transport is descriptive until runtime adapter
+        // selection can actually dispatch this model through the Responses API.
+        ("responses_effort", _) => return None,
+        _ => return None,
+    };
 
     let levels = capability
         .levels
@@ -580,7 +583,7 @@ pub fn thinking_map_for_reasoning_with_wire(
         levels,
         mode: Some(crate::types::ThinkingMode::Level),
         budget_field: None,
-        level_field: Some("reasoning_effort".to_string()),
+        level_field: Some(level_field.to_string()),
     })
 }
 
