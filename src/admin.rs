@@ -5872,7 +5872,10 @@ mod reasoning_discovery_control_plane_tests {
         );
 
         let reasoning = observation.reasoning.unwrap();
-        assert_eq!(reasoning.mode, crate::types::ThinkingMode::Adaptive);
+        assert_eq!(
+            reasoning.mode,
+            Some(crate::adapters::ReasoningCapabilityMode::Adaptive)
+        );
         assert_eq!(reasoning.upstream_format, "anthropic_effort");
         assert!(observation.thinking_map.is_none());
     }
