@@ -4044,32 +4044,20 @@ pub(crate) async fn register_enabled_plugin_capabilities(state: &AppState, id: &
     // translation library — core still owns the outbound streaming send. The
     // `plugin-adapter` world imports no network capability, so registering it
     // does not widen the plugin's authority.
-    if !provides.provider_adapters.is_empty() {
-        match crate::plugins::adapter::PluginAdapter::new(
+    if !provides.provider_adapters.is_empty()
+        && let Err(e) = crate::plugins::adapter::register_declared_adapters(
+            &state.adapters,
             (*manager).clone(),
-            id.to_string(),
-            provides.thinking_translation,
+            id,
+            &provides,
         )
         .await
-        {
-            Ok(adapter) => {
-                let adapter: std::sync::Arc<dyn crate::adapters::Adapter> =
-                    std::sync::Arc::new(adapter);
-                // Key by the full namespaced reference for each declared
-                // capability name, plus the bare plugin id (§6.0).
-                for name in &provides.provider_adapters {
-                    state.register_plugin_adapter(format!("plugin:{id}/{name}"), adapter.clone());
-                }
-                state.register_plugin_adapter(id.to_string(), adapter);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    plugin = %id,
-                    error = %e,
-                    "plugin declares provider_adapters but its adapter world could not be loaded; bound providers will fail closed"
-                );
-            }
-        }
+    {
+        tracing::warn!(
+            plugin = %id,
+            error = %e,
+            "plugin declares provider_adapters but its adapter world could not be loaded; bound providers will fail closed"
+        );
     }
 
     auto_provision_plugin_providers(state, id).await;
