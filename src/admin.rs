@@ -4320,7 +4320,10 @@ pub async fn import_config(
             ));
         }
         if let Some(mode) = p.get("credential_mode").filter(|mode| !mode.is_null()) {
-            match mode.as_str().and_then(crate::plugins::CredentialMode::parse) {
+            match mode
+                .as_str()
+                .and_then(crate::plugins::CredentialMode::parse)
+            {
                 Some(_) => {}
                 None => problems.push(format!(
                     "provider '{name}': credential_mode must be 'manual', 'auth_flow', or 'none'"
@@ -4458,8 +4461,7 @@ pub async fn import_config(
             .map_err(ApiError::internal)?;
             reconcile_provider_account_mode(&state, &existing_id, credential_mode).await?;
         } else {
-            let credential_mode =
-                explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
+            let credential_mode = explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
             let id = db::insert_provider(
                 &state.pool,
                 &db::NewProvider {
@@ -8513,7 +8515,10 @@ mod credential_enrollment_regression_tests {
             .unwrap();
         assert_eq!(oauth_accounts.len(), 1);
         assert_eq!(
-            target.crypto.decrypt(&oauth_accounts[0].secret_enc).unwrap(),
+            target
+                .crypto
+                .decrypt(&oauth_accounts[0].secret_enc)
+                .unwrap(),
             "oauth-secret"
         );
 
@@ -8531,7 +8536,10 @@ mod credential_enrollment_regression_tests {
         assert_eq!(public_accounts.len(), 1);
         assert_eq!(public_accounts[0].label, "__kinetix_noauth__");
         assert_eq!(
-            target.crypto.decrypt(&public_accounts[0].secret_enc).unwrap(),
+            target
+                .crypto
+                .decrypt(&public_accounts[0].secret_enc)
+                .unwrap(),
             ""
         );
 
