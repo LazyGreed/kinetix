@@ -246,12 +246,13 @@ impl AppState {
                 );
             };
             let strategy = Arc::clone(strategy.value());
-            let resolved = strategy.resolve(account).await?;
-            self.credential_refresh
-                .observe(&provider.id, &account.id, &resolved);
-            return Ok(resolved);
+            return self
+                .credential_refresh
+                .resolve(&provider.id, strategy, account)
+                .await
+                .map_err(Into::into);
         }
-        self.credentials.resolve(account).await
+        self.credentials.resolve(account).await.map_err(Into::into)
     }
 
     /// Force renewal for a plugin-backed credential after an upstream auth
@@ -358,9 +359,18 @@ impl AppState {
     async fn refresh_due_credential(&self, key: crate::credential_refresh::CredentialKey) {
         let account = match crate::db::get_account(&self.pool, &key.account_id).await {
             Ok(Some(account)) => account,
-            _ => {
+            Ok(None) => {
                 self.credential_refresh
                     .forget(&key.provider_id, &key.account_id);
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    provider = %key.provider_id,
+                    account = %key.account_id,
+                    %error,
+                    "credential refresh account lookup failed; keeping schedule"
+                );
                 return;
             }
         };
@@ -372,9 +382,18 @@ impl AppState {
 
         let provider = match crate::db::get_provider(&self.pool, &key.provider_id).await {
             Ok(Some(provider)) => provider,
-            _ => {
+            Ok(None) => {
                 self.credential_refresh
                     .forget(&key.provider_id, &key.account_id);
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    provider = %key.provider_id,
+                    account = %key.account_id,
+                    %error,
+                    "credential refresh provider lookup failed; keeping schedule"
+                );
                 return;
             }
         };
