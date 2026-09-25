@@ -38,22 +38,39 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 const SIGNATURE: &str = "MOCK_GEMINI_SIGNATURE";
-/// The signature the `gemini-mock-pro` model produces. Used to prove that a
+/// The signature the `gemini-3-mock-pro` model produces. Used to prove that a
 /// Flash signature is never replayed onto Pro (and vice-versa).
 const SIGNATURE_PRO: &str = "MOCK_GEMINI_SIGNATURE_PRO";
+/// The signature the `gemini-2.5-pro` model produces. Gemini 2.5 still emits a
+/// signature, but treats it as optional when the history is replayed.
+const SIGNATURE_25: &str = "MOCK_GEMINI_SIGNATURE_25";
 /// Google's documented placeholder for a historical function call whose real
 /// signature this model cannot carry (a trace transferred from another model).
+/// The mechanism is a Gemini 3 `generateContent` feature.
 const GEMINI_PLACEHOLDER: &str = "skip_thought_signature_validator";
 const TOOL_CALL_ID: &str = "call_mock_1";
 const TOOL_NAME: &str = "get_weather";
 
 /// The exact signature a given upstream model is allowed to receive.
 fn expected_signature(model: &str) -> &'static str {
-    if model.ends_with("pro") {
+    if model.starts_with("gemini-2.5") {
+        SIGNATURE_25
+    } else if model.ends_with("pro") {
         SIGNATURE_PRO
     } else {
         SIGNATURE
     }
+}
+
+/// Whether this model enforces a thought signature on a replayed
+/// `functionCall`. Only Gemini 3 does; Gemini 2.5 and older accept an unsigned
+/// historical call, and never document the Gemini 3 validator-bypass sentinel.
+fn signature_required(model: &str) -> bool {
+    let Some((_, rest)) = model.rsplit_once("gemini-") else {
+        return false;
+    };
+    let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    major.parse::<u32>().is_ok_and(|version| version >= 3)
 }
 
 /// How the mock classified a continuation request. `Invalid` is exactly what
@@ -65,8 +82,12 @@ enum Continuation {
     Signed,
     /// Every call carried the documented cross-model placeholder.
     Placeholder,
-    /// A call was unsigned, or carried a signature that does not belong to
-    /// this model (e.g. another model's real signature).
+    /// The call arrived unsigned on a model that does not require a signature
+    /// (Gemini 2.5 and older), which is accepted.
+    Unsigned,
+    /// A call was unsigned on a model that requires it, carried a signature
+    /// that does not belong to this model, or carried a placeholder this model
+    /// does not document.
     Invalid,
 }
 
@@ -85,36 +106,53 @@ struct MockUpstream {
 }
 
 impl MockUpstream {
-    async fn record(&self, body: &Value) -> Continuation {
+    async fn record(&self, model: &str, body: &Value) -> Continuation {
         self.requests.lock().await.push(body.clone());
         if !contains_key(body, "functionResponse") {
             return Continuation::Unrelated;
         }
-        let expected = expected_signature(body.get("model").and_then(Value::as_str).unwrap_or(""));
+        let expected = expected_signature(model);
+        let required = signature_required(model);
         let calls = function_call_parts(body);
         let mut placeholder = false;
-        let mut invalid = calls.is_empty();
+        let mut unsigned = false;
+        let mut foreign = calls.is_empty();
         for part in &calls {
             match part.get("thoughtSignature").and_then(Value::as_str) {
                 Some(sig) if sig == expected => {}
                 Some(GEMINI_PLACEHOLDER) => placeholder = true,
-                _ => {
-                    invalid = true;
+                Some(_) => {
+                    foreign = true;
                     break;
                 }
+                None => unsigned = true,
             }
         }
-        if invalid {
+        if foreign {
             self.unsigned_continuations.fetch_add(1, Ordering::SeqCst);
-            Continuation::Invalid
-        } else if placeholder {
+            return Continuation::Invalid;
+        }
+        if placeholder {
+            // Counted either way, so a regression that wrongly injects the
+            // Gemini 3 sentinel into an older model is visible in the tally.
             self.placeholder_continuations
                 .fetch_add(1, Ordering::SeqCst);
-            Continuation::Placeholder
-        } else {
-            self.signed_continuations.fetch_add(1, Ordering::SeqCst);
-            Continuation::Signed
+            return if required {
+                Continuation::Placeholder
+            } else {
+                Continuation::Invalid
+            };
         }
+        if unsigned {
+            self.unsigned_continuations.fetch_add(1, Ordering::SeqCst);
+            return if required {
+                Continuation::Invalid
+            } else {
+                Continuation::Unsigned
+            };
+        }
+        self.signed_continuations.fetch_add(1, Ordering::SeqCst);
+        Continuation::Signed
     }
 }
 
@@ -173,7 +211,7 @@ async fn upstream(
         })
         .unwrap_or_default();
     let has_response = contains_key(&body, "functionResponse");
-    let continuation = mock.record(&body).await;
+    let continuation = mock.record(&model, &body).await;
     if is_gemini && continuation == Continuation::Invalid {
         return (
             StatusCode::BAD_REQUEST,
@@ -376,7 +414,7 @@ async fn setup() -> Harness {
         &pool,
         &db::NewModel {
             provider_id: &provider_id,
-            upstream_id: "gemini-mock",
+            upstream_id: "gemini-3-mock",
             display_name: "Gemini Mock",
             enabled: true,
             context_window: None,
@@ -399,8 +437,31 @@ async fn setup() -> Harness {
         &pool,
         &db::NewModel {
             provider_id: &provider_id,
-            upstream_id: "gemini-mock-pro",
+            upstream_id: "gemini-3-mock-pro",
             display_name: "Gemini Mock Pro",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: json!(["text", "tool_calling"]),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    // A Gemini 2.5 model. It predates the Gemini 3 signature-validation
+    // semantics: a replayed function call may be unsigned, and the Gemini 3
+    // validator-bypass sentinel is not a documented substitute here.
+    let legacy_model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "gemini-2.5-pro",
+            display_name: "Gemini 2.5 Pro",
             enabled: true,
             context_window: None,
             max_output_tokens: None,
@@ -452,6 +513,34 @@ async fn setup() -> Harness {
     db::insert_route_target(&pool, &pro_route_id, None, &pro_model_id, 1, 1, "{}", "{}")
         .await
         .unwrap();
+
+    let legacy_route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "legacy-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "strip_with_warning",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &pool,
+        &legacy_route_id,
+        None,
+        &legacy_model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
 
     // A second, OpenAI-wire provider behind the same mock. Its model is the
     // target of the portability-bypass regressions below: an OpenAI client
@@ -963,6 +1052,61 @@ async fn cross_model_pro_to_flash_continuation_uses_documented_placeholder() {
     cleanup(harness).await;
 }
 
+/// A Gemini 3 -> 2.5 continuation is *not* a translatable cross-model trace:
+/// Gemini 2.5 predates the documented signature validation, accepts an
+/// unsigned historical call, and never documented the Gemini 3
+/// validator-bypass sentinel. Kinetix must strip the incompatible signature
+/// without injecting that sentinel.
+#[tokio::test]
+async fn cross_model_gemini_3_to_2_5_does_not_inject_the_placeholder() {
+    let harness = setup().await;
+    let key = virtual_key("key-3-to-25");
+
+    run(
+        &harness.state,
+        Some(&key),
+        first_turn_to("opaque-route", false),
+        "req_xmodel_25_1",
+    )
+    .await
+    .expect("gemini 3 turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
+
+    let (status, warning) = run_with_warning(
+        &harness.state,
+        Some(&key),
+        second_turn_to("legacy-route", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_xmodel_25_2",
+    )
+    .await
+    .expect("a Gemini 3 -> 2.5 continuation must dispatch after stripping");
+    assert_eq!(status, 200);
+    assert!(
+        warning.as_deref().is_some_and(|value| !value.is_empty()),
+        "the portability decision must surface a warning header, got {warning:?}"
+    );
+    assert_eq!(
+        harness
+            .mock
+            .placeholder_continuations
+            .load(Ordering::SeqCst),
+        0,
+        "the Gemini 3 validator-bypass sentinel must never be injected into Gemini 2.5"
+    );
+    assert_eq!(
+        harness.mock.signed_continuations.load(Ordering::SeqCst),
+        0,
+        "the Gemini 3 signature must never be replayed onto Gemini 2.5"
+    );
+    assert_eq!(
+        harness.mock.unsigned_continuations.load(Ordering::SeqCst),
+        1,
+        "the stripped historical call must reach Gemini 2.5 unsigned"
+    );
+
+    cleanup(harness).await;
+}
+
 #[tokio::test]
 async fn direct_cross_model_switch_uses_documented_placeholder() {
     let harness = setup().await;
@@ -986,7 +1130,7 @@ async fn direct_cross_model_switch_uses_documented_placeholder() {
     let (status, warning) = run_with_warning(
         &harness.state,
         Some(&key),
-        second_turn_to("gemini-mock-pro", false, TOOL_CALL_ID, TOOL_NAME),
+        second_turn_to("gemini-3-mock-pro", false, TOOL_CALL_ID, TOOL_NAME),
         "req_direct_fp_2",
     )
     .await
@@ -1039,7 +1183,7 @@ async fn direct_cross_model_switch_with_a_different_tool_name_is_rejected() {
     let error = run(
         &harness.state,
         Some(&key),
-        second_turn_to("gemini-mock-pro", false, TOOL_CALL_ID, "read_file"),
+        second_turn_to("gemini-3-mock-pro", false, TOOL_CALL_ID, "read_file"),
         "req_direct_name_2",
     )
     .await
@@ -1090,7 +1234,7 @@ async fn direct_cross_model_switch_with_a_different_session_is_not_translated() 
     let error = run_session(
         &harness.state,
         Some(&key),
-        second_turn_to("gemini-mock-pro", false, TOOL_CALL_ID, TOOL_NAME),
+        second_turn_to("gemini-3-mock-pro", false, TOOL_CALL_ID, TOOL_NAME),
         "req_direct_session_2",
         Some("session-b"),
     )

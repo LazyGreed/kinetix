@@ -813,9 +813,38 @@ impl Adapter for GeminiAdapter {
     /// `functionCall` whose real signature cannot be reused: the sentinel keeps
     /// the call in the conversation (with degraded reasoning continuity)
     /// instead of failing the whole request with HTTP 400.
-    fn opaque_state_placeholder(&self, _model: &crate::db::ModelRow) -> Option<&'static str> {
-        Some(GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
+    ///
+    /// This is a Gemini 3 mechanism. Only that family validates the signature
+    /// of a replayed `functionCall` (and therefore documents the bypass);
+    /// Gemini 2.5 and older treat the signature as optional, so injecting the
+    /// sentinel there would be inventing protocol state the upstream never
+    /// asked for. The gate is deliberately a model-id check for now — there is
+    /// no operator-configurable capability that expresses "Gemini 3 signature
+    /// semantics" yet, and hardcoding a broader vendor preset in the pipeline
+    /// core is forbidden.
+    ///
+    /// Source: <https://ai.google.dev/gemini-api/docs/thought-signatures>
+    /// (signature validation on replayed function calls, and the sentinel for
+    /// history transferred from another model, both apply to Gemini 3).
+    fn opaque_state_placeholder(&self, model: &crate::db::ModelRow) -> Option<&'static str> {
+        is_gemini_three_or_newer(&model.upstream_id).then_some(GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
     }
+}
+
+/// Whether `upstream_id` names a Gemini 3 (or later) model.
+///
+/// The id is matched as `...gemini-<major>...`, so both bare ids
+/// (`gemini-3-pro-preview`) and path-qualified ids (`models/gemini-3-flash`)
+/// are recognised. An id that does not carry a Gemini version number is not
+/// treated as Gemini 3. See
+/// <https://ai.google.dev/gemini-api/docs/thought-signatures> for the Gemini 3
+/// signature semantics this gate reflects.
+fn is_gemini_three_or_newer(upstream_id: &str) -> bool {
+    let Some((_, rest)) = upstream_id.rsplit_once("gemini-") else {
+        return false;
+    };
+    let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    major.parse::<u32>().is_ok_and(|version| version >= 3)
 }
 
 /// Convert a Gemini chunk/response into internal stream events.
@@ -988,6 +1017,27 @@ pub fn message_has_tool_result(m: &Message) -> bool {
 mod schema_tests {
     use super::*;
 
+    /// Minimal `ModelRow` for adapter-level capability decisions.
+    fn model_row(upstream_id: &str) -> crate::db::ModelRow {
+        crate::db::ModelRow {
+            id: "m".into(),
+            provider_id: "ai-studio".into(),
+            upstream_id: upstream_id.into(),
+            display_name: upstream_id.into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
     #[test]
     fn signature_only_thinking_decodes_for_round_trip() {
         let events = events_from_gemini(&json!({
@@ -1143,27 +1193,43 @@ mod schema_tests {
         // target cannot carry the stored value; Gemini documents this sentinel
         // for exactly that case, and the pipeline paints it instead of sending
         // an unsigned (rejected) historical function call.
-        let model = crate::db::ModelRow {
-            id: "m".into(),
-            provider_id: "ai-studio".into(),
-            upstream_id: "gemini-3.8-pro".into(),
-            display_name: "Gemini 3.8 Pro".into(),
-            enabled: 1,
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: "{}".into(),
-            prices: "{}".into(),
-            parameters: "{}".into(),
-            thinking_map: "{}".into(),
-            extra_request: "{}".into(),
-            discovery: "{}".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            opaque_state_plugin: String::new(),
-        };
         assert_eq!(
-            GeminiAdapter::new().opaque_state_placeholder(&model),
+            GeminiAdapter::new().opaque_state_placeholder(&model_row("gemini-3.8-pro")),
             Some("skip_thought_signature_validator")
         );
+        assert_eq!(
+            GeminiAdapter::new().opaque_state_placeholder(&model_row("gemini-3-flash-preview")),
+            Some("skip_thought_signature_validator")
+        );
+    }
+
+    #[test]
+    fn older_gemini_models_do_not_declare_the_gemini_3_placeholder() {
+        // The sentinel is a Gemini 3 `generateContent` mechanism. Gemini 2.5
+        // and older treat a replayed function-call signature as optional, so
+        // Kinetix must not inject the Gemini 3 validator-bypass token there.
+        for upstream_id in [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            // An id without a Gemini version number is not assumed Gemini 3.
+            "gemini-experimental",
+        ] {
+            assert_eq!(
+                GeminiAdapter::new().opaque_state_placeholder(&model_row(upstream_id)),
+                None,
+                "{upstream_id} must not receive the Gemini 3 placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_three_detection_handles_path_qualified_ids() {
+        assert!(is_gemini_three_or_newer("gemini-3-pro-preview"));
+        assert!(is_gemini_three_or_newer("models/gemini-3-flash"));
+        assert!(!is_gemini_three_or_newer("models/gemini-2.5-pro"));
+        assert!(!is_gemini_three_or_newer("gemini"));
     }
 
     #[test]

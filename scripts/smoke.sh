@@ -84,11 +84,11 @@ check "passthrough streams frames" "$STREAM" 'data:'
 check "passthrough terminates" "$STREAM" '[DONE]'
 
 # translation (OpenAI inbound -> Gemini outbound)
-TRANSL="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-gemini","stream":true,"messages":[{"role":"user","content":"hi"}]}')"
+TRANSL="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-gemini-3","stream":true,"messages":[{"role":"user","content":"hi"}]}')"
 check "translation streams" "$TRANSL" 'data:'
 
 # Anthropic inbound
-ANTH="$(curl -s -N --max-time 20 -X POST "$BASE/v1/messages" -H "x-api-key: $KEY" -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' -d '{"model":"syn-gemini","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}')"
+ANTH="$(curl -s -N --max-time 20 -X POST "$BASE/v1/messages" -H "x-api-key: $KEY" -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' -d '{"model":"syn-gemini-3","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}')"
 check "anthropic message_start" "$ANTH" 'message_start'
 check "anthropic message_stop" "$ANTH" 'message_stop'
 

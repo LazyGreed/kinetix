@@ -166,6 +166,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | `chat.translate.gemini.tool_signature_continuation` | http | Gemini function-call thoughtSignature survives an OpenAI/Pi multi-turn tool continuation without client-visible vendor state |
 | `chat.translate.gemini.cross_model_placeholder` | http | A Gemini signature captured on one model is translated with the provider's documented placeholder, not replayed or stripped, when the continuation moves to another model |
 | `chat.translate.gemini.cross_model_placeholder_direct` | http | A direct same-family Gemini model switch with no Route policy is translated with the provider's documented placeholder instead of being refused |
+| `chat.translate.gemini.legacy_model_strip_without_placeholder` | http | A continuation onto a pre-Gemini-3 model strips the non-portable signature instead of injecting the Gemini 3 validator-bypass placeholder |
 
 The `http` cases run through `scripts/protocol-v1-matrix.py` inside the existing synthetic compatibility harness. The `cargo` cases run as normal Rust integration tests. Entries marked `manual` are executable release acceptance and are intentionally excluded from normal PR/local CI. Real Pi, Claude Code, Responses-client, and external `.kxp` sessions remain release-only.
 

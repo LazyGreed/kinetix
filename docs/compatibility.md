@@ -116,6 +116,12 @@ second model and rejects both an unsigned call and the first model's real
 signature, so a 200 is evidence that Kinetix substituted the documented
 placeholder rather than replaying a foreign signature or stripping the call. Its
 negative control proves an uncaptured id is never given an invented placeholder.
+The placeholder is gated to models whose `generateContent` validates replayed
+function-call signatures (the Gemini 3 family): the
+`chat.translate.gemini.legacy_model_strip_without_placeholder` case continues the
+same trace onto a pre-Gemini-3 model, and the strict upstream rejects *any*
+`thoughtSignature` there, so a 200 with a warning proves Kinetix stripped the
+incompatible state instead of injecting the Gemini 3 sentinel.
 
 Positive mixed fixtures send the documented sampling, tool-choice, vision, and
 reasoning fields. `scripts/synthetic_upstream.py` rejects the request if required
@@ -333,6 +339,12 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   direct same-family switch with no Route policy (for example a deliberate
   Flash→Pro change): the adapter's placeholder is a protocol-valid
   substitute, so the request proceeds with a warning rather than being refused.
+  The placeholder is **gated to the family that documents it**: the Gemini
+  adapter returns the sentinel only for Gemini 3 (and later) model ids, because
+  only that family validates the signature of a replayed function call. Gemini
+  2.5 and older treat the signature as optional and never documented the
+  sentinel, so a continuation onto such a model is stripped and continues
+  unsigned rather than receiving the Gemini 3 validator-bypass token.
   The placeholder
   is painted only onto calls the store knew about but the target cannot carry —
   an id that was never captured is still left untouched, so missing state is

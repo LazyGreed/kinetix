@@ -50,7 +50,7 @@ models_path = "/models"
   quota_type = "none"
 
   [[providers.models]]
-  upstream_id = "syn-gemini"
+  upstream_id = "syn-gemini-3"
   display_name = "Synthetic Gemini"
   enabled = true
   context_window = 200000

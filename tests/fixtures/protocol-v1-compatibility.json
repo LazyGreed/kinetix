@@ -267,6 +267,11 @@
       "id": "chat.translate.gemini.cross_model_placeholder_direct",
       "runner": "http",
       "summary": "A direct same-family Gemini model switch with no Route policy is translated with the provider's documented placeholder instead of being refused"
+    },
+    {
+      "id": "chat.translate.gemini.legacy_model_strip_without_placeholder",
+      "runner": "http",
+      "summary": "A continuation onto a pre-Gemini-3 model strips the non-portable signature instead of injecting the Gemini 3 validator-bypass placeholder"
     }
   ],
   "apis": [

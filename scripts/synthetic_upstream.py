@@ -113,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "data": [
                         {"id": "syn-openai", "context_window": 200000, "max_output_tokens": 8192},
-                        {"id": "syn-gemini", "context_window": 200000, "max_output_tokens": 8192},
+                        {"id": "syn-gemini-3", "context_window": 200000, "max_output_tokens": 8192},
                     ]
                 }
             ).encode()
@@ -208,9 +208,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": {"message": "opaque reasoning state crossed portability boundary"}})
                 return
             if _fixture(req, "gemini-cross-model-placeholder") and _contains_key(req, {"functionResponse"}):
-                # Cross-model continuation: the trace originated on `syn-gemini`
+                # Cross-model continuation: the trace originated on `syn-gemini-3`
                 # (real signature OPAQUE_SIG_FLASH) but is being continued on
-                # `syn-gemini-pro`, which cannot carry that signature. Gemini
+                # `syn-gemini-3-pro`, which cannot carry that signature. Gemini
                 # documents the placeholder `skip_thought_signature_validator`
                 # for exactly this transfer, and rejects both an unsigned call
                 # and a foreign model's real signature.
@@ -228,6 +228,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(400, {"error": {"message": (
                         "Function call is missing a thought_signature in functionCall parts. "
                         "This is required for tools to work correctly."
+                    )}})
+                    return
+            if _fixture(req, "gemini-legacy-model-continuation") and _contains_key(req, {"functionResponse"}):
+                # Gemini 2.5 predates the Gemini 3 signature validation: an
+                # unsigned historical function call is accepted there, but the
+                # Gemini 3 validator-bypass sentinel is not documented and must
+                # not be injected. Reject any thoughtSignature so the test can
+                # only pass by actually stripping the incompatible state.
+                calls = _function_call_parts(req)
+                if not calls:
+                    self._json(400, {"error": {"message": "continuation lost the originating function call"}})
+                    return
+                if any(part.get("thoughtSignature") is not None for part in calls):
+                    self._json(400, {"error": {"message": (
+                        "unexpected thoughtSignature on a Gemini 2.5 function call: "
+                        "the Gemini 3 validator-bypass placeholder must not be injected"
                     )}})
                     return
             if _fixture(req, "gemini-signature-continuation") and _contains_key(req, {"functionResponse"}):
@@ -662,7 +678,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             time.sleep(TTFT_MS / 1000.0)
             if want_tools:
-                if req is not None and _fixture(req, "gemini-cross-model-placeholder"):
+                if req is not None and (
+                    _fixture(req, "gemini-cross-model-placeholder")
+                    or _fixture(req, "gemini-legacy-model-continuation")
+                ):
                     # The originating model's real signature; the other model must
                     # never receive it (it gets the documented placeholder).
                     origin_sig = (
