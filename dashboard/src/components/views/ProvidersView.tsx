@@ -361,6 +361,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     e.preventDefault();
     if (!name.trim() || !baseUrl.trim()) return;
 
+    const existingProvider = editingProviderId
+      ? providers.find((provider) => provider.id === editingProviderId)
+      : undefined;
     const prov: Provider = {
       id: editingProviderId || '',
       name: name.trim(),
@@ -372,6 +375,12 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       status: 'healthy',
       modelsCount: 0,
       accountsCount: 0,
+      credentialMode: existingProvider?.credentialMode ?? 'manual',
+      credentialEnrollment: existingProvider?.credentialEnrollment ?? {
+        mode: 'manual',
+        actionLabel: 'Add API Key',
+        available: true,
+      },
       extraHeaders: parseHeaders(extraHeaders),
       modelsPath: modelsPath.trim() || undefined,
       timeoutMs,
