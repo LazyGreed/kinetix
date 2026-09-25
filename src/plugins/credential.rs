@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn non_retryable_expired_credential_is_terminal() {
-        let error = rotation_error(PluginFault::PluginError {
+        let error = credential_error(PluginFault::PluginError {
             code: "credential_expired".into(),
             message: "refresh token revoked".into(),
             retryable: false,
