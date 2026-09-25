@@ -5950,7 +5950,10 @@ fn antigravity_loopback_redirect(bind: &str) -> Result<String, ApiError> {
 
 #[cfg(test)]
 mod credential_enrollment_tests {
-    use super::{manual_account_enrollment_error, validate_plugin_auth_enrollment};
+    use super::{
+        manual_account_enrollment_error, resolve_auth_integration, validate_auth_flow_binding_edit,
+        validate_plugin_auth_enrollment,
+    };
 
     fn provider(mode: &str) -> crate::db::ProviderRow {
         crate::db::ProviderRow {
@@ -6017,6 +6020,59 @@ mod credential_enrollment_tests {
             "plugin:plugin.test/other"
         )
         .is_err());
+    }
+
+    #[test]
+    fn shared_auth_flow_resolves_exact_source_integration() {
+        let integrations = vec![
+            crate::plugins::Integration {
+                id: "first".into(),
+                name: "First".into(),
+                description: String::new(),
+                credential_mode: Some(crate::plugins::CredentialMode::AuthFlow),
+                provider_adapter: None,
+                credential_strategy: Some("first-strategy".into()),
+                auth_flow: Some("shared-login".into()),
+                model_source: None,
+                provider: None,
+            },
+            crate::plugins::Integration {
+                id: "second".into(),
+                name: "Second".into(),
+                description: String::new(),
+                credential_mode: Some(crate::plugins::CredentialMode::AuthFlow),
+                provider_adapter: None,
+                credential_strategy: Some("second-strategy".into()),
+                auth_flow: Some("shared-login".into()),
+                model_source: None,
+                provider: None,
+            },
+        ];
+
+        let resolved =
+            resolve_auth_integration(&integrations, "second", "shared-login").unwrap();
+        assert_eq!(resolved.id, "second");
+        assert_eq!(resolved.credential_strategy.as_deref(), Some("second-strategy"));
+    }
+
+    #[test]
+    fn auth_flow_provider_edit_rejects_conflicting_credential_binding() {
+        let provider = provider("auth_flow");
+        let expected = "plugin:plugin.test/strategy";
+
+        assert!(validate_auth_flow_binding_edit(
+            &provider,
+            expected,
+            "plugin:plugin.test/other"
+        )
+        .is_err());
+        assert!(validate_auth_flow_binding_edit(&provider, expected, expected).is_ok());
+        assert!(validate_auth_flow_binding_edit(
+            &provider,
+            expected,
+            &provider.credential_plugin
+        )
+        .is_ok());
     }
 }
 
@@ -6137,6 +6193,23 @@ mod plugin_oauth_redirect_tests {
     }
 }
 
+fn resolve_auth_integration<'a>(
+    integrations: &'a [crate::plugins::Integration],
+    integration_id: &str,
+    flow_name: &str,
+) -> Result<&'a crate::plugins::Integration, ApiError> {
+    let integration = integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
+    if integration.auth_flow.as_deref() != Some(flow_name) {
+        return Err(ApiError::bad(
+            "requested auth flow does not match the provider source integration",
+        ));
+    }
+    Ok(integration)
+}
+
 /// Validate that a provider may enroll through this exact plugin integration.
 fn validate_plugin_auth_enrollment(
     provider: &db::ProviderRow,
@@ -6190,16 +6263,8 @@ pub async fn start_plugin_auth(
         .manifest()
         .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
 
-    let integration = manifest
-        .integrations
-        .iter()
-        .find(|integration| integration.id == integration_id)
-        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
-    if integration.auth_flow.as_deref() != Some(body.flow_name.as_str()) {
-        return Err(ApiError::bad(
-            "requested auth flow does not match the provider source integration",
-        ));
-    }
+    let integration =
+        resolve_auth_integration(&manifest.integrations, integration_id, &body.flow_name)?;
     let credential_strategy = integration
         .credential_strategy
         .as_deref()
@@ -6419,16 +6484,11 @@ async fn complete_plugin_auth(
     let manifest = row
         .manifest()
         .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
-    let integration = manifest
-        .integrations
-        .iter()
-        .find(|integration| integration.id == session.integration_id)
-        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
-    if integration.auth_flow.as_deref() != Some(session.flow_name.as_str()) {
-        return Err(ApiError::bad(
-            "stored auth flow does not match the provider source integration",
-        ));
-    }
+    let integration = resolve_auth_integration(
+        &manifest.integrations,
+        &session.integration_id,
+        &session.flow_name,
+    )?;
     let credential_strategy = integration
         .credential_strategy
         .as_deref()
