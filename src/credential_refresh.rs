@@ -75,6 +75,34 @@ impl RefreshCoordinator {
         self.store_schedule(provider_id, account_id, credential, false);
     }
 
+    /// Resolve an account credential under the same account-scoped gate used
+    /// by scheduled and reactive refresh. Some existing plugins refresh inside
+    /// resolve(), so treating it as read-only would allow rotating refresh
+    /// tokens to race.
+    pub async fn resolve(
+        &self,
+        provider_id: &str,
+        strategy: Arc<dyn CredentialStrategy>,
+        account: &AccountRow,
+    ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
+        let key = CredentialKey::new(provider_id, &account.id);
+        let gate = self.gate(&key);
+        let _guard = gate.lock.lock().await;
+
+        match strategy.resolve(account).await {
+            Ok(current) => {
+                self.observe(provider_id, &account.id, &current);
+                Ok(current)
+            }
+            Err(error) => {
+                if error.invalid_credential() {
+                    self.schedules.remove(&key);
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn observe_refreshed(
         &self,
         provider_id: &str,
@@ -160,25 +188,24 @@ impl RefreshCoordinator {
                 self.observe_refreshed(provider_id, &account.id, &current);
                 Ok(true)
             }
-            _ => match strategy.rotate(account).await {
+            Err(error) if error.invalid_credential() => Err(error),
+            Ok(_) | Err(_) => match strategy.rotate(account).await {
                 Ok(()) => match strategy.resolve(account).await {
                     Ok(current) => {
                         self.observe_refreshed(provider_id, &account.id, &current);
                         Ok(true)
                     }
                     Err(error) => {
-                        let error = CredentialRotationError::new(
-                            "plugin_internal",
-                            format!("credential resolve failed after rotation: {error}"),
-                            true,
-                            None,
-                        );
-                        self.record_failure(&key, &error);
+                        if !error.invalid_credential() {
+                            self.record_failure(&key, &error);
+                        }
                         Err(error)
                     }
                 },
                 Err(error) => {
-                    self.record_failure(&key, &error);
+                    if !error.invalid_credential() {
+                        self.record_failure(&key, &error);
+                    }
                     Err(error)
                 }
             },
@@ -213,13 +240,11 @@ impl RefreshCoordinator {
         let current = match strategy.resolve(account).await {
             Ok(current) => current,
             Err(error) => {
-                let error = CredentialRotationError::new(
-                    "plugin_internal",
-                    format!("credential resolve failed before scheduled refresh: {error}"),
-                    true,
-                    None,
-                );
-                self.record_failure(&key, &error);
+                if error.invalid_credential() {
+                    self.schedules.remove(&key);
+                } else {
+                    self.record_failure(&key, &error);
+                }
                 return Err(error);
             }
         };
@@ -244,13 +269,11 @@ impl RefreshCoordinator {
                 let current = match strategy.resolve(account).await {
                     Ok(current) => current,
                     Err(error) => {
-                        let error = CredentialRotationError::new(
-                            "plugin_internal",
-                            format!("credential resolve failed after scheduled refresh: {error}"),
-                            true,
-                            None,
-                        );
-                        self.record_failure(&key, &error);
+                        if error.invalid_credential() {
+                            self.schedules.remove(&key);
+                        } else {
+                            self.record_failure(&key, &error);
+                        }
                         return Err(error);
                     }
                 };
@@ -381,7 +404,10 @@ mod tests {
             "test_rotating"
         }
 
-        async fn resolve(&self, _account: &AccountRow) -> anyhow::Result<ResolvedCredential> {
+        async fn resolve(
+            &self,
+            _account: &AccountRow,
+        ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
             let rotations = self.rotations.load(Ordering::Relaxed);
             let now = Utc::now();
             Ok(ResolvedCredential {
