@@ -111,7 +111,10 @@ impl CredentialStrategy for TestCredential {
         "test_rotating_credential"
     }
 
-    async fn resolve(&self, account: &db::AccountRow) -> anyhow::Result<ResolvedCredential> {
+    async fn resolve(
+        &self,
+        account: &db::AccountRow,
+    ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
         let secret = if account.label == "fallback-account" {
             "fallback-token".to_string()
         } else {
@@ -158,9 +161,118 @@ impl CredentialStrategy for TestCredential {
     }
 }
 
+struct ResolveRefreshingCredential {
+    secret: Mutex<String>,
+    refreshes: AtomicUsize,
+    rotations: AtomicUsize,
+}
+
+impl ResolveRefreshingCredential {
+    fn new() -> Self {
+        Self {
+            secret: Mutex::new("stale-token".into()),
+            refreshes: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialStrategy for ResolveRefreshingCredential {
+    fn name(&self) -> &'static str {
+        "test_resolve_refreshing_credential"
+    }
+
+    async fn resolve(
+        &self,
+        account: &db::AccountRow,
+    ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
+        if account.label == "fallback-account" {
+            return Ok(ResolvedCredential {
+                secret: "fallback-token".into(),
+                expires_at: None,
+                refresh_after: None,
+                rotated: false,
+            });
+        }
+
+        let stale = self.secret.lock().await.as_str() == "stale-token";
+        if stale {
+            self.refreshes.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            *self.secret.lock().await = "fresh-token".into();
+        }
+
+        let now = chrono::Utc::now();
+        Ok(ResolvedCredential {
+            secret: self.secret.lock().await.clone(),
+            expires_at: Some((now + chrono::Duration::hours(2)).to_rfc3339()),
+            refresh_after: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+            rotated: stale,
+        })
+    }
+
+    async fn rotate(
+        &self,
+        _account: &db::AccountRow,
+    ) -> std::result::Result<(), CredentialRotationError> {
+        self.rotations.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+struct TerminalResolveCredential {
+    rotations: AtomicUsize,
+}
+
+impl TerminalResolveCredential {
+    fn new() -> Self {
+        Self {
+            rotations: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialStrategy for TerminalResolveCredential {
+    fn name(&self) -> &'static str {
+        "test_terminal_resolve_credential"
+    }
+
+    async fn resolve(
+        &self,
+        account: &db::AccountRow,
+    ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
+        if account.label == "fallback-account" {
+            return Ok(ResolvedCredential {
+                secret: "fallback-token".into(),
+                expires_at: None,
+                refresh_after: None,
+                rotated: false,
+            });
+        }
+
+        Err(CredentialRotationError::new(
+            "credential_expired",
+            "refresh token revoked during resolve",
+            false,
+            None,
+        ))
+    }
+
+    async fn rotate(
+        &self,
+        _account: &db::AccountRow,
+    ) -> std::result::Result<(), CredentialRotationError> {
+        self.rotations.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 struct Harness {
     state: AppState,
     pool: db::Pool,
+    provider_id: String,
     account_id: String,
     fallback_account_id: String,
     request: InternalRequest,
@@ -372,6 +484,7 @@ async fn setup(
     Harness {
         state,
         pool,
+        provider_id,
         account_id,
         fallback_account_id,
         request,
@@ -594,6 +707,144 @@ async fn concurrent_auth_failures_singleflight_forced_rotation_per_account() {
         2
     );
     drop(attempts);
+
+    cleanup(harness).await;
+}
+
+
+#[tokio::test]
+async fn request_resolve_and_scheduled_refresh_share_one_refresh_singleflight() {
+    let strategy = Arc::new(ResolveRefreshingCredential::new());
+    let harness = setup(strategy.clone(), None, 1).await;
+    let provider = db::get_provider(&harness.pool, &harness.provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let account = db::get_account(&harness.pool, &harness.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    harness.state.credential_refresh.observe(
+        &provider.id,
+        &account.id,
+        &ResolvedCredential {
+            secret: "stale-token".into(),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+            rotated: false,
+        },
+    );
+
+    let request_resolve = harness.state.credential_for(&provider, &account);
+    let scheduled_strategy: Arc<dyn CredentialStrategy> = strategy.clone();
+    let scheduled = harness.state.credential_refresh.rotate_scheduled(
+        &provider.id,
+        scheduled_strategy,
+        &account,
+    );
+    let (request_resolve, scheduled) = tokio::join!(request_resolve, scheduled);
+
+    assert_eq!(request_resolve.unwrap().secret, "fresh-token");
+    assert!(!scheduled.unwrap());
+    assert_eq!(
+        strategy.refreshes.load(Ordering::Relaxed),
+        1,
+        "request-path resolve and scheduled refresh must share one refresh exchange"
+    );
+    assert_eq!(
+        strategy.rotations.load(Ordering::Relaxed),
+        0,
+        "scheduled path should observe the fresh lease instead of rotating again"
+    );
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn terminal_credential_expired_from_scheduled_resolve_disables_account() {
+    let strategy = Arc::new(TerminalResolveCredential::new());
+    let harness = setup(strategy.clone(), None, 1).await;
+
+    harness.state.credential_refresh.observe(
+        &harness.provider_id,
+        &harness.account_id,
+        &ResolvedCredential {
+            secret: "stale-token".into(),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+            rotated: false,
+        },
+    );
+
+    harness.state.refresh_due_credentials().await;
+
+    let account = db::get_account(&harness.pool, &harness.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.status, "disabled");
+    assert_eq!(
+        strategy.rotations.load(Ordering::Relaxed),
+        0,
+        "terminal resolve evidence must propagate without another rotate attempt"
+    );
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn confirmed_missing_account_forgets_refresh_schedule() {
+    let strategy = Arc::new(TestCredential::new(RotationMode::Success { delay_ms: 0 }));
+    let harness = setup(strategy, None, 1).await;
+    let missing_account = "acc_missing";
+
+    harness.state.credential_refresh.observe(
+        &harness.provider_id,
+        missing_account,
+        &ResolvedCredential {
+            secret: "stale-token".into(),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+            rotated: false,
+        },
+    );
+
+    harness.state.refresh_due_credentials().await;
+
+    let future = chrono::Utc::now() + chrono::Duration::minutes(2);
+    assert!(
+        harness.state.credential_refresh.claim_due(future).is_empty(),
+        "confirmed missing account must permanently forget its refresh schedule"
+    );
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn transient_account_lookup_failure_keeps_refresh_schedule() {
+    let strategy = Arc::new(TestCredential::new(RotationMode::Success { delay_ms: 0 }));
+    let harness = setup(strategy, None, 1).await;
+
+    harness.state.credential_refresh.observe(
+        &harness.provider_id,
+        &harness.account_id,
+        &ResolvedCredential {
+            secret: "stale-token".into(),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+            rotated: false,
+        },
+    );
+
+    harness.pool.close().await;
+    harness.state.refresh_due_credentials().await;
+
+    let future = chrono::Utc::now() + chrono::Duration::minutes(2);
+    let due = harness.state.credential_refresh.claim_due(future);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].provider_id, harness.provider_id);
+    assert_eq!(due[0].account_id, harness.account_id);
 
     cleanup(harness).await;
 }
