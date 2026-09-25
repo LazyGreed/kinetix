@@ -170,8 +170,7 @@ impl PluginAdapter {
             return None;
         }
         let discovery: Value = serde_json::from_str(&model.discovery).ok()?;
-        let descriptor =
-            parse_plugin_opaque_state_capability(discovery.get("opaque_state")?)?;
+        let descriptor = parse_plugin_opaque_state_capability(discovery.get("opaque_state")?)?;
         if descriptor.encoding_version != 1
             || !matches!(descriptor.family.as_str(), "gemini" | "claude")
         {
@@ -249,10 +248,7 @@ impl Adapter for PluginAdapter {
         Self::opaque_state_target_for(&self.plugin_id, model)
     }
 
-    fn opaque_state_placeholder(
-        &self,
-        model: &crate::db::ModelRow,
-    ) -> Option<&'static str> {
+    fn opaque_state_placeholder(&self, model: &crate::db::ModelRow) -> Option<&'static str> {
         Self::opaque_state_placeholder_for(&self.plugin_id, model)
     }
 
@@ -751,7 +747,9 @@ mod tests {
 
         let mut no_provenance = row.clone();
         no_provenance.opaque_state_plugin.clear();
-        assert!(PluginAdapter::opaque_state_descriptor_for("plugin.test", &no_provenance).is_none());
+        assert!(
+            PluginAdapter::opaque_state_descriptor_for("plugin.test", &no_provenance).is_none()
+        );
         assert!(PluginAdapter::opaque_state_descriptor_for("plugin.other", &row).is_none());
 
         let mut malformed = row;
@@ -768,8 +766,7 @@ mod tests {
 
     #[test]
     fn plugin_opaque_state_target_uses_exact_model_and_typed_producer() {
-        let row =
-            model_with_opaque_state("plugin.test", "gemini-3.8-flash-high", "gemini", true);
+        let row = model_with_opaque_state("plugin.test", "gemini-3.8-flash-high", "gemini", true);
         let target =
             PluginAdapter::opaque_state_target_for("plugin.test", &row).expect("opaque target");
         assert_eq!(
@@ -803,15 +800,13 @@ mod tests {
 
     #[test]
     fn plugin_gemini_three_gate_accepts_exact_ids_and_resolved_aliases_only() {
-        let exact =
-            model_with_opaque_state("plugin.test", "gemini-3.8-flash-high", "gemini", true);
+        let exact = model_with_opaque_state("plugin.test", "gemini-3.8-flash-high", "gemini", true);
         assert!(PluginAdapter::target_is_gemini_three(&exact));
 
         let alias = model_with_opaque_state("plugin.test", "gemini-pro-agent", "gemini", true);
         assert!(PluginAdapter::target_is_gemini_three(&alias));
 
-        let older =
-            model_with_opaque_state("plugin.test", "gemini-2.5-flash", "gemini", true);
+        let older = model_with_opaque_state("plugin.test", "gemini-2.5-flash", "gemini", true);
         let mut older = older;
         older.discovery = serde_json::json!({
             "canonical_model_id": "google/gemini-2.5-flash",
