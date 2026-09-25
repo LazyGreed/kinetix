@@ -269,7 +269,6 @@ impl AppState {
         account: &crate::db::AccountRow,
         failed_secret: &str,
     ) -> std::result::Result<bool, CredentialRotationError> {
-        use crate::credentials::CredentialStrategy;
         let Some(r) = provider.credential_plugin_ref() else {
             return Ok(false);
         };
