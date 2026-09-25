@@ -4849,26 +4849,51 @@ async fn reconcile_provider_account_mode(
         crate::plugins::CredentialMode::None => {
             // Credential-free providers must have exactly one internal empty
             // account so routing can execute without exposing a fake user key.
-            sqlx::query("DELETE FROM accounts WHERE provider_id=?")
-                .bind(provider_id)
+            let accounts: Vec<_> = db::list_accounts(&state.pool)
+                .await
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .filter(|account| account.provider_id == provider_id)
+                .collect();
+            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
+
+            if accounts.len() == 1
+                && (accounts[0].label == "__kinetix_noauth__"
+                    || (accounts[0].label == "public"
+                        && accounts[0].key_mask == legacy_public_mask))
+            {
+                sqlx::query(
+                    "UPDATE accounts
+                     SET label='__kinetix_noauth__', secret_enc=?, key_mask='',
+                         status='healthy', priority=1, weight=1, quota_type='none',
+                         soft_quota_usd=NULL
+                     WHERE id=?",
+                )
+                .bind(&empty_secret)
+                .bind(&accounts[0].id)
                 .execute(&state.pool)
                 .await
                 .map_err(ApiError::internal)?;
-
-            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
-            db::insert_account(
-                &state.pool,
-                provider_id,
-                "__kinetix_noauth__",
-                &empty_secret,
-                "",
-                1,
-                1,
-                None,
-                "none",
-            )
-            .await
-            .map_err(ApiError::internal)?;
+            } else {
+                sqlx::query("DELETE FROM accounts WHERE provider_id=?")
+                    .bind(provider_id)
+                    .execute(&state.pool)
+                    .await
+                    .map_err(ApiError::internal)?;
+                db::insert_account(
+                    &state.pool,
+                    provider_id,
+                    "__kinetix_noauth__",
+                    &empty_secret,
+                    "",
+                    1,
+                    1,
+                    None,
+                    "none",
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
         }
         crate::plugins::CredentialMode::Manual | crate::plugins::CredentialMode::AuthFlow => {
             // Credential-bearing modes must never route through synthetic
@@ -4977,6 +5002,8 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                     error = %error.1,
                     "failed to upgrade plugin provider credential semantics"
                 );
+            } else {
+                let _ = state.registry.reload(&state.pool).await;
             }
             continue;
         }
