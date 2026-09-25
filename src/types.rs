@@ -584,22 +584,19 @@ impl FailureKind {
         !matches!(self, FailureKind::BadRequest)
     }
 
-    /// Whether the failure is scoped to the selected account/credential.
-    pub fn affects_account(&self) -> bool {
+    /// Whether the failure is evidence that the selected account/credential
+    /// itself is unavailable. Request-local transport/backend failures remain
+    /// retryable without mutating shared account health.
+    pub fn is_account_scoped(&self) -> bool {
         matches!(
             self,
-            FailureKind::RateLimit
-                | FailureKind::QuotaExhausted
-                | FailureKind::AuthError
-                | FailureKind::ServerError
-                | FailureKind::ConnectionError
-                | FailureKind::Timeout
+            FailureKind::RateLimit | FailureKind::QuotaExhausted | FailureKind::AuthError
         )
     }
 
     /// Backwards-compatible helper used by older tests/callers.
     pub fn is_key_level(&self) -> bool {
-        self.affects_account()
+        self.is_account_scoped()
     }
 }
 
