@@ -541,13 +541,19 @@ def run_http_case(case_id):
         continuation_turn(True)
         return
 
-    if case_id == "chat.translate.gemini.cross_model_placeholder":
+    if case_id in (
+        "chat.translate.gemini.cross_model_placeholder",
+        "chat.translate.gemini.cross_model_placeholder_direct",
+    ):
         # A trace that originated on one Gemini model and is continued on
         # another. The stored signature is real but belongs to a different
         # model: replaying it is wrong, and stripping it makes the provider
         # reject the unsigned historical call. Gemini documents a placeholder
         # for exactly this transfer, and the strict upstream accepts only that
-        # placeholder on the second model.
+        # placeholder on the second model. The first case continues through the
+        # `syn-gemini-pro` Route (strip_with_warning); the second targets the
+        # bare upstream model id directly, so no Route policy applies. Both must
+        # translate with the placeholder rather than refusing.
         marker = "fixture:gemini-cross-model-placeholder"
         tool = {
             "type": "function",
@@ -557,6 +563,13 @@ def run_http_case(case_id):
                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
             },
         }
+        # `syn-gemini-pro` resolves to the Route of that name; the
+        # `provider/model` form forces a direct target with no Route policy.
+        turn2_model = (
+            "Synth Gemini/syn-gemini-pro"
+            if case_id.endswith("_direct")
+            else "syn-gemini-pro"
+        )
 
         first = {
             "model": "syn-gemini",
@@ -572,7 +585,7 @@ def run_http_case(case_id):
         need(bool(call_id), "cross-model turn 1 tool call had no client-visible id")
 
         second = {
-            "model": "syn-gemini-pro",
+            "model": turn2_model,
             "stream": False,
             "messages": [
                 {"role": "user", "content": marker},
@@ -586,7 +599,10 @@ def run_http_case(case_id):
             "tools": [tool],
         }
         status, headers, body = request("/v1/chat/completions", second)
-        need(status == 200, f"cross-model turn 2 (placeholder not substituted?): {status}: {body}")
+        need(
+            status == 200,
+            f"{case_id} turn 2 (placeholder not substituted?): {status}: {body}",
+        )
         need(
             bool(headers.get("x-kinetix-warning")),
             "a substituted cross-model placeholder must be reported to the client",

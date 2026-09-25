@@ -442,13 +442,50 @@ impl OpaqueStateStore {
             return OpaqueLookupResult::Missing;
         }
 
+        // Identity validation runs before target compatibility. A stored row is
+        // bound to the conversation that created it: the same client scope, the
+        // same tool name, and (when both sides carry one) the same session. A
+        // reused tool-call id must be rejected even when the stored row belongs
+        // to a *different model the target cannot carry*; otherwise a
+        // cross-model switch would let `call/read_file/session-B` be continued
+        // as `call/get_weather/session-A` and merely receive a placeholder
+        // (§10, §20).
+        let identity_rows: Vec<&StoredRow> = rows
+            .iter()
+            .filter(|row| row.tool_name_hash == tool_name_hash(tool_name))
+            .collect();
+        if identity_rows.is_empty() {
+            self.counters
+                .lookup_tool_name_mismatch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return OpaqueLookupResult::ToolNameMismatch;
+        }
+
+        // Session compatibility (§10): a row whose stored session differs from
+        // the incoming one cannot belong to this conversation. An absent
+        // session on either side is compatible.
+        let incoming_session = session.map(session_hash);
+        let session_rows: Vec<&StoredRow> = identity_rows
+            .into_iter()
+            .filter(|row| match (&row.session_hash, &incoming_session) {
+                (Some(stored), Some(incoming)) => stored == incoming,
+                _ => true,
+            })
+            .collect();
+        if session_rows.is_empty() {
+            self.counters
+                .lookup_session_mismatch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return OpaqueLookupResult::SessionMismatch;
+        }
+
         // Prefer the row this target can actually carry (kind/provider/family/
-        // producer/model all match). With no capability, the newest row is
-        // inspected only so the pipeline can tell "stored but non-portable"
-        // apart from "nothing stored" (§19 case C, §22).
+        // producer/model all match). With no capability, the newest surviving
+        // row is inspected only so the pipeline can tell "stored but
+        // non-portable" apart from "nothing stored" (§19 case C, §22).
         let candidate = match capability {
-            Some(target) => rows.iter().find(|row| row.matches(target)),
-            None => rows.first(),
+            Some(target) => session_rows.iter().copied().find(|row| row.matches(target)),
+            None => session_rows.first().copied(),
         };
         let Some(row) = candidate else {
             self.counters
@@ -456,24 +493,6 @@ impl OpaqueStateStore {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return OpaqueLookupResult::Incompatible;
         };
-
-        // Tool-name and session identity are checked before provider
-        // compatibility so a reused tool-call id is caught even when the
-        // target happens to differ (§10, §20).
-        if row.tool_name_hash != tool_name_hash(tool_name) {
-            self.counters
-                .lookup_tool_name_mismatch
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return OpaqueLookupResult::ToolNameMismatch;
-        }
-        if let (Some(stored), Some(incoming)) = (&row.session_hash, session) {
-            if *stored != session_hash(incoming) {
-                self.counters
-                    .lookup_session_mismatch
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return OpaqueLookupResult::SessionMismatch;
-            }
-        }
 
         let Some(target) = capability else {
             self.counters
@@ -1121,6 +1140,82 @@ mod tests {
         other_model.model_id = "gemini-3-pro".into();
         let result = store
             .resolve_tool_signature(&scope, Some(&other_model), None, "call_1", "bash")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::Incompatible);
+    }
+
+    #[tokio::test]
+    async fn different_model_lookup_still_rejects_a_different_tool_name() {
+        // A cross-model switch must not mask a reused tool-call id: identity is
+        // validated before the target is classified as incompatible, so the
+        // pipeline returns a hard client error instead of a placeholder.
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let target = gemini_target();
+        capture(
+            &store,
+            &scope,
+            &target,
+            None,
+            "call_1",
+            "get_weather",
+            "SIG_A",
+        );
+        store.flush().await;
+        let mut other_model = gemini_target();
+        other_model.model_id = "gemini-3-pro".into();
+        let result = store
+            .resolve_tool_signature(&scope, Some(&other_model), None, "call_1", "read_file")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::ToolNameMismatch);
+    }
+
+    #[tokio::test]
+    async fn different_model_lookup_still_rejects_a_different_explicit_session() {
+        // Same reused tool-call id on another model but a conflicting session
+        // must be refused, not translated with a placeholder.
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let target = gemini_target();
+        capture(
+            &store,
+            &scope,
+            &target,
+            Some("sess_1"),
+            "call_1",
+            "bash",
+            "SIG_A",
+        );
+        store.flush().await;
+        let mut other_model = gemini_target();
+        other_model.model_id = "gemini-3-pro".into();
+        let result = store
+            .resolve_tool_signature(&scope, Some(&other_model), Some("sess_2"), "call_1", "bash")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::SessionMismatch);
+    }
+
+    #[tokio::test]
+    async fn different_model_lookup_with_matching_identity_stays_incompatible() {
+        // Matching tool name and session on another model is a genuine
+        // cross-model transfer: incompatible, not a mismatch.
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let target = gemini_target();
+        capture(
+            &store,
+            &scope,
+            &target,
+            Some("sess_1"),
+            "call_1",
+            "bash",
+            "SIG_A",
+        );
+        store.flush().await;
+        let mut other_model = gemini_target();
+        other_model.model_id = "gemini-3-pro".into();
+        let result = store
+            .resolve_tool_signature(&scope, Some(&other_model), Some("sess_1"), "call_1", "bash")
             .await;
         assert_eq!(result, OpaqueLookupResult::Incompatible);
     }

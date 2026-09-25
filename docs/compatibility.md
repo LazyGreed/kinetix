@@ -308,7 +308,10 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   continuation is reported non-portable and translated with the documented
   placeholder (see below) rather than reusing the original signature. Reusing a
   tool-call id with a *different* tool name is rejected with HTTP 400 before any
-  upstream request is sent.
+  upstream request is sent, and a conflicting explicit session is refused. Those
+  identity checks run before the row is classified as non-portable, so a
+  cross-model switch can never launder a reused tool-call id or a stranger's
+  session into a placeholder.
 - **Portability.** Stored state that the selected target cannot carry feeds the
   Route's existing `reject` / `strip_with_warning` portability policy exactly
   like inline client state — including when neither the provider nor the wire
@@ -326,10 +329,16 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   `skip_thought_signature_validator` sentinel), a `strip_with_warning` Route
   substitutes that placeholder onto the specific incompatible historical call
   instead of stripping it, and reports the substitution in the
-  `X-Kinetix-Warning` header. The placeholder is painted only onto calls the
-  store knew about but the target cannot carry — an id that was never captured is
-  still left untouched, so missing state is never invented. A `reject` Route and a
-  direct target with no Route policy still refuse before dispatch.
+  `X-Kinetix-Warning` header. The same documented translation applies to a
+  direct same-family switch with no Route policy (for example a deliberate
+  Flash
+  → Pro change): the adapter's placeholder is a protocol-valid substitute, so
+  the request proceeds with a warning rather than being refused. The placeholder
+  is painted only onto calls the store knew about but the target cannot carry —
+  an id that was never captured is still left untouched, so missing state is
+  never invented. A `reject` Route still refuses before dispatch, and a direct
+  target whose adapter declares no placeholder still refuses known non-portable
+  state instead of dropping it.
 - **Observability.** `GET /admin/metrics` exports
   `kinetix_opaque_state_entries`, `kinetix_opaque_state_captured_total`,
   `kinetix_opaque_state_replaced_total`,

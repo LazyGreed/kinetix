@@ -731,6 +731,18 @@ async fn run(
     req: InternalRequest,
     request_id: &str,
 ) -> Result<u16, String> {
+    run_session(state, key, req, request_id, None).await
+}
+
+/// Like [`run`], but forwards an explicit client session so session-bound
+/// opaque-state identity can be exercised end to end.
+async fn run_session(
+    state: &AppState,
+    key: Option<&db::VirtualKeyRow>,
+    req: InternalRequest,
+    request_id: &str,
+    session: Option<&str>,
+) -> Result<u16, String> {
     let response = pipeline::run(
         state,
         FrontendFormat::OpenAi,
@@ -738,7 +750,7 @@ async fn run(
         req,
         request_id.into(),
         true,
-        None,
+        session.map(str::to_string),
         vec![],
     )
     .await
@@ -946,6 +958,160 @@ async fn cross_model_pro_to_flash_continuation_uses_documented_placeholder() {
     assert_eq!(
         harness.mock.unsigned_continuations.load(Ordering::SeqCst),
         0
+    );
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn direct_cross_model_switch_uses_documented_placeholder() {
+    let harness = setup().await;
+    let key = virtual_key("key-direct-xmodel");
+
+    // Turn 1 runs on the flash model through its Route.
+    run(
+        &harness.state,
+        Some(&key),
+        first_turn_to("opaque-route", false),
+        "req_direct_fp_1",
+    )
+    .await
+    .expect("flash turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
+
+    // Turn 2 switches to the *pro* model directly (no Route, so no portability
+    // policy). A deliberate same-family model change is a documented, valid
+    // translation, so the adapter's placeholder must be applied rather than
+    // failing the request with the direct-target portability error.
+    let (status, warning) = run_with_warning(
+        &harness.state,
+        Some(&key),
+        second_turn_to("gemini-mock-pro", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_direct_fp_2",
+    )
+    .await
+    .expect("a direct cross-model switch must dispatch with the placeholder");
+    assert_eq!(status, 200);
+    assert!(
+        warning.as_deref().is_some_and(|value| !value.is_empty()),
+        "the substituted placeholder must be reported, got {warning:?}"
+    );
+    assert_eq!(
+        harness
+            .mock
+            .placeholder_continuations
+            .load(Ordering::SeqCst),
+        1,
+        "the direct pro target must have received the documented placeholder"
+    );
+    assert_eq!(
+        harness.mock.signed_continuations.load(Ordering::SeqCst),
+        0,
+        "flash's real signature must never be replayed onto pro"
+    );
+    assert_eq!(
+        harness.mock.unsigned_continuations.load(Ordering::SeqCst),
+        0
+    );
+
+    cleanup(harness).await;
+}
+
+/// A direct cross-model switch must still validate tool-call identity before
+/// classifying the stored state as transferable: reusing the id with a
+/// different tool name is malformed history, not a translatable continuation.
+#[tokio::test]
+async fn direct_cross_model_switch_with_a_different_tool_name_is_rejected() {
+    let harness = setup().await;
+    let key = virtual_key("key-direct-name");
+
+    run(
+        &harness.state,
+        Some(&key),
+        first_turn_to("opaque-route", false),
+        "req_direct_name_1",
+    )
+    .await
+    .expect("flash turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
+    let requests_before = harness.mock.requests.lock().await.len();
+
+    let error = run(
+        &harness.state,
+        Some(&key),
+        second_turn_to("gemini-mock-pro", false, TOOL_CALL_ID, "read_file"),
+        "req_direct_name_2",
+    )
+    .await
+    .expect_err("a reused id with a different tool name must be rejected");
+    assert!(
+        error.contains("different tool name"),
+        "unexpected rejection message: {error}"
+    );
+    assert_eq!(
+        harness.mock.requests.lock().await.len(),
+        requests_before,
+        "the mismatch must be rejected before any upstream dispatch"
+    );
+    assert_eq!(
+        harness
+            .mock
+            .placeholder_continuations
+            .load(Ordering::SeqCst),
+        0,
+        "a name mismatch must never be translated with a placeholder"
+    );
+
+    cleanup(harness).await;
+}
+
+/// The same reuse check applies to an explicit session: a row captured under a
+/// different session must not be translated with the cross-model placeholder.
+#[tokio::test]
+async fn direct_cross_model_switch_with_a_different_session_is_not_translated() {
+    let harness = setup().await;
+    let key = virtual_key("key-direct-session");
+
+    run_session(
+        &harness.state,
+        Some(&key),
+        first_turn_to("opaque-route", false),
+        "req_direct_session_1",
+        Some("session-a"),
+    )
+    .await
+    .expect("flash turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
+
+    // Continuing on pro with a different explicit session must not restore the
+    // signature. With no stored state to translate, the historical call is
+    // sent unsigned and the provider rejects it: the placeholder must not be
+    // invented for a stranger's session.
+    let error = run_session(
+        &harness.state,
+        Some(&key),
+        second_turn_to("gemini-mock-pro", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_direct_session_2",
+        Some("session-b"),
+    )
+    .await
+    .expect_err("a cross-session continuation must not succeed");
+    assert!(
+        error.contains("thought_signature"),
+        "the unsigned call must reach the provider, got: {error}"
+    );
+    assert_eq!(
+        harness
+            .mock
+            .placeholder_continuations
+            .load(Ordering::SeqCst),
+        0,
+        "a session mismatch must never be translated with a placeholder"
+    );
+    assert_eq!(
+        harness.mock.unsigned_continuations.load(Ordering::SeqCst),
+        1,
+        "the mismatched continuation must have reached Gemini unsigned"
     );
 
     cleanup(harness).await;

@@ -909,6 +909,19 @@ pub async fn run(
                     placeholder,
                     &mut trace,
                 )?;
+            } else if let Some(placeholder) =
+                placeholder.filter(|_| opaque_report.nonportable() && !inline_opaque)
+            {
+                // A direct target has no Route policy to authorize dropping the
+                // state, but the target adapter documents a protocol-valid
+                // substitute for the stored state it cannot carry (e.g. Gemini's
+                // cross-model function-call placeholder). Translate with it
+                // rather than failing the request; never strip silently.
+                let placed =
+                    strip_nonportable_state(&mut target_req, &opaque_report, Some(placeholder));
+                let warning = portability_warning(target, placed);
+                trace.warn(warning.clone());
+                tracing::warn!("{}", warning);
             } else if inline_opaque || opaque_report.nonportable() {
                 // A direct target with no Route policy must not silently drop
                 // known non-portable continuation state (§24).
@@ -2603,6 +2616,24 @@ fn apply_portability(
     }
 
     // portability=strip_with_warning
+    let placed = strip_nonportable_state(req, report, placeholder);
+    let warning = portability_warning(target, placed);
+    trace.warn(warning.clone());
+    tracing::warn!(route = %route.name, "{}", warning);
+    Ok(())
+}
+
+/// Remove non-portable continuation state (thinking parts and tool-call
+/// signatures) from the request and, where the target adapter documents a
+/// substitute, paint its placeholder onto the historical calls it cannot carry.
+/// Returns the number of placeholders applied. Shared by Route-based
+/// `strip_with_warning` fallback and a direct target that has a protocol-valid
+/// same-family translation.
+fn strip_nonportable_state(
+    req: &mut InternalRequest,
+    report: &OpaqueHydrationReport,
+    placeholder: Option<&'static str>,
+) -> usize {
     let mut placed = 0usize;
     for msg in &mut req.messages {
         msg.parts
@@ -2623,7 +2654,13 @@ fn apply_portability(
         }
     }
     strip_opaque_raw_body(req);
-    let warning = if placed > 0 {
+    placed
+}
+
+/// Client-visible wording for a portability decision: a substituted
+/// placeholder is a replacement, an unsigned call is an omission.
+fn portability_warning(target: &ResolvedTarget, placed: usize) -> String {
+    if placed > 0 {
         format!(
             "non-portable provider continuation state was replaced with the provider's documented placeholder for fallback to '{}'",
             target.model.display_name
@@ -2633,10 +2670,7 @@ fn apply_portability(
             "non-portable provider continuation state was omitted for fallback to '{}'",
             target.model.display_name
         )
-    };
-    trace.warn(warning.clone());
-    tracing::warn!(route = %route.name, "{}", warning);
-    Ok(())
+    }
 }
 
 /// Check the admin's parameter policy; reject when a value is unsupported and
