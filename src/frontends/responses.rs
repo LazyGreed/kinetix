@@ -549,7 +549,7 @@ fn decode_input_item(
             });
             Ok(())
         }
-        "message" | _ => {
+        _ => {
             // Can be typed as "message" or a bare role/content object
             let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match role {
