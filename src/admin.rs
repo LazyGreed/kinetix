@@ -5941,9 +5941,7 @@ mod credential_enrollment_tests {
         let binding = "plugin:plugin.test/strategy";
 
         let manual = provider("manual");
-        assert!(
-            validate_plugin_auth_enrollment(&manual, "plugin.test", "oauth", binding).is_err()
-        );
+        assert!(validate_plugin_auth_enrollment(&manual, "plugin.test", "oauth", binding).is_err());
 
         let auth_flow = provider("auth_flow");
         assert!(
@@ -5955,15 +5953,13 @@ mod credential_enrollment_tests {
         assert!(
             validate_plugin_auth_enrollment(&auth_flow, "plugin.test", "other", binding).is_err()
         );
-        assert!(
-            validate_plugin_auth_enrollment(
-                &auth_flow,
-                "plugin.test",
-                "oauth",
-                "plugin:plugin.test/other"
-            )
-            .is_err()
-        );
+        assert!(validate_plugin_auth_enrollment(
+            &auth_flow,
+            "plugin.test",
+            "oauth",
+            "plugin:plugin.test/other"
+        )
+        .is_err());
     }
 }
 
