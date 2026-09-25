@@ -407,6 +407,7 @@ mod tests {
     use super::*;
     use crate::db::ProviderRow;
     use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn provider() -> ProviderRow {
         ProviderRow {
@@ -477,6 +478,94 @@ mod tests {
             StatusCode::BAD_REQUEST,
             0,
         ));
+    }
+
+    async fn transient_gateway_retry_case(status: u16, explicit_empty_length: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = if attempt == 0 {
+                    let length = if explicit_empty_length {
+                        "Content-Length: 0\r\n"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "HTTP/1.1 {status} transient\r\n{length}Connection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let mut provider = provider();
+        provider.base_url = format!("http://{addr}");
+        provider.allow_insecure_tls = 1;
+        provider.follow_redirects = 0;
+        let model = crate::db::ModelRow {
+            id: "m".into(),
+            provider_id: provider.id.clone(),
+            upstream_id: "model".into(),
+            display_name: "model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        };
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: Some("acc"),
+            credential: "secret".into(),
+        };
+        let adapter: Arc<dyn Adapter> = Arc::new(crate::adapters::openai::OpenAiAdapter::new());
+        let cache = DashMap::new();
+        let response = send_provider_request(
+            &cache,
+            true,
+            true,
+            &adapter,
+            &ctx,
+            ProviderRequest {
+                method: Method::POST,
+                url: Url::parse(&format!("http://{addr}/v1/chat/completions")).unwrap(),
+                json_body: Some(serde_json::json!({"model":"model","stream":true})),
+                accept_event_stream: true,
+                request_id: Some("req_retry".into()),
+                headers: Vec::new(),
+                total_timeout: Some(Duration::from_secs(2)),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_transient_gateways_with_or_without_content_length() {
+        transient_gateway_retry_case(502, true).await;
+        transient_gateway_retry_case(502, false).await;
+        transient_gateway_retry_case(503, false).await;
+        transient_gateway_retry_case(504, false).await;
     }
 
     #[test]
