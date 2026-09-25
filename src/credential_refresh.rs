@@ -43,9 +43,8 @@ struct LeaseSchedule {
 struct RotationGate {
     lock: tokio::sync::Mutex<()>,
     generation: AtomicU64,
-    last_auth_result: parking_lot::Mutex<
-        Option<std::result::Result<bool, CredentialRotationError>>,
-    >,
+    last_auth_result:
+        parking_lot::Mutex<Option<std::result::Result<bool, CredentialRotationError>>>,
 }
 
 impl RotationGate {
@@ -72,12 +71,7 @@ impl RefreshCoordinator {
     /// Observe a freshly resolved credential lease and schedule its next
     /// proactive renewal. Explicit plugin-provided `refresh_after` wins;
     /// otherwise core derives a provider-neutral five-minute lead from expiry.
-    pub fn observe(
-        &self,
-        provider_id: &str,
-        account_id: &str,
-        credential: &ResolvedCredential,
-    ) {
+    pub fn observe(&self, provider_id: &str, account_id: &str, credential: &ResolvedCredential) {
         self.store_schedule(provider_id, account_id, credential, false);
     }
 
@@ -107,8 +101,9 @@ impl RefreshCoordinator {
             if let Some(existing) = self.schedules.get(&key) {
                 if existing.failures > 0 {
                     schedule.failures = existing.failures;
-                    schedule.next_attempt_at =
-                        schedule.next_attempt_at.max(existing.next_attempt_at.to_owned());
+                    schedule.next_attempt_at = schedule
+                        .next_attempt_at
+                        .max(existing.next_attempt_at.to_owned());
                 }
             }
         }
@@ -132,8 +127,7 @@ impl RefreshCoordinator {
         let mut due = Vec::new();
         for mut entry in self.schedules.iter_mut() {
             if entry.next_attempt_at <= now {
-                entry.next_attempt_at =
-                    now.to_owned() + ChronoDuration::seconds(CLAIM_GRACE_SECS);
+                entry.next_attempt_at = now.to_owned() + ChronoDuration::seconds(CLAIM_GRACE_SECS);
                 due.push(entry.key().clone());
             }
         }
@@ -181,7 +175,7 @@ impl RefreshCoordinator {
                         );
                         self.record_failure(&key, &error);
                         Err(error)
-                    },
+                    }
                 },
                 Err(error) => {
                     self.record_failure(&key, &error);
@@ -280,11 +274,7 @@ impl RefreshCoordinator {
     }
 
     #[cfg(test)]
-    pub fn next_attempt_at(
-        &self,
-        provider_id: &str,
-        account_id: &str,
-    ) -> Option<DateTime<Utc>> {
+    pub fn next_attempt_at(&self, provider_id: &str, account_id: &str) -> Option<DateTime<Utc>> {
         self.schedules
             .get(&CredentialKey::new(provider_id, account_id))
             .map(|entry| entry.next_attempt_at.to_owned())
@@ -307,8 +297,7 @@ impl RefreshCoordinator {
         let retry = error
             .retry_after_secs
             .unwrap_or_else(|| exponential_backoff_secs(schedule.failures));
-        schedule.next_attempt_at =
-            now + ChronoDuration::seconds(retry.min(MAX_RETRY_SECS) as i64);
+        schedule.next_attempt_at = now + ChronoDuration::seconds(retry.min(MAX_RETRY_SECS) as i64);
     }
 }
 
@@ -506,19 +495,14 @@ mod tests {
             &key,
             &CredentialRotationError::new("upstream_unavailable", "temporary", true, Some(5)),
         );
-        coordinator
-            .schedules
-            .get_mut(&key)
-            .unwrap()
-            .next_attempt_at = Utc::now() - ChronoDuration::seconds(1);
+        coordinator.schedules.get_mut(&key).unwrap().next_attempt_at =
+            Utc::now() - ChronoDuration::seconds(1);
 
         assert_eq!(coordinator.claim_due(Utc::now()).len(), 1);
-        assert!(
-            coordinator
-                .rotate_scheduled("p1", strategy.clone(), &account)
-                .await
-                .unwrap()
-        );
+        assert!(coordinator
+            .rotate_scheduled("p1", strategy.clone(), &account)
+            .await
+            .unwrap());
         assert_eq!(strategy.rotations.load(Ordering::Relaxed), 1);
     }
 
@@ -531,12 +515,10 @@ mod tests {
         coordinator.observe("p1", &account.id, &initial);
 
         assert_eq!(coordinator.claim_due(Utc::now()).len(), 1);
-        assert!(
-            coordinator
-                .rotate_scheduled("p1", strategy.clone(), &account)
-                .await
-                .unwrap()
-        );
+        assert!(coordinator
+            .rotate_scheduled("p1", strategy.clone(), &account)
+            .await
+            .unwrap());
         assert_eq!(strategy.rotations.load(Ordering::Relaxed), 1);
         assert!(
             coordinator.next_attempt_at("p1", &account.id).unwrap()
