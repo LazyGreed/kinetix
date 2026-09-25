@@ -776,6 +776,27 @@ impl Adapter for GeminiAdapter {
         }
         out
     }
+
+    /// Native Gemini opts into automatic opaque `thoughtSignature`
+    /// persistence/replay (§6). The state family is deliberately the coarse
+    /// `"gemini"` protocol family rather than the exact model id: Google
+    /// documents thought-signature continuation as surviving a model switch on
+    /// the same provider, so scoping by exact model id would needlessly
+    /// invalidate valid continuation state on an ordinary model change. The
+    /// producer string is an adapter *encoding* version, bumped only if
+    /// Kinetix's interpretation of the signature payload changes
+    /// incompatibly — never the crate release version.
+    fn opaque_state_target(
+        &self,
+        model: &crate::db::ModelRow,
+    ) -> Option<crate::opaque_state::OpaqueStateTarget> {
+        Some(crate::opaque_state::OpaqueStateTarget {
+            kind: crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
+            provider_id: model.provider_id.clone(),
+            family: "gemini".to_string(),
+            producer: "native:gemini:v1".to_string(),
+        })
+    }
 }
 
 /// Convert a Gemini chunk/response into internal stream events.
@@ -984,6 +1005,115 @@ mod schema_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["thought"], true);
         assert_eq!(out[0]["thoughtSignature"], "sig-thinking");
+    }
+
+    #[test]
+    fn function_call_with_same_part_signature_decodes_to_tool_call_start() {
+        let events = events_from_gemini(&json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "call_1",
+                            "name": "bash",
+                            "args": {}
+                        },
+                        "thoughtSignature": "SIG_A"
+                    }]
+                }
+            }]
+        }));
+
+        let start = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+            .expect("tool call start event");
+        assert!(matches!(
+            start,
+            StreamEvent::ToolCallStart {
+                id: Some(id),
+                name,
+                signature: Some(signature),
+                ..
+            } if id == "call_1" && name == "bash" && signature == "SIG_A"
+        ));
+    }
+
+    #[test]
+    fn parallel_function_calls_only_first_carries_signature() {
+        // Gemini 3 commonly signs only the first function call in a parallel
+        // function-call step; the other calls must decode with no signature
+        // rather than inheriting the first one's.
+        let events = events_from_gemini(&json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": { "id": "A", "name": "read", "args": {} },
+                            "thoughtSignature": "SIG_A"
+                        },
+                        {
+                            "functionCall": { "id": "B", "name": "bash", "args": {} }
+                        }
+                    ]
+                }
+            }]
+        }));
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert!(matches!(
+            starts[0],
+            StreamEvent::ToolCallStart { id: Some(id), signature: Some(sig), .. }
+            if id == "A" && sig == "SIG_A"
+        ));
+        assert!(matches!(
+            starts[1],
+            StreamEvent::ToolCallStart { id: Some(id), signature: None, .. }
+            if id == "B"
+        ));
+    }
+
+    #[test]
+    fn native_gemini_opts_into_opaque_state_by_family_not_exact_model() {
+        let model = crate::db::ModelRow {
+            id: "m".into(),
+            provider_id: "ai-studio".into(),
+            upstream_id: "gemini-3.8-flash".into(),
+            display_name: "Gemini 3.8 Flash".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        };
+        let adapter = GeminiAdapter::new();
+        let target = adapter.opaque_state_target(&model).expect("gemini opts in");
+        assert_eq!(target.provider_id, "ai-studio");
+        assert_eq!(target.family, "gemini");
+        assert_eq!(target.producer, "native:gemini:v1");
+
+        // A different exact model id on the same provider must resolve to the
+        // same family/producer, proving compatibility is not scoped to the
+        // exact model id (§6).
+        let mut other_model = model.clone();
+        other_model.upstream_id = "gemini-3.8-pro".into();
+        let other_target = adapter
+            .opaque_state_target(&other_model)
+            .expect("gemini opts in");
+        assert_eq!(other_target.family, target.family);
+        assert_eq!(other_target.producer, target.producer);
     }
 
     #[test]

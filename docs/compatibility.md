@@ -96,9 +96,18 @@ adapter combination Kinetix supports:
 That is 18 path/mode cells before specialized cases. Sync cases assert aggregated
 usage and tool identity. Streaming cases assert terminal events, usage, and stable
 tool-call identity. Specialized cases cover parallel tools, tool-result continuation,
-vision variants, tool-choice variants, nested schemas/content rejection, opaque
-reasoning portability, token-count modes, model discovery/auth, fallback, and
-same-format provider extensions.
+Gemini tool-call signature replay, vision variants, tool-choice variants, nested
+schemas/content rejection, opaque reasoning portability, token-count modes, model
+discovery/auth, fallback, and same-format provider extensions.
+
+The `chat.translate.gemini.tool_signature_continuation` case drives a full two-turn
+tool conversation through the OpenAI frontend. The synthetic Gemini upstream fails
+closed with the provider's real "Function call is missing a thought_signature" 400
+unless the historical function-call part carries the exact signature Kinetix stored
+on the previous turn, so a 200 is evidence that Kinetix captured, persisted, and
+replayed the signature without the client ever seeing it. The same case includes a
+negative control: a never-seen tool-call id must *not* be given an invented
+signature, and the strict upstream rejects it.
 
 Positive mixed fixtures send the documented sampling, tool-choice, vision, and
 reasoning fields. `scripts/synthetic_upstream.py` rejects the request if required
@@ -237,9 +246,66 @@ not a Kinetix bug. Raise `max_tokens` or lower the thinking level.
 
 - **Gemini:** `streamGenerateContent?alt=sse`; SSE frames are CRLF-separated and
   are normalized to LF by the byte-robust framer (FR-2.12). `thoughtSignature`
-  values are round-tripped through the internal model's signature slots.
+  values are round-tripped through the internal model's signature slots. Because a
+  translated client (OpenAI Chat Completions, Responses, Anthropic Messages) cannot
+  represent a `thoughtSignature`, Kinetix also persists each function-call signature
+  server-side keyed by the client-visible tool-call id and replays it on the next
+  turn; see [Opaque provider state](#opaque-provider-state) below.
 - **OpenAI-compatible:** same-format passthrough forwards the upstream's frames
   verbatim, preserving unknown/vendor fields (FR-2.10) — e.g. vendor `cost` or
   `reasoning_details` fields Kinetix itself never produces.
 - **Anthropic:** inbound `anthropic-version` and `anthropic-beta` are forwarded
   to Anthropic upstreams; Kinetix does not invent hidden version/beta defaults.
+
+## Opaque provider state
+
+Some providers attach state to a tool call that the client protocol cannot
+represent. Gemini's `thoughtSignature` is the canonical example: the model
+returns it beside a `functionCall`, and requires it back on the *same*
+historical function-call part when the conversation is continued. An OpenAI
+Chat Completions or Anthropic Messages client never sees it and therefore never
+returns it, which is why multi-turn Gemini tool calling through those frontends
+previously failed with `Function call is missing a thought_signature in
+functionCall parts.`
+
+Kinetix keeps this state host-side instead of pushing it through the client:
+
+- **Capture.** As a translated response streams, the Gemini adapter surfaces the
+  signature on the normalized tool-call event. The pipeline captures it keyed by
+  the *post-normalization* client-visible tool-call id (so generated ids work
+  too), the coarse provider family, and the client scope (the virtual key id, or
+  `internal` for keyless requests).
+- **Storage.** Values are encrypted at rest with a cipher derived specifically
+  for this subsystem (distinct from the credential and plugin-KV ciphers), and
+  stored in the `opaque_provider_state` table. Only SHA-256 hashes of the scope,
+  tool-call id, session id, and tool name are persisted; raw identifiers and raw
+  signatures never are. A bounded RAM cache is written synchronously and the
+  SQLite row is written asynchronously, so the immediately following request
+  never races persistence.
+- **Replay.** On the next request, tool-call parts whose signature slot is empty
+  are looked up. A compatible value is restored onto the exact historical part
+  before dispatch. An explicit client/canonical signature is never overwritten,
+  and a missing/unknown id is never given an invented signature.
+- **Scope and compatibility.** Replay is scoped to the originating virtual key.
+  A stored value is only reused when the target's provider id, protocol family,
+  and producer match; the account may change (same-provider failover and
+  different Gemini models in the same family both stay compatible). Reusing a
+  tool-call id with a *different* tool name is rejected with HTTP 400 before any
+  upstream request is sent.
+- **Portability.** Stored state that the selected target cannot carry feeds the
+  Route's existing `reject` / `strip_with_warning` portability policy exactly
+  like inline client state. Compatible stored state is restored only after the
+  portability decision, so a `strip_with_warning` boundary never deletes state
+  that the chosen target can use.
+- **Observability.** `GET /admin/metrics` exports
+  `kinetix_opaque_state_entries`, `kinetix_opaque_state_captured_total`,
+  `kinetix_opaque_state_replaced_total`,
+  `kinetix_opaque_state_capture_storage_errors_total`, and
+  `kinetix_opaque_state_lookups_total{outcome=...}`. These are counts and bucket
+  sizes only; no signature, tool-call id, or session identifier is exported.
+  Signatures never appear in logs, traces, the dashboard, or client responses.
+
+Only adapters that explicitly opt in participate (native Gemini today). A plugin
+adapter that happens to populate a signature is *not* assumed compatible, because
+it could multiplex unrelated opaque-state protocols; blind replay across
+adapters would be a correctness and security bug.

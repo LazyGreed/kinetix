@@ -252,6 +252,11 @@
       "id": "messages.count_tokens.heterogeneous_estimated",
       "runner": "http",
       "summary": "Heterogeneous route token count stays local and does not consume route-balancing state"
+    },
+    {
+      "id": "chat.translate.gemini.tool_signature_continuation",
+      "runner": "http",
+      "summary": "Gemini function-call thoughtSignature survives an OpenAI/Pi multi-turn tool continuation without client-visible vendor state"
     }
   ],
   "apis": [

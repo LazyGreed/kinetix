@@ -472,6 +472,75 @@ def run_http_case(case_id):
         need(status == 200, body)
         return
 
+    if case_id == "chat.translate.gemini.tool_signature_continuation":
+        # Gemini hands back an opaque `thoughtSignature` beside a function call.
+        # The OpenAI/Pi client protocol cannot represent it, so the client never
+        # sees or returns it; Kinetix must persist it server-side under the
+        # client-visible tool-call id and restore it on the next turn. The
+        # synthetic upstream fails closed (400) if the restored function call
+        # lacks the exact signature, which is the exact failure this fix
+        # addresses.
+        marker = "fixture:gemini-signature-continuation"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+
+        def continuation_turn(stream):
+            first = {
+                "model": "syn-gemini",
+                "stream": stream,
+                "messages": [{"role": "user", "content": marker}],
+                "tools": [tool],
+            }
+            status, _, body = request("/v1/chat/completions", first)
+            need(status == 200, f"stream={stream} turn 1: {status}: {body}")
+            if stream:
+                call_ids = chat_tool_identity(sse(body))[1]
+                need(len(call_ids) == 1, f"stream={stream} turn 1 ids: {call_ids}")
+                call_id = next(iter(call_ids))
+            else:
+                message = json.loads(body)["choices"][0]["message"]
+                calls = message.get("tool_calls") or []
+                need(len(calls) == 1, f"stream={stream} turn 1 calls: {calls}")
+                call_id = calls[0]["id"]
+            need(bool(call_id), f"stream={stream} turn 1 tool call had no client-visible id")
+
+            second = {
+                "model": "syn-gemini",
+                "stream": stream,
+                "messages": [
+                    {"role": "user", "content": marker},
+                    {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                    }]},
+                    {"role": "tool", "tool_call_id": call_id, "content": "18C"},
+                ],
+                "tools": [tool],
+            }
+            status, _, body = request("/v1/chat/completions", second)
+            need(status == 200, f"stream={stream} turn 2 (signature not restored?): {status}: {body}")
+
+            # Negative control: a tool-call id that was never captured must not
+            # be given an invented signature. The strict upstream rejects the
+            # unsigned continuation, proving the positive turn above really did
+            # replay stored state rather than passing vacuously.
+            unknown = json.loads(json.dumps(second))
+            unknown["messages"][1]["tool_calls"][0]["id"] = "call_never_captured"
+            unknown["messages"][2]["tool_call_id"] = "call_never_captured"
+            status, _, _ = request("/v1/chat/completions", unknown)
+            need(status != 200, f"stream={stream} unknown id was accepted without stored state")
+
+        continuation_turn(False)
+        continuation_turn(True)
+        return
+
     if case_id == "chat.fallback.tool_continuation":
         payload = {
             "model": "syn-fallback",

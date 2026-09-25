@@ -22,6 +22,9 @@ use crate::app::AppState;
 use crate::cost;
 use crate::db::{self, UsageLogRow};
 use crate::frontends::{self, Encoder, EncoderCtx, FrontendFormat};
+use crate::opaque_state::{
+    OpaqueClientScope, OpaqueLookupResult, OpaqueStateStore, OpaqueStateTarget,
+};
 use crate::passthrough;
 use crate::pool;
 use crate::predicate::{self, PluginFacts, RequestFacts, TargetFacts, TargetPredicate};
@@ -863,15 +866,70 @@ pub async fn run(
             .map(|id| id != target.provider.id)
             .unwrap_or(false);
         let cross_format = !passthrough::is_passthrough(format, target.provider.wire());
+
+        // Inline opaque state is evaluated *before* hydration so a signature we
+        // are about to restore for a compatible target is never mistaken for
+        // non-portable client state and stripped.
+        let inline_opaque = request_has_opaque_state(&target_req);
+
+        // Resolve host-owned stored continuation state for this candidate
+        // target. Compatible signatures are restored only after portability is
+        // settled (below); incompatible stored state feeds the portability
+        // decision exactly like inline state.
+        let opaque_report = resolve_opaque_state(
+            state,
+            &target_req,
+            key.as_ref(),
+            session.as_deref(),
+            target,
+            adapter.as_ref(),
+        )
+        .await?;
+
         if cross_provider || cross_format {
             if let Some(route) = &route {
-                apply_continuity(&mut target_req, route, target, &mut trace)?;
-            } else if request_has_opaque_state(&target_req) {
+                apply_portability(
+                    &mut target_req,
+                    route,
+                    target,
+                    inline_opaque,
+                    &opaque_report,
+                    &mut trace,
+                )?;
+            } else if inline_opaque || opaque_report.nonportable() {
+                // A direct target with no Route policy must not silently drop
+                // known non-portable continuation state (§24).
                 return Err(ProxyError::unsupported(
-                    "non-portable reasoning state cannot be sent to a direct cross-format target",
+                    "non-portable provider continuation state cannot be sent to a direct cross-format target",
                 ));
             }
         }
+
+        hydrate_opaque_state(&mut target_req, &opaque_report);
+        if opaque_report.known_state() {
+            // Coarse, secret-free diagnostics (§35/§36): counts and kinds only,
+            // never a signature, tool id, or session value.
+            state.flight.record(
+                &meta.request_id,
+                started.elapsed().as_millis() as u64,
+                "opaque_state_lookup",
+                format!(
+                    "restored={} incompatible={} unavailable={}",
+                    opaque_report.restored, opaque_report.incompatible, opaque_report.unavailable
+                ),
+            );
+            if opaque_report.restored > 0 {
+                trace.step(
+                    "candidate",
+                    Some(target.model.display_name.clone()),
+                    format!(
+                        "restored {} opaque provider continuation signature(s)",
+                        opaque_report.restored
+                    ),
+                );
+            }
+        }
+
         apply_target_overrides(&mut target_req, &target.param_overrides)?;
         if target
             .param_overrides
@@ -2354,19 +2412,164 @@ fn strip_opaque_raw_body(req: &mut InternalRequest) {
     req.raw_body = serde_json::to_string(&value).ok();
 }
 
-fn apply_continuity(
+/// The result of resolving stored opaque continuation state for one candidate
+/// target. Kept internal to the data plane; it never crosses the HTTP boundary.
+#[derive(Default)]
+struct OpaqueHydrationReport {
+    /// Compatible stored signatures that should be restored onto the canonical
+    /// request (applied only after portability handling).
+    restored: usize,
+    /// Stored signatures that exist but this target cannot carry.
+    incompatible: usize,
+    /// Stored signatures that could not be decrypted (treated as lost, never
+    /// surfaced to the client).
+    unavailable: usize,
+    /// `(tool_call_id, signature)` restorations to apply. Keyed by the
+    /// client-visible tool-call id rather than a positional index so a
+    /// portability strip (which removes parts) cannot invalidate the mapping.
+    restorations: Vec<(String, String)>,
+}
+
+impl OpaqueHydrationReport {
+    /// Whether any stored continuation state was found for this conversation,
+    /// regardless of whether the target can carry it.
+    fn known_state(&self) -> bool {
+        self.restored + self.incompatible + self.unavailable > 0
+    }
+
+    /// Whether stored continuation state exists that this target cannot carry,
+    /// which is what portability policy must act on.
+    fn nonportable(&self) -> bool {
+        self.incompatible > 0
+    }
+}
+
+/// Resolve stored opaque continuation state for every historical tool call that
+/// lacks an inline signature. Compatible records are collected for restoration;
+/// incompatible records feed portability policy. A tool-call id reused with a
+/// different tool name is a hard client error and never reaches the upstream
+/// (§20).
+async fn resolve_opaque_state(
+    state: &AppState,
+    req: &InternalRequest,
+    key: Option<&db::VirtualKeyRow>,
+    session: Option<&str>,
+    target: &ResolvedTarget,
+    adapter: &dyn Adapter,
+) -> Result<OpaqueHydrationReport, ProxyError> {
+    // Fast path: without any historical tool call lacking a signature there is
+    // nothing to recover, so no opaque-state work happens at all (§64).
+    let needs_lookup = req.messages.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(
+                part,
+                crate::types::Part::ToolCall {
+                    id: Some(_),
+                    signature: None,
+                    ..
+                }
+            )
+        })
+    });
+    if !needs_lookup {
+        return Ok(OpaqueHydrationReport::default());
+    }
+
+    let capability = adapter.opaque_state_target(&target.model);
+    let scope = match key {
+        Some(key) => OpaqueClientScope::for_key(&key.id),
+        None => OpaqueClientScope::internal(),
+    };
+
+    let mut report = OpaqueHydrationReport::default();
+    for message in &req.messages {
+        for part in &message.parts {
+            let crate::types::Part::ToolCall {
+                id: Some(id),
+                name,
+                signature: None,
+                ..
+            } = part
+            else {
+                continue;
+            };
+            match state
+                .opaque_state
+                .resolve_tool_signature(&scope, capability.as_ref(), session, id, name)
+                .await
+            {
+                OpaqueLookupResult::Compatible(signature) => {
+                    report.restored += 1;
+                    report.restorations.push((id.clone(), signature));
+                }
+                OpaqueLookupResult::Incompatible => report.incompatible += 1,
+                OpaqueLookupResult::Unavailable => report.unavailable += 1,
+                OpaqueLookupResult::ToolNameMismatch => {
+                    // Malformed/reused conversation history: fail closed with a
+                    // clear client error instead of letting the provider return
+                    // a less useful signature error.
+                    return Err(ProxyError::bad_request(format!(
+                        "tool call id '{id}' was reused with a different tool name"
+                    )));
+                }
+                // A session conflict simply means we must not restore; it is
+                // not a portability boundary.
+                OpaqueLookupResult::SessionMismatch | OpaqueLookupResult::Missing => {}
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Apply the resolved compatible signatures onto the target-local request
+/// clone. Never overwrites an explicit client/canonical signature (§21).
+fn hydrate_opaque_state(req: &mut InternalRequest, report: &OpaqueHydrationReport) {
+    for (tool_call_id, signature) in &report.restorations {
+        for message in &mut req.messages {
+            for part in &mut message.parts {
+                if let crate::types::Part::ToolCall {
+                    id: Some(id),
+                    signature: slot,
+                    ..
+                } = part
+                {
+                    if id == tool_call_id && slot.is_none() {
+                        *slot = Some(signature.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply a route's continuity/portability policy when falling back across
+/// providers or translating across formats (FR-2.11, FR-12.13).
+///
+/// * `reject` — refuse to fall back to a target that cannot carry the
+///   non-portable opaque state; the client gets a clear error.
+/// * `strip_with_warning` — remove the non-portable state, record it in the
+///   Route Trace, and emit a client-visible warning. Silent stripping is
+///   forbidden.
+///
+/// `inline_opaque` reflects opaque state already present in the decoded request
+/// (thinking parts, tool-call signatures) and `report` reflects host-owned
+/// stored continuation state resolved for this target. Either source can make
+/// the conversation non-portable for the candidate target.
+fn apply_portability(
     req: &mut InternalRequest,
     route: &db::RouteRow,
     target: &ResolvedTarget,
+    inline_opaque: bool,
+    report: &OpaqueHydrationReport,
     trace: &mut RouteTrace,
 ) -> Result<(), ProxyError> {
-    if !request_has_opaque_state(req) {
+    if !inline_opaque && !report.nonportable() {
         return Ok(());
     }
 
     if route.portability() == "reject" {
         return Err(ProxyError::unsupported(format!(
-            "route '{}' forbids cross-provider fallback with non-portable conversation state for target '{}'",
+            "route '{}' forbids fallback because the conversation contains non-portable provider continuation state for target '{}'",
             route.name, target.model.display_name
         )));
     }
@@ -2383,7 +2586,7 @@ fn apply_continuity(
     }
     strip_opaque_raw_body(req);
     let warning = format!(
-        "non-portable provider state (reasoning/thinking signatures) was removed to fall back to '{}'",
+        "non-portable provider continuation state was omitted for fallback to '{}'",
         target.model.display_name
     );
     trace.warn(warning.clone());
@@ -2632,6 +2835,11 @@ struct ToolStreamState {
     upstream_indexes: std::collections::HashMap<u32, u32>,
     ids: std::collections::HashMap<String, u32>,
     request_id: String,
+    /// An opaque provider signature observed on a signature-only part (e.g.
+    /// Gemini's `{ text: "", thoughtSignature: ... }`) that arrived *before*
+    /// the `ToolCallStart` it belongs to. Carried forward only until the next
+    /// relevant event so it can never attach to an unrelated later tool call.
+    pending_signature: Option<String>,
 }
 
 impl ToolStreamState {
@@ -2643,15 +2851,47 @@ impl ToolStreamState {
     }
 
     fn normalize(&mut self, events: Vec<StreamEvent>) -> Vec<StreamEvent> {
-        events
-            .into_iter()
-            .map(|event| match event {
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            let normalized = match event {
+                StreamEvent::ThinkingDelta { text, signature }
+                    if text.is_empty() && signature.is_some() =>
+                {
+                    // Signature-only part: remember it for the tool call that
+                    // should follow, but still emit the raw event unchanged so
+                    // the client encoder behaves exactly as before.
+                    self.pending_signature = signature.clone();
+                    StreamEvent::ThinkingDelta { text, signature }
+                }
+                StreamEvent::ThinkingDelta { text, signature } => {
+                    // Real thinking content is not a signature-only marker;
+                    // drop any stale pending signature so it cannot leak onto
+                    // an unrelated later tool call.
+                    self.pending_signature = None;
+                    StreamEvent::ThinkingDelta { text, signature }
+                }
+                StreamEvent::TextDelta(text) => {
+                    self.pending_signature = None;
+                    StreamEvent::TextDelta(text)
+                }
                 StreamEvent::ToolCallStart {
                     index,
                     id,
                     name,
                     signature,
                 } => {
+                    // An explicit signature on the tool call itself always
+                    // wins; never overwrite it with a pending one. Either way
+                    // pending state is consumed here so it cannot attach to a
+                    // second, later tool call: parallel calls must keep their
+                    // original signature placement exactly (never copy FC0's
+                    // signature onto FC1/FC2).
+                    let resolved_signature = match signature {
+                        Some(sig) => Some(sig),
+                        None => self.pending_signature.take(),
+                    };
+                    self.pending_signature = None;
+
                     let canonical = id
                         .as_ref()
                         .and_then(|id| self.ids.get(id).copied())
@@ -2678,7 +2918,7 @@ impl ToolStreamState {
                         index: canonical,
                         id,
                         name,
-                        signature,
+                        signature: resolved_signature,
                     }
                 }
                 StreamEvent::ToolCallArgsDelta { index, args } => {
@@ -2688,9 +2928,82 @@ impl ToolStreamState {
                         args,
                     }
                 }
+                StreamEvent::Finish(reason) => {
+                    self.pending_signature = None;
+                    StreamEvent::Finish(reason)
+                }
                 other => other,
-            })
-            .collect()
+            };
+            out.push(normalized);
+        }
+        out
+    }
+}
+
+/// Capture context for opaque provider continuation state (e.g. Gemini
+/// `thoughtSignature`). Created once per successfully-connected target so the
+/// streaming and non-streaming drivers share one capture path.
+struct OpaqueCaptureContext {
+    scope: OpaqueClientScope,
+    session: Option<String>,
+    target: OpaqueStateTarget,
+    origin_model: String,
+}
+
+impl OpaqueCaptureContext {
+    /// Build a capture context only when the target adapter declares an
+    /// opaque-state capability. For every other adapter (all non-Gemini
+    /// built-ins, and plugins without an explicit contract) this returns
+    /// `None`, so no opaque-state work happens on their request path.
+    fn from_attempt(
+        attempt: &Attempt,
+        key: Option<&db::VirtualKeyRow>,
+        session: Option<&str>,
+    ) -> Option<Self> {
+        let target = attempt.adapter.opaque_state_target(&attempt.target.model)?;
+        let scope = match key {
+            Some(key) => OpaqueClientScope::for_key(&key.id),
+            None => OpaqueClientScope::internal(),
+        };
+        Some(Self {
+            scope,
+            session: session.map(str::to_string),
+            target,
+            origin_model: attempt.target.model.upstream_id.clone(),
+        })
+    }
+}
+
+/// Persist every opaque signature observed on normalized `ToolCallStart`
+/// events, keyed by the **client-visible** tool-call id (after
+/// `ToolStreamState::normalize`) so a later translated request can recover it
+/// by the id the client actually saw. Shared by both drivers; a storage
+/// failure is recorded by the store and never interrupts the response.
+async fn capture_opaque_state(
+    events: &[StreamEvent],
+    ctx: &OpaqueCaptureContext,
+    store: &OpaqueStateStore,
+) {
+    for event in events {
+        if let StreamEvent::ToolCallStart {
+            id: Some(id),
+            name,
+            signature: Some(signature),
+            ..
+        } = event
+        {
+            store
+                .capture_tool_signature(
+                    &ctx.scope,
+                    &ctx.target,
+                    ctx.session.as_deref(),
+                    id,
+                    name,
+                    &ctx.origin_model,
+                    signature,
+                )
+                .await;
+        }
     }
 }
 
@@ -2799,10 +3112,15 @@ async fn drive_stream(
     let mut saw_reasoning = false;
     let mut saw_tool = false;
     let adapter = attempt.adapter.clone();
+    let opaque_ctx =
+        OpaqueCaptureContext::from_attempt(&attempt, key.as_ref(), meta.session.as_deref());
 
     // A normal JSON response is already complete and validated before commit.
     if let Some(events) = attempt.full_events.take() {
         let events = tool_stream.normalize(events);
+        if let Some(ctx) = &opaque_ctx {
+            capture_opaque_state(&events, ctx, &state.opaque_state).await;
+        }
         if !emit_translated_events(
             events,
             &mut encoder,
@@ -2942,6 +3260,9 @@ async fn drive_stream(
                                 terminal_seen = true;
                             }
                             let events = tool_stream.normalize(events);
+                            if let Some(ctx) = &opaque_ctx {
+                                capture_opaque_state(&events, ctx, &state.opaque_state).await;
+                            }
                             if !emit_translated_events(
                                 events,
                                 &mut encoder,
@@ -3346,6 +3667,8 @@ async fn drive_aggregate(
     mut trace: RouteTrace,
 ) -> AggregateResult {
     let adapter = attempt.adapter.clone();
+    let opaque_ctx =
+        OpaqueCaptureContext::from_attempt(&attempt, key.as_ref(), meta.session.as_deref());
     let mut events: Vec<StreamEvent> = Vec::new();
     let mut tool_stream = ToolStreamState::new(&encoder_ctx.request_id);
     let mut usage = TokenUsage::default();
@@ -3355,7 +3678,11 @@ async fn drive_aggregate(
     let mut committed = false;
 
     if let Some(full_events) = attempt.full_events.take() {
-        for event in tool_stream.normalize(full_events) {
+        let normalized = tool_stream.normalize(full_events);
+        if let Some(ctx) = &opaque_ctx {
+            capture_opaque_state(&normalized, ctx, &state.opaque_state).await;
+        }
+        for event in normalized {
             if let StreamEvent::Usage(value) = &event {
                 usage.merge(value);
             }
@@ -3416,7 +3743,12 @@ async fn drive_aggregate(
                                 if payload_is_terminal(&payload, &parsed) {
                                     terminal_seen = true;
                                 }
-                                for event in tool_stream.normalize(parsed) {
+                                let normalized = tool_stream.normalize(parsed);
+                                if let Some(ctx) = &opaque_ctx {
+                                    capture_opaque_state(&normalized, ctx, &state.opaque_state)
+                                        .await;
+                                }
+                                for event in normalized {
                                     if let StreamEvent::Usage(value) = &event {
                                         usage.merge(value);
                                     }
@@ -4444,6 +4776,168 @@ mod route_policy_tests {
     }
 
     #[test]
+    fn generated_tool_call_id_keeps_signature_attached() {
+        let mut state = ToolStreamState::new("req_test");
+        let out = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: None,
+            name: "bash".into(),
+            signature: Some("SIG".into()),
+        }]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart { id: Some(id), signature: Some(sig), .. }
+                if id == "call_reqtest_0" && sig == "SIG"
+        ));
+    }
+
+    #[test]
+    fn explicit_tool_call_id_keeps_signature_attached() {
+        let mut state = ToolStreamState::new("req_test");
+        let out = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("call_123".into()),
+            name: "bash".into(),
+            signature: Some("SIG".into()),
+        }]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart { id: Some(id), signature: Some(sig), .. }
+                if id == "call_123" && sig == "SIG"
+        ));
+    }
+
+    #[test]
+    fn signature_only_then_function_call_attaches_pending_signature() {
+        let mut state = ToolStreamState::new("req_test");
+        let first = state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: String::new(),
+            signature: Some("SIG".into()),
+        }]);
+        // The raw thinking event is passed through unchanged.
+        assert!(matches!(
+            &first[0],
+            StreamEvent::ThinkingDelta { text, signature: Some(sig) }
+                if text.is_empty() && sig == "SIG"
+        ));
+
+        let second = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: None,
+            name: "bash".into(),
+            signature: None,
+        }]);
+        assert!(matches!(
+            &second[0],
+            StreamEvent::ToolCallStart { id: Some(id), signature: Some(sig), .. }
+                if id == "call_reqtest_0" && sig == "SIG"
+        ));
+    }
+
+    #[test]
+    fn pending_signature_not_copied_to_parallel_calls() {
+        let mut state = ToolStreamState::new("req_test");
+        state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: String::new(),
+            signature: Some("SIG_A".into()),
+        }]);
+        let out = state.normalize(vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: Some("A".into()),
+                name: "read".into(),
+                signature: None,
+            },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: Some("B".into()),
+                name: "bash".into(),
+                signature: None,
+            },
+        ]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart { id: Some(id), signature: Some(sig), .. }
+                if id == "A" && sig == "SIG_A"
+        ));
+        assert!(matches!(
+            &out[1],
+            StreamEvent::ToolCallStart { id: Some(id), signature: None, .. }
+                if id == "B"
+        ));
+    }
+
+    #[test]
+    fn explicit_tool_call_signature_wins_over_pending() {
+        let mut state = ToolStreamState::new("req_test");
+        state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: String::new(),
+            signature: Some("PENDING".into()),
+        }]);
+        let out = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("A".into()),
+            name: "read".into(),
+            signature: Some("EXPLICIT".into()),
+        }]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart { signature: Some(sig), .. } if sig == "EXPLICIT"
+        ));
+    }
+
+    #[test]
+    fn pending_signature_cleared_by_text_delta() {
+        // A stale signature-only part followed by ordinary text (and then an
+        // unrelated tool call) must not leak the earlier signature onward.
+        let mut state = ToolStreamState::new("req_test");
+        state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: String::new(),
+            signature: Some("STALE".into()),
+        }]);
+        state.normalize(vec![StreamEvent::TextDelta("hello".into())]);
+        let out = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("later".into()),
+            name: "read".into(),
+            signature: None,
+        }]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart {
+                signature: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pending_signature_cleared_by_real_thinking_delta() {
+        let mut state = ToolStreamState::new("req_test");
+        state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: String::new(),
+            signature: Some("STALE".into()),
+        }]);
+        state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: "real reasoning".into(),
+            signature: None,
+        }]);
+        let out = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("later".into()),
+            name: "read".into(),
+            signature: None,
+        }]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart {
+                signature: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn portability_strip_updates_canonical_and_raw_request_state() {
         let mut req = request();
         req.messages = vec![crate::types::Message {
@@ -4473,9 +4967,11 @@ mod route_policy_tests {
         let route = route(serde_json::json!({}));
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
-        apply_continuity(&mut req, &route, &target, &mut trace).unwrap();
+        let report = OpaqueHydrationReport::default();
+        apply_portability(&mut req, &route, &target, true, &report, &mut trace).unwrap();
 
         assert!(!request_has_opaque_state(&req));
+        assert!(!trace.warnings.is_empty());
         let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
         assert_eq!(raw["messages"][0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(raw["messages"][0]["content"][0]["type"], "text");
@@ -4494,7 +4990,131 @@ mod route_policy_tests {
         let mut route = route(serde_json::json!({}));
         route.portability_policy = "reject".into();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
-        assert!(apply_continuity(&mut req, &route, &target(), &mut trace).is_err());
+        let report = OpaqueHydrationReport::default();
+        assert!(apply_portability(&mut req, &route, &target(), true, &report, &mut trace).is_err());
+    }
+
+    #[test]
+    fn portability_strip_handles_stored_nonportable_state() {
+        // No inline state, but a stored record exists that this target cannot
+        // carry: strip_with_warning must warn without touching the request.
+        let mut req = request();
+        let route = route(serde_json::json!({}));
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        let report = OpaqueHydrationReport {
+            incompatible: 1,
+            ..Default::default()
+        };
+        apply_portability(&mut req, &route, &target, false, &report, &mut trace).unwrap();
+        assert_eq!(trace.warnings.len(), 1);
+    }
+
+    #[test]
+    fn portability_reject_handles_stored_nonportable_state() {
+        let mut req = request();
+        let mut route = route(serde_json::json!({}));
+        route.portability_policy = "reject".into();
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        let report = OpaqueHydrationReport {
+            incompatible: 1,
+            ..Default::default()
+        };
+        assert!(apply_portability(&mut req, &route, &target, false, &report, &mut trace).is_err());
+    }
+
+    #[test]
+    fn portability_noop_when_no_opaque_state() {
+        let mut req = request();
+        let route = route(serde_json::json!({}));
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        let report = OpaqueHydrationReport::default();
+        apply_portability(&mut req, &route, &target, false, &report, &mut trace).unwrap();
+        assert!(trace.warnings.is_empty());
+    }
+
+    #[test]
+    fn hydrate_opaque_state_restores_signature_and_preserves_explicit_one() {
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![
+                crate::types::Part::ToolCall {
+                    id: Some("call_a".into()),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                    signature: None,
+                },
+                crate::types::Part::ToolCall {
+                    id: Some("call_b".into()),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                    signature: Some("EXPLICIT".into()),
+                },
+            ],
+        }];
+        let report = OpaqueHydrationReport {
+            restored: 1,
+            restorations: vec![("call_a".into(), "RESTORED".into())],
+            ..Default::default()
+        };
+        hydrate_opaque_state(&mut req, &report);
+
+        let parts = &req.messages[0].parts;
+        assert!(matches!(
+            &parts[0],
+            crate::types::Part::ToolCall { signature: Some(sig), .. } if sig == "RESTORED"
+        ));
+        // An explicit client/canonical signature is never overwritten.
+        assert!(matches!(
+            &parts[1],
+            crate::types::Part::ToolCall { signature: Some(sig), .. } if sig == "EXPLICIT"
+        ));
+    }
+
+    #[test]
+    fn portability_strips_inline_but_hydrates_compatible_afterwards() {
+        // Simulates the OpenAI->Gemini translated path: recent tool calls carry
+        // no inline signature (they were recovered from the store), while a
+        // stray inline thinking block is stripped. The recovered signature must
+        // survive because hydration happens after the strip.
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![
+                crate::types::Part::Thinking {
+                    text: "hidden".into(),
+                    signature: Some("thinking-sig".into()),
+                },
+                crate::types::Part::ToolCall {
+                    id: Some("call_a".into()),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                    signature: None,
+                },
+            ],
+        }];
+        let route = route(serde_json::json!({}));
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        let report = OpaqueHydrationReport {
+            restored: 1,
+            restorations: vec![("call_a".into(), "RECOVERED".into())],
+            ..Default::default()
+        };
+
+        let inline = request_has_opaque_state(&req);
+        assert!(inline);
+        apply_portability(&mut req, &route, &target, inline, &report, &mut trace).unwrap();
+        hydrate_opaque_state(&mut req, &report);
+
+        assert_eq!(req.messages[0].parts.len(), 1);
+        assert!(matches!(
+            &req.messages[0].parts[0],
+            crate::types::Part::ToolCall { signature: Some(sig), .. } if sig == "RECOVERED"
+        ));
     }
 
     #[test]

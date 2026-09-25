@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod gemini;
 pub mod openai;
 
+use crate::opaque_state::OpaqueStateTarget;
 use crate::types::{InternalRequest, ProxyError, StreamEvent, UpstreamFailure, WireFormat};
 
 /// Everything an adapter needs to build and authenticate one upstream call.
@@ -107,6 +108,21 @@ pub trait Adapter: Send + Sync {
     fn parse_model_list(&self, body: &serde_json::Value) -> Vec<DiscoveredModel> {
         let _ = body;
         Vec::new()
+    }
+
+    /// Declares whether this adapter produces/consumes opaque provider
+    /// continuation state (e.g. Gemini `thoughtSignature`) that Kinetix should
+    /// automatically persist and replay for translated client protocols.
+    ///
+    /// Returning `None` (the default) disables automatic persistence/replay.
+    /// Built-in native Gemini is the only adapter that opts in today; plugin
+    /// adapters must not be assumed Gemini-compatible just because they also
+    /// populate `ToolCallStart.signature` — a plugin (e.g. Antigravity) may
+    /// multiplex several unrelated opaque-state protocols behind one adapter,
+    /// and blindly replaying one family's token into another would be a
+    /// correctness/security bug, not just a missed optimization.
+    fn opaque_state_target(&self, _model: &crate::db::ModelRow) -> Option<OpaqueStateTarget> {
+        None
     }
 }
 

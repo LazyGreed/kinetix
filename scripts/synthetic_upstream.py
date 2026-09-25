@@ -62,6 +62,25 @@ def _fixture(req, name):
     return f"fixture:{name}" in json.dumps(req, sort_keys=True)
 
 
+def _function_call_parts(value):
+    """Return every `functionCall` part (the enclosing part, so the sibling
+    `thoughtSignature` is visible) in a Gemini body."""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key == "functionCall" and isinstance(child, dict):
+                    found.append(node)
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return found
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -177,6 +196,25 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 self._json(400, {"error": {"message": "opaque reasoning state crossed portability boundary"}})
                 return
+            if _fixture(req, "gemini-signature-continuation") and _contains_key(req, {"functionResponse"}):
+                # Strict Gemini behavior: once a signed function call has been
+                # continued, every function-call part in the history must carry
+                # its exact thoughtSignature. This mirrors the real provider's
+                # "Function call is missing a thought_signature" rejection and is
+                # what Kinetix's server-side replay must satisfy. The
+                # originating function call must also still be present at all.
+                calls = _function_call_parts(req)
+                if not calls:
+                    self._json(400, {"error": {"message": "continuation lost the originating function call"}})
+                    return
+                if any(
+                    part.get("thoughtSignature") != "OPAQUE_SIG_CONTINUATION" for part in calls
+                ):
+                    self._json(400, {"error": {"message": (
+                        "Function call is missing a thought_signature in functionCall parts. "
+                        "This is required for tools to work correctly."
+                    )}})
+                    return
             self._gemini(model, want_tools, req)
         else:
             self._openai(model, stream, want_tools, tool_fragments, req)
@@ -590,9 +628,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             time.sleep(TTFT_MS / 1000.0)
             if want_tools:
-                calls = [
-                    {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}
-                ]
+                if req is not None and _fixture(req, "gemini-signature-continuation"):
+                    # Deliberately omit functionCall.id so Kinetix must generate
+                    # the client-visible id; the test then continues with the id
+                    # Kinetix actually exposed.
+                    calls = [{
+                        "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                        "thoughtSignature": "OPAQUE_SIG_CONTINUATION",
+                    }]
+                else:
+                    calls = [
+                        {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}
+                    ]
                 if req is not None and _fixture(req, "multi-tools"):
                     calls.append(
                         {"functionCall": {"name": "read_file", "args": {"path": "src/main.rs"}}}
