@@ -697,9 +697,7 @@ pub async fn list_providers(State(state): State<AppState>, _auth: AdminAuth) -> 
                 && !(p.credential_mode == "none" && a.label == "__kinetix_noauth__")
         });
         let accounts_count = visible_accounts.clone().count();
-        let healthy_accounts = visible_accounts
-            .filter(|a| a.status == "healthy")
-            .count();
+        let healthy_accounts = visible_accounts.filter(|a| a.status == "healthy").count();
         let mut v = provider_json_with_enrollment(&state, p).await;
         v["accounts_count"] = json!(accounts_count);
         v["models_count"] = json!(models.iter().filter(|m| m.provider_id == p.id).count());
@@ -4807,9 +4805,10 @@ async fn reconcile_provider_credential_semantics(
             }
 
             let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
-            if let Some(legacy) = accounts.iter().find(|account| {
-                account.label == "public" && account.key_mask == legacy_public_mask
-            }) {
+            if let Some(legacy) = accounts
+                .iter()
+                .find(|account| account.label == "public" && account.key_mask == legacy_public_mask)
+            {
                 sqlx::query(
                     "UPDATE accounts SET label='__kinetix_noauth__', secret_enc=?, key_mask='' WHERE id=?",
                 )
@@ -5683,14 +5682,10 @@ pub async fn start_provider_credential_enrollment(
     match provider.credential_mode.as_str() {
         "auth_flow" => {}
         "none" => {
-            return Err(ApiError::bad(
-                "provider does not require user credentials",
-            ));
+            return Err(ApiError::bad("provider does not require user credentials"));
         }
         _ => {
-            return Err(ApiError::bad(
-                "provider uses manual credential enrollment",
-            ));
+            return Err(ApiError::bad("provider uses manual credential enrollment"));
         }
     }
 
@@ -5710,9 +5705,7 @@ pub async fn start_provider_credential_enrollment(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::bad("provider authentication plugin is not installed"))?;
     if row.enabled == 0 {
-        return Err(ApiError::bad(
-            "provider authentication plugin is disabled",
-        ));
+        return Err(ApiError::bad("provider authentication plugin is disabled"));
     }
     let manifest = row
         .manifest()
