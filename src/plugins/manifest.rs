@@ -753,8 +753,7 @@ integration = "foo"
 
         let legacy = parse_and_validate(GOOD, HostPolicy::default()).unwrap();
         assert_eq!(
-            legacy.manifest.integrations[0]
-                .effective_credential_mode(&legacy.manifest.permissions),
+            legacy.manifest.integrations[0].effective_credential_mode(&legacy.manifest.permissions),
             CredentialMode::AuthFlow
         );
 
@@ -765,8 +764,7 @@ integration = "foo"
                 "network_hosts = [\"api.foo.example\", \"*.svc.example\"]",
                 "network_hosts = [\"api.foo.example\", \"*.svc.example\"]\ncredential_scopes = [\"credential_strategy:foo-auth\"]",
             );
-        let legacy_manual =
-            parse_and_validate(&legacy_manual, HostPolicy::default()).unwrap();
+        let legacy_manual = parse_and_validate(&legacy_manual, HostPolicy::default()).unwrap();
         assert_eq!(
             legacy_manual.manifest.integrations[0]
                 .effective_credential_mode(&legacy_manual.manifest.permissions),
@@ -787,27 +785,27 @@ integration = "foo"
 
     #[test]
     fn rejects_contradictory_credential_modes() {
-        let auth_without_flow = GOOD
-            .replace("auth_flow = \"foo-login\"\n", "")
-            .replace(
-                "description = \"Foo provider integration\"",
-                "description = \"Foo provider integration\"\ncredential_mode = \"auth_flow\"",
-            );
-        assert!(parse_and_validate(&auth_without_flow, HostPolicy::default())
-            .unwrap_err()
-            .to_string()
-            .contains("requires auth_flow"));
+        let auth_without_flow = GOOD.replace("auth_flow = \"foo-login\"\n", "").replace(
+            "description = \"Foo provider integration\"",
+            "description = \"Foo provider integration\"\ncredential_mode = \"auth_flow\"",
+        );
+        assert!(
+            parse_and_validate(&auth_without_flow, HostPolicy::default())
+                .unwrap_err()
+                .to_string()
+                .contains("requires auth_flow")
+        );
 
-        let none_with_strategy = GOOD
-            .replace("auth_flow = \"foo-login\"\n", "")
-            .replace(
-                "description = \"Foo provider integration\"",
-                "description = \"Foo provider integration\"\ncredential_mode = \"none\"",
-            );
-        assert!(parse_and_validate(&none_with_strategy, HostPolicy::default())
-            .unwrap_err()
-            .to_string()
-            .contains("may not declare auth_flow or credential_strategy"));
+        let none_with_strategy = GOOD.replace("auth_flow = \"foo-login\"\n", "").replace(
+            "description = \"Foo provider integration\"",
+            "description = \"Foo provider integration\"\ncredential_mode = \"none\"",
+        );
+        assert!(
+            parse_and_validate(&none_with_strategy, HostPolicy::default())
+                .unwrap_err()
+                .to_string()
+                .contains("may not declare auth_flow or credential_strategy")
+        );
 
         let none_with_flow = GOOD.replace(
             "description = \"Foo provider integration\"",
