@@ -4902,7 +4902,6 @@ mod route_policy_tests {
                 },
                 "required": ["path"]
             }),
-        
             defer_loading: None,
         });
 

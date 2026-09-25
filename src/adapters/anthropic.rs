@@ -928,14 +928,12 @@ mod tests {
                 name: "read".into(),
                 description: Some("read a file".into()),
                 parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
-            
                 defer_loading: None,
             },
             ToolDef {
                 name: "write".into(),
                 description: Some("write a file".into()),
                 parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
-            
                 defer_loading: None,
             },
         ];
@@ -981,7 +979,6 @@ mod tests {
             name: "read".into(),
             description: Some("read a file".into()),
             parameters: json!({"type":"object"}),
-        
             defer_loading: None,
         }];
         let mut second = first.clone();
@@ -1013,7 +1010,6 @@ mod tests {
             name: "read".into(),
             description: None,
             parameters: json!({"type":"object"}),
-        
             defer_loading: None,
         }];
         let ctx = UpstreamContext {
@@ -1140,7 +1136,6 @@ mod tests {
             name: "read".into(),
             description: None,
             parameters: json!({"type":"object"}),
-        
             defer_loading: None,
         }];
 
