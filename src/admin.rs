@@ -8310,6 +8310,34 @@ mod credential_enrollment_regression_tests {
             1
         );
 
+        // Runtime selection must fail closed even if stale real credentials are
+        // inserted outside the reconciliation path.
+        let stale = state.crypto.encrypt("should-not-route").unwrap();
+        let stale_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale-real",
+            &stale,
+            &crate::crypto::mask_secret("should-not-route"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let runtime_accounts: Vec<_> = state
+            .registry
+            .snapshot()
+            .accounts
+            .values()
+            .filter(|account| account.provider_id == provider_id)
+            .map(|account| account.label.clone())
+            .collect();
+        assert_eq!(runtime_accounts, vec!["__kinetix_noauth__".to_string()]);
+        db::delete_account(&state.pool, &stale_id).await.unwrap();
+
         reconcile_provider_credential_semantics(
             &state,
             &provider_id,
