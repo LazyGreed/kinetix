@@ -119,9 +119,12 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
         }
         if let Some(mode) = integration.credential_mode {
             match mode {
-                CredentialMode::AuthFlow if integration.auth_flow.is_none() => {
+                CredentialMode::AuthFlow
+                    if integration.auth_flow.is_none()
+                        || integration.credential_strategy.is_none() =>
+                {
                     bail!(
-                        "integration '{}' credential_mode 'auth_flow' requires auth_flow",
+                        "integration '{}' credential_mode 'auth_flow' requires auth_flow and credential_strategy",
                         integration.id
                     );
                 }
@@ -793,7 +796,20 @@ integration = "foo"
             parse_and_validate(&auth_without_flow, HostPolicy::default())
                 .unwrap_err()
                 .to_string()
-                .contains("requires auth_flow")
+                .contains("requires auth_flow and credential_strategy")
+        );
+
+        let auth_without_strategy = GOOD
+            .replace("credential_strategy = \"foo-auth\"\n", "")
+            .replace(
+                "description = \"Foo provider integration\"",
+                "description = \"Foo provider integration\"\ncredential_mode = \"auth_flow\"",
+            );
+        assert!(
+            parse_and_validate(&auth_without_strategy, HostPolicy::default())
+                .unwrap_err()
+                .to_string()
+                .contains("requires auth_flow and credential_strategy")
         );
 
         let none_with_strategy = GOOD.replace("auth_flow = \"foo-login\"\n", "").replace(
