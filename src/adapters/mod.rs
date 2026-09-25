@@ -697,9 +697,7 @@ pub fn plugin_provider_variant(metadata: &serde_json::Value) -> Option<serde_jso
     serde_json::to_value(metadata.identity?.variant?).ok()
 }
 
-pub fn plugin_opaque_state_capability(
-    metadata: &serde_json::Value,
-) -> Option<serde_json::Value> {
+pub fn plugin_opaque_state_capability(metadata: &serde_json::Value) -> Option<serde_json::Value> {
     let metadata = parse_model_capabilities_v2(metadata)?;
     serde_json::to_value(metadata.opaque_state?).ok()
 }
