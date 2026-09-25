@@ -899,11 +899,7 @@ pub async fn set_model_discovery(pool: &Pool, id: &str, discovery: &Value) -> Re
     Ok(())
 }
 
-pub async fn set_model_opaque_state_plugin(
-    pool: &Pool,
-    id: &str,
-    plugin_id: &str,
-) -> Result<()> {
+pub async fn set_model_opaque_state_plugin(pool: &Pool, id: &str, plugin_id: &str) -> Result<()> {
     sqlx::query("UPDATE models SET opaque_state_plugin=? WHERE id=?")
         .bind(plugin_id)
         .bind(id)
