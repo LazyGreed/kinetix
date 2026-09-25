@@ -4875,6 +4875,14 @@ async fn reconcile_provider_account_mode(
                 .await
                 .map_err(ApiError::internal)?;
             } else {
+                sqlx::query(
+                    "UPDATE route_targets SET account_id=NULL
+                     WHERE account_id IN (SELECT id FROM accounts WHERE provider_id=?)",
+                )
+                .bind(provider_id)
+                .execute(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
                 sqlx::query("DELETE FROM accounts WHERE provider_id=?")
                     .bind(provider_id)
                     .execute(&state.pool)
@@ -4898,6 +4906,19 @@ async fn reconcile_provider_account_mode(
         crate::plugins::CredentialMode::Manual | crate::plugins::CredentialMode::AuthFlow => {
             // Credential-bearing modes must never route through synthetic
             // no-auth state left by a previous credential-free configuration.
+            sqlx::query(
+                "UPDATE route_targets SET account_id=NULL
+                 WHERE account_id IN (
+                     SELECT id FROM accounts
+                     WHERE provider_id=?
+                       AND (label='__kinetix_noauth__' OR (label='public' AND key_mask=?))
+                 )",
+            )
+            .bind(provider_id)
+            .bind(&legacy_public_mask)
+            .execute(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
             sqlx::query(
                 "DELETE FROM accounts
                  WHERE provider_id=?
