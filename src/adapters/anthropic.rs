@@ -765,6 +765,27 @@ mod tests {
     }
 
     #[test]
+    fn cache_usage_regression_matches_provider_accounting() {
+        let first = parse_anthropic_usage(&serde_json::json!({
+            "input_tokens": 500,
+            "cache_creation_input_tokens": 8000,
+            "cache_read_input_tokens": 0
+        }));
+        assert_eq!(first.input, Some(8500));
+        assert_eq!(first.cached, Some(0));
+        assert_eq!(first.cache_write, Some(8000));
+
+        let second = parse_anthropic_usage(&serde_json::json!({
+            "input_tokens": 700,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 8000
+        }));
+        assert_eq!(second.input, Some(9000));
+        assert_eq!(second.cached, Some(8000));
+        assert_eq!(second.cache_write, Some(300));
+    }
+
+    #[test]
     fn anthropic_retry_after_ms_takes_precedence() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after-ms", "1500".parse().unwrap());
