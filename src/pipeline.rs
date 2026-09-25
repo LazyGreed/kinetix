@@ -5026,10 +5026,8 @@ mod route_policy_tests {
         let url = format!("sqlite://{}?mode=rwc", dir.join("t.db").display());
         let pool = crate::db::connect(&url).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
-        let store = OpaqueStateStore::new(
-            pool,
-            Arc::new(crate::crypto::Crypto::new(&[11u8; 32])),
-        );
+        let store =
+            OpaqueStateStore::new(pool, Arc::new(crate::crypto::Crypto::new(&[11u8; 32])));
         let scope = OpaqueClientScope::internal();
         let target = OpaqueStateTarget {
             kind: crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
@@ -5071,13 +5069,7 @@ mod route_policy_tests {
         capture_opaque_state(&thinking_events, &ctx, &store);
         assert_eq!(
             store
-                .resolve_tool_signature(
-                    &scope,
-                    Some(&target),
-                    None,
-                    "call_think",
-                    "bash",
-                )
+                .resolve_tool_signature(&scope, Some(&target), None, "call_think", "bash")
                 .await,
             OpaqueLookupResult::Compatible("SIG_THINK".into())
         );
@@ -5106,13 +5098,7 @@ mod route_policy_tests {
         capture_opaque_state(&text_events, &ctx, &store);
         assert_eq!(
             store
-                .resolve_tool_signature(
-                    &scope,
-                    Some(&target),
-                    None,
-                    "call_text",
-                    "read",
-                )
+                .resolve_tool_signature(&scope, Some(&target), None, "call_text", "read")
                 .await,
             OpaqueLookupResult::Compatible("SIG_TEXT".into())
         );
