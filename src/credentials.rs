@@ -4,7 +4,6 @@
 //! capable of representing refresh/expiry/rotation and health reporting so
 //! future login-session strategies can be added without touching pool logic.
 
-use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::crypto::Crypto;
@@ -94,7 +93,10 @@ pub trait CredentialStrategy: Send + Sync {
     /// Resolve the plaintext credential to send upstream for this account.
     /// Static strategies ignore `now`; refresh-capable strategies use it to
     /// decide whether the cached/derived credential is still valid.
-    async fn resolve(&self, account: &AccountRow) -> Result<ResolvedCredential>;
+    async fn resolve(
+        &self,
+        account: &AccountRow,
+    ) -> std::result::Result<ResolvedCredential, CredentialRotationError>;
 
     /// Report whether the current credential is healthy/expiring/unusable
     /// (FR-11.2 health reporting). Static keys are always healthy.
@@ -140,10 +142,19 @@ impl CredentialStrategy for StaticKeyStrategy {
         "static_api_key"
     }
 
-    async fn resolve(&self, account: &AccountRow) -> Result<ResolvedCredential> {
-        Ok(ResolvedCredential::static_key(
-            self.crypto.decrypt(&account.secret_enc)?,
-        ))
+    async fn resolve(
+        &self,
+        account: &AccountRow,
+    ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
+        let secret = self.crypto.decrypt(&account.secret_enc).map_err(|error| {
+            CredentialRotationError::new(
+                "credential_internal",
+                format!("decrypting static credential: {error}"),
+                false,
+                None,
+            )
+        })?;
+        Ok(ResolvedCredential::static_key(secret))
     }
 }
 
