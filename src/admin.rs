@@ -769,7 +769,8 @@ async fn provider_json_with_enrollment(state: &AppState, p: &db::ProviderRow) ->
                         .iter()
                         .find(|integration| integration.id == integration_id)
                     {
-                        available = integration.auth_flow.is_some();
+                        available =
+                            integration.auth_flow.is_some() && integration.credential_strategy.is_some();
                         if let Some(action) = manifest.ui.actions.iter().find(|action| {
                             action.kind == "auth" && action.integration == integration_id
                         }) {
@@ -6026,6 +6027,33 @@ mod plugin_oauth_redirect_tests {
 }
 
 /// Start a one-time browser authorization session for a plugin integration.
+fn validate_plugin_auth_enrollment(
+    provider: &db::ProviderRow,
+    plugin_id: &str,
+    integration_id: &str,
+    credential_binding: &str,
+) -> Result<(), ApiError> {
+    if provider.credential_mode != "auth_flow" {
+        return Err(ApiError::bad(
+            "provider does not use authentication-flow credential enrollment",
+        ));
+    }
+    if provider.source_plugin_id.as_deref() != Some(plugin_id)
+        || provider.source_integration_id.as_deref() != Some(integration_id)
+    {
+        return Err(ApiError::bad(
+            "provider authentication integration provenance does not match the requested flow",
+        ));
+    }
+    if provider.credential_plugin != credential_binding {
+        return Err(ApiError::bad(format!(
+            "provider '{}' is not bound to integration credential strategy '{}'",
+            provider.id, credential_binding
+        )));
+    }
+    Ok(())
+}
+
 pub async fn start_plugin_auth(
     State(state): State<AppState>,
     auth: AdminAuth,
@@ -6056,12 +6084,12 @@ pub async fn start_plugin_auth(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let expected_binding = format!("plugin:{}/{}", body.plugin_id, credential_strategy);
-    if provider.credential_plugin != expected_binding {
-        return Err(ApiError::bad(format!(
-            "provider '{}' is not bound to integration credential strategy '{}'",
-            provider.id, expected_binding
-        )));
-    }
+    validate_plugin_auth_enrollment(
+        &provider,
+        &body.plugin_id,
+        &integration.id,
+        &expected_binding,
+    )?;
 
     let redirect_uri = if body.plugin_id == "dev.kinetix.claude-code-oauth" {
         claude_code_loopback_redirect(&state.config.bind)?
@@ -6260,11 +6288,38 @@ async fn complete_plugin_auth(
         ));
     }
 
+    let row = manager
+        .get(&session.plugin_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::bad("provider authentication plugin is not installed"))?;
+    let manifest = row
+        .manifest()
+        .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
+    let integration = manifest
+        .integrations
+        .iter()
+        .find(|integration| integration.auth_flow.as_deref() == Some(session.flow_name.as_str()))
+        .ok_or_else(|| ApiError::bad("auth flow is not exposed by a plugin integration"))?;
+    let credential_strategy = integration
+        .credential_strategy
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("integration has no credential strategy"))?;
+    let expected_binding = format!("plugin:{}/{}", session.plugin_id, credential_strategy);
+
     let provider = db::get_provider(&state.pool, &session.provider_id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
-    if provider.credential_plugin != session.credential_binding {
+    if expected_binding != session.credential_binding
+        || validate_plugin_auth_enrollment(
+            &provider,
+            &session.plugin_id,
+            &integration.id,
+            &session.credential_binding,
+        )
+        .is_err()
+    {
         let _ = db::insert_audit(
             &state.pool,
             "admin",
@@ -6272,7 +6327,7 @@ async fn complete_plugin_auth(
             "provider",
             &provider.id,
             &provider.name,
-            "Provider credential binding changed during browser authorization; enrollment refused.",
+            "Provider credential enrollment mode, provenance, or binding changed during browser authorization; enrollment refused.",
         )
         .await;
         return Ok(PluginAuthCompletion {
