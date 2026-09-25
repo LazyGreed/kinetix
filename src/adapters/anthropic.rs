@@ -22,9 +22,11 @@ fn mark_last_cacheable_tool(tools: &mut Value) {
     let Some(tools) = tools.as_array_mut() else {
         return;
     };
-    if let Some(tool) = tools.iter_mut().rev().find(|tool| {
-        tool.get("defer_loading").and_then(Value::as_bool) != Some(true)
-    }) {
+    if let Some(tool) = tools
+        .iter_mut()
+        .rev()
+        .find(|tool| tool.get("defer_loading").and_then(Value::as_bool) != Some(true))
+    {
         if let Some(tool) = tool.as_object_mut() {
             tool.insert(
                 "cache_control".to_string(),
@@ -334,8 +336,7 @@ impl Adapter for AnthropicAdapter {
         mut req: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
-        if is_claude_code_oauth(ctx)
-        {
+        if is_claude_code_oauth(ctx) {
             req = req.header("user-agent", "claude-cli/1.18.31 (external, cli)");
         }
         Ok(match ctx.provider.auth() {
