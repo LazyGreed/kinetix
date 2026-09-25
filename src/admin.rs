@@ -769,8 +769,8 @@ async fn provider_json_with_enrollment(state: &AppState, p: &db::ProviderRow) ->
                         .iter()
                         .find(|integration| integration.id == integration_id)
                     {
-                        available =
-                            integration.auth_flow.is_some() && integration.credential_strategy.is_some();
+                        available = integration.auth_flow.is_some()
+                            && integration.credential_strategy.is_some();
                         if let Some(action) = manifest.ui.actions.iter().find(|action| {
                             action.kind == "auth" && action.integration == integration_id
                         }) {
@@ -5941,7 +5941,9 @@ mod credential_enrollment_tests {
         let binding = "plugin:plugin.test/strategy";
 
         let manual = provider("manual");
-        assert!(validate_plugin_auth_enrollment(&manual, "plugin.test", "oauth", binding).is_err());
+        assert!(
+            validate_plugin_auth_enrollment(&manual, "plugin.test", "oauth", binding).is_err()
+        );
 
         let auth_flow = provider("auth_flow");
         assert!(
@@ -6082,7 +6084,7 @@ mod plugin_oauth_redirect_tests {
     }
 }
 
-/// Start a one-time browser authorization session for a plugin integration.
+/// Validate that a provider may enroll through this exact plugin integration.
 fn validate_plugin_auth_enrollment(
     provider: &db::ProviderRow,
     plugin_id: &str,
@@ -6110,6 +6112,7 @@ fn validate_plugin_auth_enrollment(
     Ok(())
 }
 
+/// Start a one-time browser authorization session for a plugin integration.
 pub async fn start_plugin_auth(
     State(state): State<AppState>,
     auth: AdminAuth,
