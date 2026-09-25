@@ -194,6 +194,33 @@ pub struct IntegrationProvider {
     pub credential_hosts: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialMode {
+    Manual,
+    AuthFlow,
+    None,
+}
+
+impl CredentialMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialMode::Manual => "manual",
+            CredentialMode::AuthFlow => "auth_flow",
+            CredentialMode::None => "none",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "manual" => Some(Self::Manual),
+            "auth_flow" => Some(Self::AuthFlow),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
 /// A user-facing integration assembled from one or more capabilities provided
 /// by the same plugin. This metadata is declarative only: it grants no
 /// authority and contains no browser-executable code.
@@ -204,6 +231,8 @@ pub struct Integration {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub credential_mode: Option<CredentialMode>,
+    #[serde(default)]
     pub provider_adapter: Option<String>,
     #[serde(default)]
     pub credential_strategy: Option<String>,
@@ -213,6 +242,20 @@ pub struct Integration {
     pub model_source: Option<String>,
     #[serde(default)]
     pub provider: Option<IntegrationProvider>,
+}
+
+impl Integration {
+    pub fn effective_credential_mode(&self, permissions: &Permissions) -> CredentialMode {
+        self.credential_mode.unwrap_or_else(|| {
+            if self.auth_flow.is_some() {
+                CredentialMode::AuthFlow
+            } else if permissions.credential_read || !permissions.credential_scopes.is_empty() {
+                CredentialMode::Manual
+            } else {
+                CredentialMode::None
+            }
+        })
+    }
 }
 
 /// A native dashboard action declared by a plugin. Actions are metadata only:

@@ -772,6 +772,9 @@ mod tests {
             wire_plugin: String::new(),
             credential_plugin: String::new(),
             model_source_plugin: String::new(),
+            credential_mode: "manual".into(),
+            source_plugin_id: None,
+            source_integration_id: None,
         }
     }
 

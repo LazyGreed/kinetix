@@ -6,7 +6,9 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use super::types::{parse_size, Capability, Manifest, MANIFEST_VERSION, PLUGIN_API_MAJOR};
+use super::types::{
+    parse_size, Capability, CredentialMode, Manifest, MANIFEST_VERSION, PLUGIN_API_MAJOR,
+};
 
 /// The result of validating a manifest, including the effective host limits.
 #[derive(Debug, Clone)]
@@ -114,6 +116,35 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
         }
         if integration.name.trim().is_empty() {
             bail!("integration '{}' name must not be empty", integration.id);
+        }
+        if let Some(mode) = integration.credential_mode {
+            match mode {
+                CredentialMode::AuthFlow
+                    if integration.auth_flow.is_none()
+                        || integration.credential_strategy.is_none() =>
+                {
+                    bail!(
+                        "integration '{}' credential_mode 'auth_flow' requires auth_flow and credential_strategy",
+                        integration.id
+                    );
+                }
+                CredentialMode::None
+                    if integration.auth_flow.is_some()
+                        || integration.credential_strategy.is_some() =>
+                {
+                    bail!(
+                        "integration '{}' credential_mode 'none' may not declare auth_flow or credential_strategy",
+                        integration.id
+                    );
+                }
+                CredentialMode::Manual if integration.auth_flow.is_some() => {
+                    bail!(
+                        "integration '{}' credential_mode 'manual' may not declare auth_flow",
+                        integration.id
+                    );
+                }
+                _ => {}
+            }
         }
         if integration.provider_adapter.is_none()
             && integration.credential_strategy.is_none()
@@ -681,6 +712,131 @@ storage = "2MiB"
             .replace("auth_flows = [\"foo-login\"]", "")
             .replace("model_sources = [\"foo-models\"]", "");
         assert!(parse_and_validate(&bad, HostPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn credential_modes_validate_and_legacy_inference_is_stable() {
+        const AUTH_ACTION: &str = r#"
+[[ui.actions]]
+id = "connect"
+label = "Connect account"
+kind = "auth"
+integration = "foo"
+"#;
+
+        let auth_flow = GOOD.replace(
+            "description = \"Foo provider integration\"",
+            "description = \"Foo provider integration\"\ncredential_mode = \"auth_flow\"",
+        );
+        let parsed = parse_and_validate(&auth_flow, HostPolicy::default()).unwrap();
+        let integration = &parsed.manifest.integrations[0];
+        assert_eq!(
+            integration.effective_credential_mode(&parsed.manifest.permissions),
+            CredentialMode::AuthFlow
+        );
+
+        let manual = GOOD
+            .replace(AUTH_ACTION, "")
+            .replace("auth_flow = \"foo-login\"\n", "")
+            .replace(
+                "description = \"Foo provider integration\"",
+                "description = \"Foo provider integration\"\ncredential_mode = \"manual\"",
+            );
+        assert!(parse_and_validate(&manual, HostPolicy::default()).is_ok());
+
+        let none = GOOD
+            .replace(AUTH_ACTION, "")
+            .replace("credential_strategy = \"foo-auth\"\n", "")
+            .replace("auth_flow = \"foo-login\"\n", "")
+            .replace(
+                "description = \"Foo provider integration\"",
+                "description = \"Foo provider integration\"\ncredential_mode = \"none\"",
+            );
+        assert!(parse_and_validate(&none, HostPolicy::default()).is_ok());
+
+        let legacy = parse_and_validate(GOOD, HostPolicy::default()).unwrap();
+        assert_eq!(
+            legacy.manifest.integrations[0].effective_credential_mode(&legacy.manifest.permissions),
+            CredentialMode::AuthFlow
+        );
+
+        let legacy_manual = GOOD
+            .replace(AUTH_ACTION, "")
+            .replace("auth_flow = \"foo-login\"\n", "")
+            .replace(
+                "network_hosts = [\"api.foo.example\", \"*.svc.example\"]",
+                "network_hosts = [\"api.foo.example\", \"*.svc.example\"]\ncredential_scopes = [\"credential_strategy:foo-auth\"]",
+            );
+        let legacy_manual = parse_and_validate(&legacy_manual, HostPolicy::default()).unwrap();
+        assert_eq!(
+            legacy_manual.manifest.integrations[0]
+                .effective_credential_mode(&legacy_manual.manifest.permissions),
+            CredentialMode::Manual
+        );
+
+        let legacy_none = GOOD
+            .replace(AUTH_ACTION, "")
+            .replace("credential_strategy = \"foo-auth\"\n", "")
+            .replace("auth_flow = \"foo-login\"\n", "");
+        let legacy_none = parse_and_validate(&legacy_none, HostPolicy::default()).unwrap();
+        assert_eq!(
+            legacy_none.manifest.integrations[0]
+                .effective_credential_mode(&legacy_none.manifest.permissions),
+            CredentialMode::None
+        );
+    }
+
+    #[test]
+    fn rejects_contradictory_credential_modes() {
+        let auth_without_flow = GOOD.replace("auth_flow = \"foo-login\"\n", "").replace(
+            "description = \"Foo provider integration\"",
+            "description = \"Foo provider integration\"\ncredential_mode = \"auth_flow\"",
+        );
+        assert!(
+            parse_and_validate(&auth_without_flow, HostPolicy::default())
+                .unwrap_err()
+                .to_string()
+                .contains("requires auth_flow and credential_strategy")
+        );
+
+        let auth_without_strategy = GOOD
+            .replace("credential_strategy = \"foo-auth\"\n", "")
+            .replace(
+                "description = \"Foo provider integration\"",
+                "description = \"Foo provider integration\"\ncredential_mode = \"auth_flow\"",
+            );
+        assert!(
+            parse_and_validate(&auth_without_strategy, HostPolicy::default())
+                .unwrap_err()
+                .to_string()
+                .contains("requires auth_flow and credential_strategy")
+        );
+
+        let none_with_strategy = GOOD.replace("auth_flow = \"foo-login\"\n", "").replace(
+            "description = \"Foo provider integration\"",
+            "description = \"Foo provider integration\"\ncredential_mode = \"none\"",
+        );
+        assert!(
+            parse_and_validate(&none_with_strategy, HostPolicy::default())
+                .unwrap_err()
+                .to_string()
+                .contains("may not declare auth_flow or credential_strategy")
+        );
+
+        let none_with_flow = GOOD.replace(
+            "description = \"Foo provider integration\"",
+            "description = \"Foo provider integration\"\ncredential_mode = \"none\"",
+        );
+        assert!(parse_and_validate(&none_with_flow, HostPolicy::default()).is_err());
+
+        let manual_with_flow = GOOD.replace(
+            "description = \"Foo provider integration\"",
+            "description = \"Foo provider integration\"\ncredential_mode = \"manual\"",
+        );
+        assert!(parse_and_validate(&manual_with_flow, HostPolicy::default())
+            .unwrap_err()
+            .to_string()
+            .contains("may not declare auth_flow"));
     }
 
     #[test]

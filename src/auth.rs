@@ -29,6 +29,7 @@ const PLUGIN_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
 pub struct PluginAuthSession {
     pub plugin_id: String,
     pub flow_name: String,
+    pub integration_id: String,
     pub provider_id: String,
     pub credential_binding: String,
     pub redirect_uri: String,
@@ -76,6 +77,7 @@ impl PluginAuthSessions {
         &self,
         plugin_id: &str,
         flow_name: &str,
+        integration_id: &str,
         provider_id: &str,
         credential_binding: &str,
         redirect_uri: &str,
@@ -103,6 +105,7 @@ impl PluginAuthSessions {
             PluginAuthSession {
                 plugin_id: plugin_id.to_string(),
                 flow_name: flow_name.to_string(),
+                integration_id: integration_id.to_string(),
                 provider_id: provider_id.to_string(),
                 credential_binding: credential_binding.to_string(),
                 redirect_uri: redirect_uri.to_string(),
@@ -520,6 +523,7 @@ mod plugin_auth_tests {
         let first = sessions.create(
             "dev.example.plugin",
             "login",
+            "integration-login",
             "prov_1",
             "plugin:dev.example.plugin/login-credential",
             "https://example.test/admin/api/plugins/auth/callback",
@@ -528,6 +532,7 @@ mod plugin_auth_tests {
         let second = sessions.create(
             "dev.example.plugin",
             "login",
+            "integration-login",
             "prov_1",
             "plugin:dev.example.plugin/login-credential",
             "https://example.test/admin/api/plugins/auth/callback",
@@ -545,6 +550,7 @@ mod plugin_auth_tests {
             .expect("matching session should consume state");
         assert_eq!(session.plugin_id, "dev.example.plugin");
         assert_eq!(session.flow_name, "login");
+        assert_eq!(session.integration_id, "integration-login");
         assert_eq!(session.provider_id, "prov_1");
         assert!(!session.pkce_verifier.is_empty());
         assert!(sessions.take(&second.state, "session-token-1").is_none());
@@ -556,6 +562,7 @@ mod plugin_auth_tests {
         let pending = sessions.create(
             "dev.example.plugin",
             "login",
+            "integration-login",
             "prov_1",
             "plugin:dev.example.plugin/login-credential",
             "https://example.test/callback",
@@ -570,6 +577,7 @@ mod plugin_auth_tests {
         let sessions = PluginAuthSessions::new();
         let pending = sessions.create(
             "dev.kinetix.claude-code-oauth",
+            "claude-code",
             "claude-code",
             "prov_1",
             "plugin:dev.kinetix.claude-code-oauth/claude-code-oauth",
@@ -591,6 +599,7 @@ mod plugin_auth_tests {
         let pending = sessions.create(
             "dev.kinetix.antigravity-oauth",
             "antigravity",
+            "antigravity",
             "prov_1",
             "plugin:dev.kinetix.antigravity-oauth/antigravity-oauth",
             "http://127.0.0.1:20128/callback",
@@ -611,6 +620,7 @@ mod plugin_auth_tests {
         let generic = sessions.create(
             "dev.example.plugin",
             "login",
+            "integration-login",
             "prov_1",
             "plugin:dev.example.plugin/login-credential",
             "http://localhost:20128/callback",
@@ -620,6 +630,7 @@ mod plugin_auth_tests {
 
         let wrong_redirect = sessions.create(
             "dev.kinetix.claude-code-oauth",
+            "claude-code",
             "claude-code",
             "prov_1",
             "plugin:dev.kinetix.claude-code-oauth/claude-code-oauth",
@@ -632,6 +643,7 @@ mod plugin_auth_tests {
 
         let antigravity_remote_redirect = sessions.create(
             "dev.kinetix.antigravity-oauth",
+            "antigravity",
             "antigravity",
             "prov_1",
             "plugin:dev.kinetix.antigravity-oauth/antigravity-oauth",

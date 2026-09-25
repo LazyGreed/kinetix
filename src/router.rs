@@ -71,6 +71,10 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/providers/{id}/discover", post(admin::discover_models))
         .route("/providers/{id}/test", post(admin::test_provider))
+        .route(
+            "/providers/{id}/credential-enrollment/start",
+            post(admin::start_provider_credential_enrollment),
+        )
         // models
         .route("/models", get(admin::list_models))
         .route("/providers/{id}/models", post(admin::create_model))

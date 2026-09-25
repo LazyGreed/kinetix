@@ -677,7 +677,7 @@ pub async fn get_provider(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
-    Ok(Json(provider_json(&p)))
+    Ok(Json(provider_json_with_enrollment(&state, &p).await))
 }
 
 pub async fn list_providers(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
@@ -690,19 +690,20 @@ pub async fn list_providers(State(state): State<AppState>, _auth: AdminAuth) -> 
     let models = db::list_models(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    let out: Vec<Value> = providers
-        .iter()
-        .map(|p| {
-            let mut v = provider_json(p);
-            v["accounts_count"] = json!(accounts.iter().filter(|a| a.provider_id == p.id).count());
-            v["models_count"] = json!(models.iter().filter(|m| m.provider_id == p.id).count());
-            v["healthy_accounts"] = json!(accounts
-                .iter()
-                .filter(|a| a.provider_id == p.id && a.status == "healthy")
-                .count());
-            v
-        })
-        .collect();
+    let mut out = Vec::with_capacity(providers.len());
+    for p in &providers {
+        let visible_accounts = accounts.iter().filter(|a| {
+            a.provider_id == p.id
+                && !(p.credential_mode == "none" && a.label == "__kinetix_noauth__")
+        });
+        let accounts_count = visible_accounts.clone().count();
+        let healthy_accounts = visible_accounts.filter(|a| a.status == "healthy").count();
+        let mut v = provider_json_with_enrollment(&state, p).await;
+        v["accounts_count"] = json!(accounts_count);
+        v["models_count"] = json!(models.iter().filter(|m| m.provider_id == p.id).count());
+        v["healthy_accounts"] = json!(healthy_accounts);
+        out.push(v);
+    }
     Ok(Json(json!({ "providers": out })))
 }
 
@@ -710,6 +711,11 @@ pub async fn list_providers(State(state): State<AppState>, _auth: AdminAuth) -> 
 /// endpoints). The dashboard's edit form is populated from this shape, so every
 /// field an admin can set must be present here (FR-8.4/8.6).
 fn provider_json(p: &db::ProviderRow) -> Value {
+    let (action_label, available) = match p.credential_mode.as_str() {
+        "auth_flow" => (Some("Connect account"), false),
+        "none" => (None, true),
+        _ => (Some("Add API Key"), true),
+    };
     json!({
         "id": p.id,
         "name": p.name,
@@ -730,8 +736,57 @@ fn provider_json(p: &db::ProviderRow) -> Value {
         "wire_plugin": p.wire_plugin,
         "credential_plugin": p.credential_plugin,
         "model_source_plugin": p.model_source_plugin,
+        "credential_mode": p.credential_mode,
+        "source_plugin_id": p.source_plugin_id,
+        "source_integration_id": p.source_integration_id,
+        "credential_enrollment": {
+            "mode": p.credential_mode,
+            "action_label": action_label,
+            "available": available,
+        },
         "created_at": p.created_at,
     })
+}
+
+async fn provider_json_with_enrollment(state: &AppState, p: &db::ProviderRow) -> Value {
+    let mut value = provider_json(p);
+    if p.credential_mode != "auth_flow" {
+        return value;
+    }
+
+    let mut label = "Connect account".to_string();
+    let mut available = false;
+    if let (Some(plugin_id), Some(integration_id), Some(manager)) = (
+        p.source_plugin_id.as_deref(),
+        p.source_integration_id.as_deref(),
+        state.plugin_manager(),
+    ) {
+        if let Ok(Some(row)) = manager.get(plugin_id).await {
+            if row.enabled != 0 {
+                if let Some(manifest) = row.manifest() {
+                    if let Some(integration) = manifest
+                        .integrations
+                        .iter()
+                        .find(|integration| integration.id == integration_id)
+                    {
+                        available = integration.auth_flow.is_some()
+                            && integration.credential_strategy.is_some();
+                        if let Some(action) = manifest.ui.actions.iter().find(|action| {
+                            action.kind == "auth" && action.integration == integration_id
+                        }) {
+                            label = action.label.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    value["credential_enrollment"] = json!({
+        "mode": "auth_flow",
+        "action_label": label,
+        "available": available,
+    });
+    value
 }
 
 #[derive(Deserialize)]
@@ -899,6 +954,9 @@ pub async fn create_provider(
             wire_plugin: &body.wire_plugin,
             credential_plugin: &body.credential_plugin,
             model_source_plugin: &body.model_source_plugin,
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
         },
     )
     .await
@@ -942,6 +1000,62 @@ pub async fn create_provider(
     Ok(Json(json!({ "id": id })))
 }
 
+fn validate_auth_flow_binding_edit(
+    provider: &db::ProviderRow,
+    expected_binding: &str,
+    proposed_binding: &str,
+) -> Result<(), ApiError> {
+    if provider.credential_mode == "auth_flow"
+        && proposed_binding != provider.credential_plugin
+        && proposed_binding != expected_binding
+    {
+        return Err(ApiError::bad(
+            "credential_plugin conflicts with the provider's authentication-flow source integration",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_provider_credential_binding_edit(
+    state: &AppState,
+    provider: &db::ProviderRow,
+    proposed_binding: &str,
+) -> Result<(), ApiError> {
+    if provider.credential_mode != "auth_flow" || proposed_binding == provider.credential_plugin {
+        return Ok(());
+    }
+
+    let plugin_id = provider
+        .source_plugin_id
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+    let integration_id = provider
+        .source_integration_id
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+    let manager = plugin_manager(state)?;
+    let row = manager
+        .get(plugin_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::bad("provider authentication plugin is not installed"))?;
+    let manifest = row
+        .manifest()
+        .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
+    let integration = manifest
+        .integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
+    let credential_strategy = integration
+        .credential_strategy
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider integration has no credential strategy"))?;
+    let expected_binding = format!("plugin:{plugin_id}/{credential_strategy}");
+
+    validate_auth_flow_binding_edit(provider, &expected_binding, proposed_binding)
+}
+
 pub async fn update_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -953,9 +1067,19 @@ pub async fn update_provider(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    if body
+        .api_key
+        .as_deref()
+        .is_some_and(|api_key| !api_key.trim().is_empty())
+    {
+        if let Some(error) = manual_account_enrollment_error(&existing.credential_mode) {
+            return Err(ApiError::bad(error));
+        }
+    }
     let rate_limit_rules = body.rate_limit_rules.clone().unwrap_or_else(|| {
         serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
     });
+    validate_provider_credential_binding_edit(&state, &existing, &body.credential_plugin).await?;
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -1055,6 +1179,7 @@ pub async fn delete_provider(
 #[derive(Debug, Clone)]
 struct DiscoveredObservation {
     model: crate::adapters::DiscoveredModel,
+    #[cfg_attr(not(test), allow(dead_code))]
     reasoning_support: Option<bool>,
     reasoning: Option<crate::adapters::ReasoningCapability>,
     thinking_map: Option<ThinkingMap>,
@@ -1276,6 +1401,7 @@ fn normalized_modalities(metadata: &Value) -> Option<Value> {
     }
 }
 
+#[cfg(test)]
 fn discovered_observation(
     model: crate::adapters::DiscoveredModel,
     provider_metadata: Option<Value>,
@@ -1900,10 +2026,7 @@ async fn discover_models_native(
     let credential = state
         .credential_for(provider, &account)
         .await
-        .map(|c| {
-            crate::alerts::record_credential_success();
-            c
-        })
+        .inspect(|_| crate::alerts::record_credential_success())
         .map_err(|e| {
             crate::alerts::record_credential_failure();
             ApiError::internal(e)
@@ -2031,10 +2154,7 @@ pub async fn test_provider(
     let credential = state
         .credential_for(&provider, &account)
         .await
-        .map(|c| {
-            crate::alerts::record_credential_success();
-            c
-        })
+        .inspect(|_| crate::alerts::record_credential_success())
         .map_err(|e| {
             crate::alerts::record_credential_failure();
             ApiError::internal(e)
@@ -2592,6 +2712,13 @@ pub async fn list_accounts(
         .map_err(ApiError::internal)?;
     let out: Vec<Value> = accounts
         .iter()
+        .filter(|a| {
+            providers
+                .iter()
+                .find(|p| p.id == a.provider_id)
+                .map(|p| !(p.credential_mode == "none" && a.label == "__kinetix_noauth__"))
+                .unwrap_or(true)
+        })
         .map(|a| {
             let (requests, tokens) = by_account.get(&a.id).copied().unwrap_or((0, 0));
             account_json(a, &providers, requests, tokens)
@@ -2653,11 +2780,27 @@ fn default_quota_type() -> String {
     "none".into()
 }
 
+fn manual_account_enrollment_error(mode: &str) -> Option<&'static str> {
+    match mode {
+        "auth_flow" => Some("provider uses an authentication flow; connect an account instead"),
+        "none" => Some("provider does not require user credentials"),
+        _ => None,
+    }
+}
+
 pub async fn create_account(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Json(body): Json<AccountBody>,
 ) -> ApiResult {
+    let provider = db::get_provider(&state.pool, &body.provider_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    if let Some(error) = manual_account_enrollment_error(&provider.credential_mode) {
+        return Err(ApiError::bad(error));
+    }
+
     let api_key = body
         .api_key
         .clone()
@@ -2713,8 +2856,19 @@ pub async fn update_account(
     )
     .await
     .map_err(ApiError::internal)?;
-    // Optionally rotate the credential.
+    // Optionally rotate a manually enrolled credential.
     if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
+        let account = db::get_account(&state.pool, &id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        let provider = db::get_provider(&state.pool, &account.provider_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("provider not found"))?;
+        if let Some(error) = manual_account_enrollment_error(&provider.credential_mode) {
+            return Err(ApiError::bad(error));
+        }
         let enc = state.crypto.encrypt(&api_key).map_err(ApiError::internal)?;
         sqlx::query("UPDATE accounts SET secret_enc=?, key_mask=? WHERE id=?")
             .bind(enc)
@@ -3210,12 +3364,22 @@ pub async fn validate_model_edit(
 /// `POST /admin/api/validate/account` (FR-8.6): schema validation of a proposed
 /// account. The credential is not stored; only its presence is checked.
 pub async fn validate_account_edit(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _auth: AdminAuth,
     Json(body): Json<AccountBody>,
 ) -> ApiResult {
-    let problems =
+    let mut problems =
         crate::validate::validate_account(&body.label, body.api_key.as_deref(), &body.quota_type);
+    if let Some(provider) = db::get_provider(&state.pool, &body.provider_id)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        if let Some(error) = manual_account_enrollment_error(&provider.credential_mode) {
+            problems.push(error.into());
+        }
+    } else {
+        problems.push("provider not found".into());
+    }
     Ok(Json(json!({
         "valid": problems.is_empty(),
         "problems": problems,
@@ -3658,16 +3822,15 @@ pub async fn require_control_plane(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
-    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
-        if !db_healthy(&state).await {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(
-                    json!({"error": "admin mutation unavailable: control-plane store is degraded"}),
-                ),
-            )
-                .into_response();
-        }
+    if method != axum::http::Method::GET
+        && method != axum::http::Method::HEAD
+        && !db_healthy(&state).await
+    {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "admin mutation unavailable: control-plane store is degraded"})),
+        )
+            .into_response();
     }
     next.run(req).await
 }
@@ -4006,7 +4169,9 @@ pub async fn export_config(
             .await
             .map_err(ApiError::internal)?
         {
-            accounts.push(a);
+            if a.label != "__kinetix_noauth__" {
+                accounts.push(a);
+            }
         }
         for m in db::models_for_provider(&state.pool, &p.id)
             .await
@@ -4055,6 +4220,12 @@ pub async fn export_config(
                 "follow_redirects": p.follow_redirects != 0,
                 "credential_hosts": p.credential_hosts,
                 "allow_insecure_tls": p.allow_insecure_tls != 0,
+                "wire_plugin": p.wire_plugin,
+                "credential_plugin": p.credential_plugin,
+                "model_source_plugin": p.model_source_plugin,
+                "credential_mode": p.credential_mode,
+                "source_plugin_id": p.source_plugin_id,
+                "source_integration_id": p.source_integration_id,
                 "enabled": p.enabled != 0,
             })
         })
@@ -4159,6 +4330,97 @@ pub async fn export_config(
     })))
 }
 
+async fn validate_imported_provider_credential_semantics(
+    state: &AppState,
+    name: &str,
+    credential_mode: crate::plugins::CredentialMode,
+    credential_plugin: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+) -> Result<(), String> {
+    match credential_mode {
+        crate::plugins::CredentialMode::None => {
+            if !credential_plugin.is_empty() {
+                return Err(format!(
+                    "provider '{name}': credential_mode 'none' may not declare credential_plugin"
+                ));
+            }
+        }
+        crate::plugins::CredentialMode::AuthFlow => {
+            let plugin_id = source_plugin_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "provider '{name}': credential_mode 'auth_flow' requires source_plugin_id"
+                    )
+                })?;
+            let integration_id = source_integration_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "provider '{name}': credential_mode 'auth_flow' requires source_integration_id"
+                    )
+                })?;
+            let binding = crate::plugins::PluginRef::parse(credential_plugin).ok_or_else(|| {
+                format!(
+                    "provider '{name}': credential_mode 'auth_flow' requires a credential_plugin binding"
+                )
+            })?;
+            if binding.plugin_id != plugin_id {
+                return Err(format!(
+                    "provider '{name}': credential_plugin does not match source_plugin_id"
+                ));
+            }
+
+            // Preserve portable exports when the plugin is not installed yet.
+            // Once present, its manifest becomes authoritative for integration
+            // identity and the exact credential strategy binding.
+            let installed_plugin = match state.plugin_manager() {
+                Some(manager) => manager
+                    .get(plugin_id)
+                    .await
+                    .map_err(|error| format!("provider '{name}': {error}"))?,
+                None => None,
+            };
+            if let Some(row) = installed_plugin {
+                let manifest = row.manifest().ok_or_else(|| {
+                    format!("provider '{name}': source plugin manifest is unreadable")
+                })?;
+                let integration = manifest
+                    .integrations
+                    .iter()
+                    .find(|integration| integration.id == integration_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "provider '{name}': source integration '{integration_id}' is unavailable"
+                        )
+                    })?;
+                if integration.effective_credential_mode(&manifest.permissions)
+                    != crate::plugins::CredentialMode::AuthFlow
+                {
+                    return Err(format!(
+                        "provider '{name}': source integration '{integration_id}' is not an auth_flow integration"
+                    ));
+                }
+                let strategy = integration.credential_strategy.as_deref().ok_or_else(|| {
+                    format!(
+                        "provider '{name}': source integration '{integration_id}' has no credential strategy"
+                    )
+                })?;
+                let expected_binding = format!("plugin:{plugin_id}/{strategy}");
+                if credential_plugin != expected_binding {
+                    return Err(format!(
+                        "provider '{name}': credential_plugin does not match source integration '{integration_id}'"
+                    ));
+                }
+            }
+        }
+        crate::plugins::CredentialMode::Manual => {}
+    }
+
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct ImportBody {
     pub config: Value,
@@ -4206,15 +4468,64 @@ pub async fn import_config(
                 p["wire_format"].as_str().unwrap_or("")
             ));
         }
-        let existing = db::list_providers(&state.pool)
+        let existing_provider = db::list_providers(&state.pool)
             .await
             .map_err(ApiError::internal)?
             .into_iter()
-            .any(|x| x.name == name);
+            .find(|provider| provider.name == name);
+        let explicit_mode = match p.get("credential_mode").filter(|mode| !mode.is_null()) {
+            Some(mode) => match mode
+                .as_str()
+                .and_then(crate::plugins::CredentialMode::parse)
+            {
+                Some(mode) => Some(mode),
+                None => {
+                    problems.push(format!(
+                        "provider '{name}': credential_mode must be 'manual', 'auth_flow', or 'none'"
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        let effective_mode = explicit_mode
+            .or_else(|| {
+                existing_provider.as_ref().and_then(|provider| {
+                    crate::plugins::CredentialMode::parse(&provider.credential_mode)
+                })
+            })
+            .unwrap_or(crate::plugins::CredentialMode::Manual);
+        let source_plugin_id = if p.get("source_plugin_id").is_some() {
+            p["source_plugin_id"].as_str()
+        } else {
+            existing_provider
+                .as_ref()
+                .and_then(|provider| provider.source_plugin_id.as_deref())
+        };
+        let source_integration_id = if p.get("source_integration_id").is_some() {
+            p["source_integration_id"].as_str()
+        } else {
+            existing_provider
+                .as_ref()
+                .and_then(|provider| provider.source_integration_id.as_deref())
+        };
+        if let Err(problem) = validate_imported_provider_credential_semantics(
+            &state,
+            name,
+            effective_mode,
+            p["credential_plugin"].as_str().unwrap_or(""),
+            source_plugin_id,
+            source_integration_id,
+        )
+        .await
+        {
+            problems.push(problem);
+        }
+
         plan.push(json!({
             "kind": "provider",
             "name": name,
-            "action": if existing { "update" } else { "create" },
+            "action": if existing_provider.is_some() { "update" } else { "create" },
         }));
     }
     for m in models {
@@ -4280,10 +4591,32 @@ pub async fn import_config(
         let allow_insecure_tls = p["allow_insecure_tls"].as_bool().unwrap_or(false);
         let custom_header = p["custom_header_name"].as_str();
         let custom_param = p["custom_param_name"].as_str();
-        if let Some(existing) = provider_ids.get(name) {
+        let explicit_mode = p["credential_mode"]
+            .as_str()
+            .and_then(crate::plugins::CredentialMode::parse);
+
+        if let Some(existing_id) = provider_ids.get(name).cloned() {
+            let existing = db::get_provider(&state.pool, &existing_id)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("provider not found"))?;
+            let credential_mode = explicit_mode
+                .or_else(|| crate::plugins::CredentialMode::parse(&existing.credential_mode))
+                .unwrap_or(crate::plugins::CredentialMode::Manual);
+            let source_plugin_id = if p.get("source_plugin_id").is_some() {
+                p["source_plugin_id"].as_str().map(str::to_string)
+            } else {
+                existing.source_plugin_id.clone()
+            };
+            let source_integration_id = if p.get("source_integration_id").is_some() {
+                p["source_integration_id"].as_str().map(str::to_string)
+            } else {
+                existing.source_integration_id.clone()
+            };
+
             db::update_provider(
                 &state.pool,
-                existing,
+                &existing_id,
                 name,
                 base_url,
                 wire,
@@ -4304,7 +4637,18 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::internal)?;
+            db::update_provider_credential_semantics(
+                &state.pool,
+                &existing_id,
+                credential_mode.as_str(),
+                source_plugin_id.as_deref(),
+                source_integration_id.as_deref(),
+            )
+            .await
+            .map_err(ApiError::internal)?;
+            reconcile_provider_account_mode(&state, &existing_id, credential_mode).await?;
         } else {
+            let credential_mode = explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
             let id = db::insert_provider(
                 &state.pool,
                 &db::NewProvider {
@@ -4325,25 +4669,37 @@ pub async fn import_config(
                     wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
                     credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
                     model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
+                    credential_mode: credential_mode.as_str(),
+                    source_plugin_id: p["source_plugin_id"].as_str(),
+                    source_integration_id: p["source_integration_id"].as_str(),
                 },
             )
             .await
             .map_err(ApiError::internal)?;
+            reconcile_provider_account_mode(&state, &id, credential_mode).await?;
             provider_ids.insert(name.to_string(), id);
         }
     }
 
-    // Accounts: only created when they carry an encrypted secret blob; an
-    // account without a secret cannot be materialized (FR-3.4 write-only).
+    // Accounts: only restored when the provider mode permits credentials and
+    // the export carries an encrypted secret blob. Internal no-auth accounts
+    // are always synthesized by reconciliation, never imported as user state.
     for a in accounts {
         let provider = a["provider"].as_str().unwrap_or("");
         let Some(pid) = provider_ids.get(provider) else {
             continue;
         };
+        let provider_row = db::get_provider(&state.pool, pid)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("provider not found"))?;
+        let label = a["label"].as_str().unwrap_or("Default key");
+        if provider_row.credential_mode == "none" || label == "__kinetix_noauth__" {
+            continue;
+        }
         let Some(secret_enc) = a["secret_enc"].as_str() else {
             continue;
         };
-        let label = a["label"].as_str().unwrap_or("Default key");
         let exists = db::accounts_for_provider(&state.pool, pid)
             .await
             .map_err(ApiError::internal)?
@@ -4670,6 +5026,124 @@ pub(crate) async fn register_enabled_plugin_capabilities(state: &AppState, id: &
     auto_provision_plugin_providers(state, id).await;
 }
 
+async fn reconcile_provider_account_mode(
+    state: &AppState,
+    provider_id: &str,
+    credential_mode: crate::plugins::CredentialMode,
+) -> Result<(), ApiError> {
+    let legacy_public_mask = crate::crypto::mask_secret("public");
+    match credential_mode {
+        crate::plugins::CredentialMode::None => {
+            // Credential-free providers must have exactly one internal empty
+            // account so routing can execute without exposing a fake user key.
+            let accounts: Vec<_> = db::list_accounts(&state.pool)
+                .await
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .filter(|account| account.provider_id == provider_id)
+                .collect();
+            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
+
+            if accounts.len() == 1
+                && (accounts[0].label == "__kinetix_noauth__"
+                    || (accounts[0].label == "public"
+                        && accounts[0].key_mask == legacy_public_mask))
+            {
+                sqlx::query(
+                    "UPDATE accounts
+                     SET label='__kinetix_noauth__', secret_enc=?, key_mask='',
+                         status='healthy', cooldown_until=NULL, quota_reset_at=NULL,
+                         quota_type='none', quota_window_s=NULL, soft_quota_usd=NULL,
+                         priority=1, weight=1, last_error=NULL, last_probe_at=NULL,
+                         circuit_open_until=NULL, consecutive_failures=0
+                     WHERE id=?",
+                )
+                .bind(&empty_secret)
+                .bind(&accounts[0].id)
+                .execute(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
+            } else {
+                sqlx::query(
+                    "UPDATE route_targets SET account_id=NULL
+                     WHERE account_id IN (SELECT id FROM accounts WHERE provider_id=?)",
+                )
+                .bind(provider_id)
+                .execute(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
+                sqlx::query("DELETE FROM accounts WHERE provider_id=?")
+                    .bind(provider_id)
+                    .execute(&state.pool)
+                    .await
+                    .map_err(ApiError::internal)?;
+                db::insert_account(
+                    &state.pool,
+                    provider_id,
+                    "__kinetix_noauth__",
+                    &empty_secret,
+                    "",
+                    1,
+                    1,
+                    None,
+                    "none",
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
+        }
+        crate::plugins::CredentialMode::Manual | crate::plugins::CredentialMode::AuthFlow => {
+            // Credential-bearing modes must never route through synthetic
+            // no-auth state left by a previous credential-free configuration.
+            sqlx::query(
+                "UPDATE route_targets SET account_id=NULL
+                 WHERE account_id IN (
+                     SELECT id FROM accounts
+                     WHERE provider_id=?
+                       AND (label='__kinetix_noauth__' OR (label='public' AND key_mask=?))
+                 )",
+            )
+            .bind(provider_id)
+            .bind(&legacy_public_mask)
+            .execute(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+            sqlx::query(
+                "DELETE FROM accounts
+                 WHERE provider_id=?
+                   AND (label='__kinetix_noauth__' OR (label='public' AND key_mask=?))",
+            )
+            .bind(provider_id)
+            .bind(&legacy_public_mask)
+            .execute(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn reconcile_provider_credential_semantics(
+    state: &AppState,
+    provider_id: &str,
+    credential_mode: crate::plugins::CredentialMode,
+    source_plugin_id: &str,
+    source_integration_id: &str,
+) -> Result<(), ApiError> {
+    db::update_provider_credential_semantics(
+        &state.pool,
+        provider_id,
+        credential_mode.as_str(),
+        Some(source_plugin_id),
+        Some(source_integration_id),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
+    reconcile_provider_account_mode(state, provider_id, credential_mode).await
+}
+
 pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) {
     let Some(manager) = state.plugin_manager().cloned() else {
         return;
@@ -4703,6 +5177,7 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
             .as_deref()
             .map(|name| format!("plugin:{id}/{name}"))
             .unwrap_or_default();
+        let credential_mode = integration.effective_credential_mode(&manifest.permissions);
 
         let Some(wire) = WireFormat::parse(&template.wire_format) else {
             continue;
@@ -4714,13 +5189,32 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
         let Ok(providers) = db::list_providers(&state.pool).await else {
             continue;
         };
-        let exists = providers.into_iter().any(|provider| {
+        let existing = providers.into_iter().find(|provider| {
             provider.base_url == template.base_url
                 && provider.wire_plugin == wire_plugin
                 && provider.credential_plugin == credential_plugin
                 && provider.model_source_plugin == model_source_plugin
         });
-        if exists {
+        if let Some(provider) = existing {
+            if let Err(error) = reconcile_provider_credential_semantics(
+                state,
+                &provider.id,
+                credential_mode,
+                id,
+                &integration.id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    provider = %provider.id,
+                    plugin = %id,
+                    integration = %integration.id,
+                    error = %error.1,
+                    "failed to upgrade plugin provider credential semantics"
+                );
+            } else {
+                let _ = state.registry.reload(&state.pool).await;
+            }
             continue;
         }
 
@@ -4746,6 +5240,9 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 wire_plugin: &wire_plugin,
                 credential_plugin: &credential_plugin,
                 model_source_plugin: &model_source_plugin,
+                credential_mode: credential_mode.as_str(),
+                source_plugin_id: Some(id),
+                source_integration_id: Some(&integration.id),
             },
         )
         .await;
@@ -4765,27 +5262,22 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
             )
             .await;
 
-            // If this integration requires no external credential strategy, provision a default public account.
-            if credential_plugin.is_empty() {
-                if let Ok(accounts) = db::accounts_for_provider(&state.pool, &id_created).await {
-                    if accounts.is_empty() {
-                        if let Ok(secret_enc) = state.crypto.encrypt("public") {
-                            let mask = crate::crypto::mask_secret("public");
-                            let _ = db::insert_account(
-                                &state.pool,
-                                &id_created,
-                                "public",
-                                &secret_enc,
-                                &mask,
-                                1,
-                                1,
-                                None,
-                                "none",
-                            )
-                            .await;
-                        }
-                    }
-                }
+            if let Err(error) = reconcile_provider_credential_semantics(
+                state,
+                &id_created,
+                credential_mode,
+                id,
+                &integration.id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    provider = %id_created,
+                    plugin = %id,
+                    integration = %integration.id,
+                    error = %error.1,
+                    "failed to reconcile plugin provider credential semantics"
+                );
             }
             let _ = state.registry.reload(&state.pool).await;
         }
@@ -5030,7 +5522,7 @@ pub async fn preview_catalog_plugin(
     Path(id): Path<String>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    let verified = verify_catalog_package(&state, &manager, &id).await?;
+    let verified = verify_catalog_package(&state, manager, &id).await?;
 
     let current = manager.get(&id).await.map_err(ApiError::internal)?;
     let (current_version, current_permissions) = match current {
@@ -5076,7 +5568,7 @@ pub async fn install_catalog_plugin(
     Path(id): Path<String>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    let verified = verify_catalog_package(&state, &manager, &id).await?;
+    let verified = verify_catalog_package(&state, manager, &id).await?;
     let distribution = verified
         .plugin
         .distribution
@@ -5328,6 +5820,7 @@ pub async fn setup_plugin_integration_provider(
         .as_deref()
         .map(|name| format!("plugin:{id}/{name}"))
         .unwrap_or_default();
+    let credential_mode = integration.effective_credential_mode(&manifest.permissions);
 
     for (reference, capability) in [
         (&wire_plugin, crate::plugins::Capability::ProviderAdapter),
@@ -5389,6 +5882,19 @@ pub async fn setup_plugin_integration_provider(
                 && provider.model_source_plugin == model_source_plugin
         });
     if let Some(provider) = existing {
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider.id,
+            credential_mode,
+            &id,
+            &integration.id,
+        )
+        .await?;
+        state
+            .registry
+            .reload(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
         return Ok(Json(json!({
             "id": provider.id,
             "name": provider.name,
@@ -5418,10 +5924,22 @@ pub async fn setup_plugin_integration_provider(
             wire_plugin: &wire_plugin,
             credential_plugin: &credential_plugin,
             model_source_plugin: &model_source_plugin,
+            credential_mode: credential_mode.as_str(),
+            source_plugin_id: Some(&id),
+            source_integration_id: Some(&integration.id),
         },
     )
     .await
     .map_err(ApiError::internal)?;
+
+    reconcile_provider_credential_semantics(
+        &state,
+        &id_created,
+        credential_mode,
+        &id,
+        &integration.id,
+    )
+    .await?;
 
     let _ = db::insert_audit(
         &state.pool,
@@ -5447,6 +5965,69 @@ pub async fn setup_plugin_integration_provider(
         "name": integration.name,
         "created": true,
     })))
+}
+
+pub async fn start_provider_credential_enrollment(
+    State(state): State<AppState>,
+    auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let provider = db::get_provider(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+
+    match provider.credential_mode.as_str() {
+        "auth_flow" => {}
+        "none" => {
+            return Err(ApiError::bad("provider does not require user credentials"));
+        }
+        _ => {
+            return Err(ApiError::bad("provider uses manual credential enrollment"));
+        }
+    }
+
+    let plugin_id = provider
+        .source_plugin_id
+        .clone()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+    let integration_id = provider
+        .source_integration_id
+        .clone()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+
+    let manager = plugin_manager(&state)?;
+    let row = manager
+        .get(&plugin_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::bad("provider authentication plugin is not installed"))?;
+    if row.enabled == 0 {
+        return Err(ApiError::bad("provider authentication plugin is disabled"));
+    }
+    let manifest = row
+        .manifest()
+        .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
+    let integration = manifest
+        .integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
+    let flow_name = integration
+        .auth_flow
+        .clone()
+        .ok_or_else(|| ApiError::bad("provider integration has no authentication flow"))?;
+
+    start_plugin_auth(
+        State(state),
+        auth,
+        Json(PluginAuthStartBody {
+            plugin_id,
+            flow_name,
+            provider_id: id,
+        }),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -5494,6 +6075,132 @@ fn antigravity_loopback_redirect(bind: &str) -> Result<String, ApiError> {
     };
 
     Ok(format!("http://{callback_host}:{port}/callback"))
+}
+
+#[cfg(test)]
+mod credential_enrollment_tests {
+    use super::{
+        manual_account_enrollment_error, resolve_auth_integration, validate_auth_flow_binding_edit,
+        validate_plugin_auth_enrollment,
+    };
+
+    fn provider(mode: &str) -> crate::db::ProviderRow {
+        crate::db::ProviderRow {
+            id: "provider".into(),
+            name: "Provider".into(),
+            base_url: "https://api.example.com".into(),
+            wire_format: "openai".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: "{}".into(),
+            timeout_ms: 1_000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: "{}".into(),
+            enabled: 1,
+            follow_redirects: 0,
+            credential_hosts: String::new(),
+            allow_insecure_tls: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            wire_plugin: String::new(),
+            credential_plugin: "plugin:plugin.test/strategy".into(),
+            model_source_plugin: String::new(),
+            credential_mode: mode.into(),
+            source_plugin_id: Some("plugin.test".into()),
+            source_integration_id: Some("oauth".into()),
+        }
+    }
+
+    #[test]
+    fn manual_account_creation_is_mode_gated() {
+        assert_eq!(manual_account_enrollment_error("manual"), None);
+        assert_eq!(
+            manual_account_enrollment_error("auth_flow"),
+            Some("provider uses an authentication flow; connect an account instead")
+        );
+        assert_eq!(
+            manual_account_enrollment_error("none"),
+            Some("provider does not require user credentials")
+        );
+    }
+
+    #[test]
+    fn plugin_auth_start_requires_auth_flow_mode_and_matching_provenance() {
+        let binding = "plugin:plugin.test/strategy";
+
+        let manual = provider("manual");
+        assert!(validate_plugin_auth_enrollment(&manual, "plugin.test", "oauth", binding).is_err());
+
+        let auth_flow = provider("auth_flow");
+        assert!(
+            validate_plugin_auth_enrollment(&auth_flow, "plugin.test", "oauth", binding).is_ok()
+        );
+        assert!(
+            validate_plugin_auth_enrollment(&auth_flow, "other.plugin", "oauth", binding).is_err()
+        );
+        assert!(
+            validate_plugin_auth_enrollment(&auth_flow, "plugin.test", "other", binding).is_err()
+        );
+        assert!(validate_plugin_auth_enrollment(
+            &auth_flow,
+            "plugin.test",
+            "oauth",
+            "plugin:plugin.test/other"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shared_auth_flow_resolves_exact_source_integration() {
+        let integrations = vec![
+            crate::plugins::Integration {
+                id: "first".into(),
+                name: "First".into(),
+                description: String::new(),
+                credential_mode: Some(crate::plugins::CredentialMode::AuthFlow),
+                provider_adapter: None,
+                credential_strategy: Some("first-strategy".into()),
+                auth_flow: Some("shared-login".into()),
+                model_source: None,
+                provider: None,
+            },
+            crate::plugins::Integration {
+                id: "second".into(),
+                name: "Second".into(),
+                description: String::new(),
+                credential_mode: Some(crate::plugins::CredentialMode::AuthFlow),
+                provider_adapter: None,
+                credential_strategy: Some("second-strategy".into()),
+                auth_flow: Some("shared-login".into()),
+                model_source: None,
+                provider: None,
+            },
+        ];
+
+        let resolved = resolve_auth_integration(&integrations, "second", "shared-login").unwrap();
+        assert_eq!(resolved.id, "second");
+        assert_eq!(
+            resolved.credential_strategy.as_deref(),
+            Some("second-strategy")
+        );
+    }
+
+    #[test]
+    fn auth_flow_provider_edit_rejects_conflicting_credential_binding() {
+        let provider = provider("auth_flow");
+        let expected = "plugin:plugin.test/strategy";
+
+        assert!(
+            validate_auth_flow_binding_edit(&provider, expected, "plugin:plugin.test/other")
+                .is_err()
+        );
+        assert!(validate_auth_flow_binding_edit(&provider, expected, expected).is_ok());
+        assert!(
+            validate_auth_flow_binding_edit(&provider, expected, &provider.credential_plugin)
+                .is_ok()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5613,12 +6320,66 @@ mod plugin_oauth_redirect_tests {
     }
 }
 
+fn resolve_auth_integration<'a>(
+    integrations: &'a [crate::plugins::Integration],
+    integration_id: &str,
+    flow_name: &str,
+) -> Result<&'a crate::plugins::Integration, ApiError> {
+    let integration = integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
+    if integration.auth_flow.as_deref() != Some(flow_name) {
+        return Err(ApiError::bad(
+            "requested auth flow does not match the provider source integration",
+        ));
+    }
+    Ok(integration)
+}
+
+/// Validate that a provider may enroll through this exact plugin integration.
+fn validate_plugin_auth_enrollment(
+    provider: &db::ProviderRow,
+    plugin_id: &str,
+    integration_id: &str,
+    credential_binding: &str,
+) -> Result<(), ApiError> {
+    if provider.credential_mode != "auth_flow" {
+        return Err(ApiError::bad(
+            "provider does not use authentication-flow credential enrollment",
+        ));
+    }
+    if provider.source_plugin_id.as_deref() != Some(plugin_id)
+        || provider.source_integration_id.as_deref() != Some(integration_id)
+    {
+        return Err(ApiError::bad(
+            "provider authentication integration provenance does not match the requested flow",
+        ));
+    }
+    if provider.credential_plugin != credential_binding {
+        return Err(ApiError::bad(format!(
+            "provider '{}' is not bound to integration credential strategy '{}'",
+            provider.id, credential_binding
+        )));
+    }
+    Ok(())
+}
+
 /// Start a one-time browser authorization session for a plugin integration.
 pub async fn start_plugin_auth(
     State(state): State<AppState>,
     auth: AdminAuth,
     Json(body): Json<PluginAuthStartBody>,
 ) -> ApiResult {
+    let provider = db::get_provider(&state.pool, &body.provider_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let integration_id = provider
+        .source_integration_id
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+
     let manager = plugin_manager(&state)?;
     let row = manager
         .get(&body.plugin_id)
@@ -5629,27 +6390,20 @@ pub async fn start_plugin_auth(
         .manifest()
         .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
 
-    let integration = manifest
-        .integrations
-        .iter()
-        .find(|integration| integration.auth_flow.as_deref() == Some(body.flow_name.as_str()))
-        .ok_or_else(|| ApiError::bad("auth flow is not exposed by a plugin integration"))?;
+    let integration =
+        resolve_auth_integration(&manifest.integrations, integration_id, &body.flow_name)?;
     let credential_strategy = integration
         .credential_strategy
         .as_deref()
         .ok_or_else(|| ApiError::bad("integration has no credential strategy"))?;
 
-    let provider = db::get_provider(&state.pool, &body.provider_id)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let expected_binding = format!("plugin:{}/{}", body.plugin_id, credential_strategy);
-    if provider.credential_plugin != expected_binding {
-        return Err(ApiError::bad(format!(
-            "provider '{}' is not bound to integration credential strategy '{}'",
-            provider.id, expected_binding
-        )));
-    }
+    validate_plugin_auth_enrollment(
+        &provider,
+        &body.plugin_id,
+        &integration.id,
+        &expected_binding,
+    )?;
 
     let redirect_uri = if body.plugin_id == "dev.kinetix.claude-code-oauth" {
         claude_code_loopback_redirect(&state.config.bind)?
@@ -5662,6 +6416,7 @@ pub async fn start_plugin_auth(
     let pending = state.plugin_auth_sessions.create(
         &body.plugin_id,
         &body.flow_name,
+        &integration.id,
         &body.provider_id,
         &expected_binding,
         &redirect_uri,
@@ -5848,11 +6603,38 @@ async fn complete_plugin_auth(
         ));
     }
 
+    let row = manager
+        .get(&session.plugin_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::bad("provider authentication plugin is not installed"))?;
+    let manifest = row
+        .manifest()
+        .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
+    let integration = resolve_auth_integration(
+        &manifest.integrations,
+        &session.integration_id,
+        &session.flow_name,
+    )?;
+    let credential_strategy = integration
+        .credential_strategy
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("integration has no credential strategy"))?;
+    let expected_binding = format!("plugin:{}/{}", session.plugin_id, credential_strategy);
+
     let provider = db::get_provider(&state.pool, &session.provider_id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
-    if provider.credential_plugin != session.credential_binding {
+    if expected_binding != session.credential_binding
+        || validate_plugin_auth_enrollment(
+            &provider,
+            &session.plugin_id,
+            &integration.id,
+            &session.credential_binding,
+        )
+        .is_err()
+    {
         let _ = db::insert_audit(
             &state.pool,
             "admin",
@@ -5860,7 +6642,7 @@ async fn complete_plugin_auth(
             "provider",
             &provider.id,
             &provider.name,
-            "Provider credential binding changed during browser authorization; enrollment refused.",
+            "Provider credential enrollment mode, provenance, or binding changed during browser authorization; enrollment refused.",
         )
         .await;
         return Ok(PluginAuthCompletion {
@@ -6946,6 +7728,9 @@ mod reasoning_discovery_control_plane_tests {
                 wire_plugin: "",
                 credential_plugin: "",
                 model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
             },
         )
         .await
@@ -7371,6 +8156,9 @@ mod reasoning_discovery_control_plane_tests {
                 wire_plugin: "",
                 credential_plugin: "",
                 model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
             },
         )
         .await
@@ -7495,6 +8283,9 @@ mod reasoning_discovery_control_plane_tests {
                 wire_plugin: "",
                 credential_plugin: "",
                 model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
             },
         )
         .await
@@ -7678,5 +8469,573 @@ mod reasoning_discovery_control_plane_tests {
                 .and_then(Value::as_str),
             Some("models/gemini-test")
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_enrollment_regression_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-credential-enrollment-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = crate::paths::Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+        };
+        paths.ensure_dirs().unwrap();
+        let database_url = paths.database_url();
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let config = Arc::new(crate::config::Config {
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://127.0.0.1".into(),
+            database_url,
+            master_key: [42_u8; 32],
+            admin_token: "test-admin".into(),
+            cf_access_aud: None,
+            cf_access_team_domain: None,
+            log_json: false,
+            bootstrap_file: None,
+            allow_private_upstreams: true,
+            allow_insecure_tls: true,
+            data_dir: paths.data_dir.clone(),
+            shutdown_grace_secs: 1,
+            alert_webhook_url: None,
+            alert_fallback_rate: 1.0,
+            alert_error_rate: 1.0,
+            alert_min_requests: 1,
+            alert_interval_secs: 60,
+            alert_p95_latency_ms: 1_000,
+            ip_rate_limit_per_min: 0,
+            session_ttl_minutes: 60,
+            export_retention_days: 1,
+            paths,
+            generated_admin_password: None,
+        });
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry,
+            Arc::new(crate::crypto::Crypto::new(&[42_u8; 32])),
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool, 16),
+            0,
+        );
+        (state, root)
+    }
+
+    fn auth() -> AdminAuth {
+        AdminAuth {
+            actor: "test".into(),
+            token: "test-admin".into(),
+        }
+    }
+
+    async fn insert_provider(
+        state: &AppState,
+        name: &str,
+        mode: crate::plugins::CredentialMode,
+        source_plugin_id: Option<&str>,
+        source_integration_id: Option<&str>,
+    ) -> String {
+        let credential_plugin = match (mode, source_plugin_id) {
+            (crate::plugins::CredentialMode::AuthFlow, Some(plugin_id)) => {
+                format!("plugin:{plugin_id}/strategy")
+            }
+            _ => String::new(),
+        };
+        db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name,
+                base_url: "http://127.0.0.1:12345",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: &credential_plugin,
+                model_source_plugin: "",
+                credential_mode: mode.as_str(),
+                source_plugin_id,
+                source_integration_id,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn provider_body(name: &str, api_key: Option<&str>) -> ProviderBody {
+        ProviderBody {
+            name: name.into(),
+            base_url: "http://127.0.0.1:12345".into(),
+            wire_format: "openai".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::Map::new(),
+            timeout_ms: 1_000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: Some(json!({})),
+            follow_redirects: false,
+            credential_hosts: String::new(),
+            allow_insecure_tls: true,
+            wire_plugin: String::new(),
+            credential_plugin: String::new(),
+            model_source_plugin: String::new(),
+            api_key: api_key.map(str::to_string),
+            account_label: Some("manual-key".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_update_rejects_manual_key_for_non_manual_enrollment() {
+        let (state, root) = test_state("provider-update").await;
+
+        for (name, mode) in [
+            ("oauth", crate::plugins::CredentialMode::AuthFlow),
+            ("public", crate::plugins::CredentialMode::None),
+        ] {
+            let id = insert_provider(&state, name, mode, Some("plugin.test"), Some(name)).await;
+            let error = update_provider(
+                State(state.clone()),
+                auth(),
+                Path(id.clone()),
+                Json(provider_body(name, Some("manual-secret"))),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(db::accounts_for_provider(&state.pool, &id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_removes_accounts_invalid_for_the_new_mode() {
+        let (state, root) = test_state("transitions").await;
+        let provider_id = insert_provider(
+            &state,
+            "transition-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+
+        let encrypted = state.crypto.encrypt("manual-secret").unwrap();
+        db::insert_account(
+            &state.pool,
+            &provider_id,
+            "manual",
+            &encrypted,
+            &crate::crypto::mask_secret("manual-secret"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::None,
+            "plugin.test",
+            "public",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let accounts = db::accounts_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].label, "__kinetix_noauth__");
+        assert_eq!(state.crypto.decrypt(&accounts[0].secret_enc).unwrap(), "");
+        assert_eq!(
+            state
+                .registry
+                .snapshot()
+                .accounts
+                .values()
+                .filter(|account| account.provider_id == provider_id)
+                .count(),
+            1
+        );
+
+        // Runtime selection must fail closed even if stale real credentials are
+        // inserted outside the reconciliation path.
+        let stale = state.crypto.encrypt("should-not-route").unwrap();
+        let stale_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale-real",
+            &stale,
+            &crate::crypto::mask_secret("should-not-route"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let runtime_accounts: Vec<_> = state
+            .registry
+            .snapshot()
+            .accounts
+            .values()
+            .filter(|account| account.provider_id == provider_id)
+            .map(|account| account.label.clone())
+            .collect();
+        assert_eq!(runtime_accounts, vec!["__kinetix_noauth__".to_string()]);
+        db::delete_account(&state.pool, &stale_id).await.unwrap();
+
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::Manual,
+            "plugin.test",
+            "manual",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        assert!(db::accounts_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .registry
+            .snapshot()
+            .accounts
+            .values()
+            .all(|account| account.provider_id != provider_id));
+
+        let encrypted = state.crypto.encrypt("stale-secret").unwrap();
+        db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale",
+            &encrypted,
+            &crate::crypto::mask_secret("stale-secret"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::None,
+            "plugin.test",
+            "public",
+        )
+        .await
+        .unwrap();
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::AuthFlow,
+            "plugin.test",
+            "oauth",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        assert!(db::accounts_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .registry
+            .snapshot()
+            .accounts
+            .values()
+            .all(|account| account.provider_id != provider_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_rejects_malformed_credential_semantics_before_apply() {
+        let (state, root) = test_state("invalid-import").await;
+
+        let base_provider = json!({
+            "name": "invalid-provider",
+            "base_url": "http://127.0.0.1:12345",
+            "wire_format": "openai",
+            "auth_scheme": "bearer",
+            "extra_headers": {},
+            "rate_limit_rules": {},
+            "credential_plugin": "",
+            "wire_plugin": "",
+            "model_source_plugin": ""
+        });
+
+        let mut none_provider = base_provider.clone();
+        none_provider["credential_mode"] = json!("none");
+        none_provider["credential_plugin"] = json!("plugin:plugin.test/strategy");
+        let none_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [none_provider]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(none_error.0, StatusCode::BAD_REQUEST);
+        assert!(none_error
+            .1
+            .contains("credential_mode 'none' may not declare credential_plugin"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let mut auth_flow_provider = base_provider.clone();
+        auth_flow_provider["credential_mode"] = json!("auth_flow");
+        auth_flow_provider["credential_plugin"] = json!("plugin:wrong.plugin/strategy");
+        auth_flow_provider["source_plugin_id"] = json!("plugin.test");
+        auth_flow_provider["source_integration_id"] = json!("oauth");
+        let auth_flow_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [auth_flow_provider]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(auth_flow_error.0, StatusCode::BAD_REQUEST);
+        assert!(auth_flow_error
+            .1
+            .contains("credential_plugin does not match source_plugin_id"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let mut missing_provenance = base_provider;
+        missing_provenance["credential_mode"] = json!("auth_flow");
+        missing_provenance["credential_plugin"] = json!("plugin:plugin.test/strategy");
+        let missing_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [missing_provenance]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_error.0, StatusCode::BAD_REQUEST);
+        assert!(missing_error.1.contains("requires source_plugin_id"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let existing_id = insert_provider(
+            &state,
+            "existing-auth",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("plugin.test"),
+            Some("oauth"),
+        )
+        .await;
+        let existing_update = json!({
+            "name": "existing-auth",
+            "base_url": "http://127.0.0.1:12345",
+            "wire_format": "openai",
+            "auth_scheme": "bearer",
+            "extra_headers": {},
+            "rate_limit_rules": {},
+            "credential_plugin": "plugin:wrong.plugin/strategy",
+            "wire_plugin": "",
+            "model_source_plugin": ""
+        });
+        let update_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [existing_update]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(update_error.0, StatusCode::BAD_REQUEST);
+        assert!(update_error
+            .1
+            .contains("credential_plugin does not match source_plugin_id"));
+        let existing = db::get_provider(&state.pool, &existing_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing.credential_mode, "auth_flow");
+        assert_eq!(existing.credential_plugin, "plugin:plugin.test/strategy");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_export_import_round_trips_credential_semantics() {
+        let (source, source_root) = test_state("export-source").await;
+        let auth_provider = insert_provider(
+            &source,
+            "oauth-provider",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("plugin.oauth"),
+            Some("oauth"),
+        )
+        .await;
+        let noauth_provider = insert_provider(
+            &source,
+            "public-provider",
+            crate::plugins::CredentialMode::None,
+            Some("plugin.public"),
+            Some("public"),
+        )
+        .await;
+
+        let encrypted = source.crypto.encrypt("oauth-secret").unwrap();
+        db::insert_account(
+            &source.pool,
+            &auth_provider,
+            "connected",
+            &encrypted,
+            &crate::crypto::mask_secret("oauth-secret"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        reconcile_provider_credential_semantics(
+            &source,
+            &noauth_provider,
+            crate::plugins::CredentialMode::None,
+            "plugin.public",
+            "public",
+        )
+        .await
+        .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let oauth = exported["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["name"] == "oauth-provider")
+            .unwrap();
+        assert_eq!(oauth["credential_mode"], "auth_flow");
+        assert_eq!(oauth["source_plugin_id"], "plugin.oauth");
+        assert_eq!(oauth["source_integration_id"], "oauth");
+
+        let public = exported["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["name"] == "public-provider")
+            .unwrap();
+        assert_eq!(public["credential_mode"], "none");
+        assert_eq!(public["source_plugin_id"], "plugin.public");
+        assert_eq!(public["source_integration_id"], "public");
+        assert!(exported["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|account| account["label"] != "__kinetix_noauth__"));
+
+        let (target, target_root) = test_state("export-target").await;
+        import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let providers = db::list_providers(&target.pool).await.unwrap();
+        let oauth = providers
+            .iter()
+            .find(|provider| provider.name == "oauth-provider")
+            .unwrap();
+        assert_eq!(oauth.credential_mode, "auth_flow");
+        assert_eq!(oauth.source_plugin_id.as_deref(), Some("plugin.oauth"));
+        assert_eq!(oauth.source_integration_id.as_deref(), Some("oauth"));
+
+        let oauth_accounts = db::accounts_for_provider(&target.pool, &oauth.id)
+            .await
+            .unwrap();
+        assert_eq!(oauth_accounts.len(), 1);
+        assert_eq!(
+            target
+                .crypto
+                .decrypt(&oauth_accounts[0].secret_enc)
+                .unwrap(),
+            "oauth-secret"
+        );
+
+        let public = providers
+            .iter()
+            .find(|provider| provider.name == "public-provider")
+            .unwrap();
+        assert_eq!(public.credential_mode, "none");
+        assert_eq!(public.source_plugin_id.as_deref(), Some("plugin.public"));
+        assert_eq!(public.source_integration_id.as_deref(), Some("public"));
+
+        let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
+            .await
+            .unwrap();
+        assert_eq!(public_accounts.len(), 1);
+        assert_eq!(public_accounts[0].label, "__kinetix_noauth__");
+        assert_eq!(
+            target
+                .crypto
+                .decrypt(&public_accounts[0].secret_enc)
+                .unwrap(),
+            ""
+        );
+
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
     }
 }

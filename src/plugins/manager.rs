@@ -2552,6 +2552,9 @@ mod tests {
                 wire_plugin: "plugin:dev.example.plugin/adapter",
                 credential_plugin: "plugin:dev.example.plugin/oauth",
                 model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
             },
         )
         .await
@@ -2621,6 +2624,9 @@ mod tests {
                 wire_plugin: "",
                 credential_plugin: "",
                 model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
             }
         }
         let provider_a = crate::db::insert_provider(&pool, &new_provider("A"))

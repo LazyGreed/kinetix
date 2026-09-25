@@ -1401,8 +1401,8 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             let installed = manager.list().await.unwrap_or_default();
 
             println!(
-                "{:<32} {:<10} {:<12} {}",
-                "ID", "VERSION", "STATUS", "NAME / DESCRIPTION"
+                "{:<32} {:<10} {:<12} NAME / DESCRIPTION",
+                "ID", "VERSION", "STATUS"
             );
             println!("{}", "-".repeat(80));
             for p in filtered {
@@ -1442,7 +1442,7 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
 
                 let installed = manager.list().await.unwrap_or_default();
 
-                println!("{:<32} {:<10} {:<12} {}", "ID", "VERSION", "STATUS", "NAME");
+                println!("{:<32} {:<10} {:<12} NAME", "ID", "VERSION", "STATUS");
                 println!("{}", "-".repeat(80));
                 for p in filtered {
                     let inst = installed.iter().find(|i| i.id == p.id);

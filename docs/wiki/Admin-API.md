@@ -38,11 +38,12 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | --- | --- |
 | `GET /admin/api/providers` | List with `accounts_count` / `models_count` / `healthy_accounts`. |
 | `POST /admin/api/providers` | Create; optional `api_key` + `account_label` create the first account. Supports plugin capability bindings (`wire_plugin`, `credential_plugin`, `model_source_plugin`). |
-| `GET /admin/api/providers/{id}` | Full config (incl. `follow_redirects`, `credential_hosts`, `allow_insecure_tls`, and plugin bindings). |
+| `GET /admin/api/providers/{id}` | Full config, plugin provenance, and normalized `credential_enrollment` state. |
 | `PUT /admin/api/providers/{id}` | Update; a non-empty `api_key` rotates the first account's credential. Supports updating plugin bindings. |
 | `DELETE /admin/api/providers/{id}` | Delete. |
 | `POST /admin/api/providers/{id}/discover` | Fetch the upstream model list (via HTTP or bound `model_source_plugin`); flags already-imported and disappeared models. |
 | `POST /admin/api/providers/{id}/test` | Minimal connectivity probe; returns status + latency + a bounded preview. |
+| `POST /admin/api/providers/{id}/credential-enrollment/start` | Start the provider's declared auth flow. Rejects manual and credential-free providers and never falls back to API-key entry. |
 
 ## Models
 

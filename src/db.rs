@@ -316,6 +316,11 @@ pub struct ProviderRow {
     pub credential_plugin: String,
     #[serde(default)]
     pub model_source_plugin: String,
+    pub credential_mode: String,
+    #[serde(default)]
+    pub source_plugin_id: Option<String>,
+    #[serde(default)]
+    pub source_integration_id: Option<String>,
 }
 
 impl ProviderRow {
@@ -419,6 +424,9 @@ pub struct NewProvider<'a> {
     pub wire_plugin: &'a str,
     pub credential_plugin: &'a str,
     pub model_source_plugin: &'a str,
+    pub credential_mode: &'a str,
+    pub source_plugin_id: Option<&'a str>,
+    pub source_integration_id: Option<&'a str>,
 }
 
 pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
@@ -428,8 +436,9 @@ pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String>
          (id, name, base_url, wire_format, auth_scheme, custom_header_name, custom_param_name,
           extra_headers, timeout_ms, capability_mode, models_path, rate_limit_rules, enabled,
           follow_redirects, credential_hosts, allow_insecure_tls, created_at,
-          wire_plugin, credential_plugin, model_source_plugin)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",
+          wire_plugin, credential_plugin, model_source_plugin, credential_mode,
+          source_plugin_id, source_integration_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(p.name)
@@ -450,6 +459,9 @@ pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String>
     .bind(p.wire_plugin)
     .bind(p.credential_plugin)
     .bind(p.model_source_plugin)
+    .bind(p.credential_mode)
+    .bind(p.source_plugin_id)
+    .bind(p.source_integration_id)
     .execute(pool)
     .await?;
     Ok(id)
@@ -508,6 +520,25 @@ pub async fn update_provider(
     .bind(wire_plugin)
     .bind(credential_plugin)
     .bind(model_source_plugin)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_provider_credential_semantics(
+    pool: &Pool,
+    id: &str,
+    credential_mode: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE providers SET credential_mode=?, source_plugin_id=?, source_integration_id=? WHERE id=?",
+    )
+    .bind(credential_mode)
+    .bind(source_plugin_id)
+    .bind(source_integration_id)
     .bind(id)
     .execute(pool)
     .await?;

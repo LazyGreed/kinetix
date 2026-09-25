@@ -176,7 +176,7 @@ async fn resolve_latest_tag() -> Result<String> {
     let tag = response
         .url()
         .path_segments()
-        .and_then(|segments| segments.last())
+        .and_then(|mut segments| segments.next_back())
         .ok_or_else(|| anyhow!("latest release redirect did not contain a tag"))?;
     validate_tag(tag)
 }

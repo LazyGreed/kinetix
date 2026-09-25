@@ -47,19 +47,14 @@ impl Tri {
 
 /// How an `unknown` predicate result affects target eligibility. The admin
 /// must choose; Kinetix never guesses (FR-12.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WhenUnknown {
     /// Unknown => target is not eligible (conservative, the default).
+    #[default]
     Skip,
     /// Unknown => target remains eligible.
     Allow,
-}
-
-impl Default for WhenUnknown {
-    fn default() -> Self {
-        WhenUnknown::Skip
-    }
 }
 
 // ---------------------------------------------------------------------------

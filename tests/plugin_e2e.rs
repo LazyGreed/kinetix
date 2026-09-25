@@ -297,6 +297,9 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         wire_plugin: format!("plugin:{id}/antigravity"),
         credential_plugin: String::new(),
         model_source_plugin: String::new(),
+        credential_mode: "auth_flow".into(),
+        source_plugin_id: Some(id.into()),
+        source_integration_id: Some("antigravity".into()),
     };
     assert_eq!(provider_row.wire(), WireFormat::Plugin);
     let registered = registry.for_provider(&provider_row);

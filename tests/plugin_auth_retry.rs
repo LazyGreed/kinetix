@@ -222,6 +222,9 @@ async fn setup(
             wire_plugin: "",
             credential_plugin: "plugin:test.oauth/oauth",
             model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
         },
     )
     .await

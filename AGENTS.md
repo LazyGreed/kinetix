@@ -183,6 +183,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 - **Domain vocabulary**: Use authoritative terms:
   - **Provider**: An upstream service (e.g., OpenAI, Gemini, Anthropic).
   - **Account**: Specific credentials/pool associated with a provider.
+  - **Credential enrollment**: How a provider obtains user credentials: `manual`, `auth_flow`, or `none`. Keep this separate from request `auth_scheme`.
   - **Model**: An upstream model ID with pricing and capabilities.
   - **Route**: A user-defined routing rule resolving to ordered targets (previously termed "combo").
   - **Target**: A concrete pairing of provider, model, and optional account.

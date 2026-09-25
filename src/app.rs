@@ -7,7 +7,7 @@ use dashmap::DashMap;
 
 use crate::adapters::AdapterRegistry;
 use crate::config::Config;
-use crate::credentials::{CredentialRotationError, StaticKeyStrategy};
+use crate::credentials::{CredentialRotationError, CredentialStrategy, StaticKeyStrategy};
 use crate::crypto::Crypto;
 use crate::db::Pool;
 use crate::logqueue::UsageLogQueue;
@@ -246,7 +246,6 @@ impl AppState {
         provider: &crate::db::ProviderRow,
         account: &crate::db::AccountRow,
     ) -> anyhow::Result<crate::credentials::ResolvedCredential> {
-        use crate::credentials::CredentialStrategy;
         if let Some(r) = provider.credential_plugin_ref() {
             let Some(strategy) = self.plugin_credentials.get(&r.plugin_id) else {
                 anyhow::bail!(
@@ -270,7 +269,6 @@ impl AppState {
         account: &crate::db::AccountRow,
         failed_secret: &str,
     ) -> std::result::Result<bool, CredentialRotationError> {
-        use crate::credentials::CredentialStrategy;
         let Some(r) = provider.credential_plugin_ref() else {
             return Ok(false);
         };

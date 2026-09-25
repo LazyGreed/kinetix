@@ -684,8 +684,7 @@ pub async fn run(
         .and_then(|c| c.max_attempts)
         .map(|m| m as usize)
         .unwrap_or(targets.len())
-        .min(5)
-        .max(1);
+        .clamp(1, 5);
 
     // Session target provenance is retained even when sticky/cache affinity is
     // disabled. It lets the portability layer identify a first-attempt provider
@@ -856,12 +855,10 @@ pub async fn run(
         // previous turn came from a different provider.
         let cross_provider = previous_provider_id
             .as_deref()
-            .or_else(|| {
-                if attempts_done == 0 {
-                    session_origin_provider.as_deref()
-                } else {
-                    None
-                }
+            .or(if attempts_done == 0 {
+                session_origin_provider.as_deref()
+            } else {
+                None
             })
             .map(|id| id != target.provider.id)
             .unwrap_or(false);
@@ -896,7 +893,7 @@ pub async fn run(
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
-        if let Err(e) = check_param_policy(&target, &target_req) {
+        if let Err(e) = check_param_policy(target, &target_req) {
             trace.finish("rejected");
             state
                 .live
@@ -1243,9 +1240,9 @@ pub async fn run(
                     }
                 }
 
-                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
                 let client_error = preserve_anthropic_error(
-                    failure_to_error(&failure, &target),
+                    failure_to_error(&failure, target),
                     format,
                     adapter.as_ref(),
                     &failure,
@@ -1285,7 +1282,7 @@ pub async fn run(
                     "upstream_connect_failed",
                     format!("{:?}", failure.kind),
                 );
-                handle_key_failure(state, &target, &failure, &mut meta, &mut trace).await;
+                handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
                 if !can_fallback {
@@ -1303,9 +1300,9 @@ pub async fn run(
                         None,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
-                    return Err(failure_to_error(&failure, &target));
+                    return Err(failure_to_error(&failure, target));
                 }
-                last_error = Some(failure_to_error(&failure, &target));
+                last_error = Some(failure_to_error(&failure, target));
                 continue;
             }
         }
@@ -3928,6 +3925,9 @@ mod route_policy_tests {
             wire_plugin: String::new(),
             credential_plugin: String::new(),
             model_source_plugin: String::new(),
+            credential_mode: "manual".into(),
+            source_plugin_id: None,
+            source_integration_id: None,
         }
     }
 
