@@ -29,6 +29,7 @@ const PLUGIN_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
 pub struct PluginAuthSession {
     pub plugin_id: String,
     pub flow_name: String,
+    pub integration_id: String,
     pub provider_id: String,
     pub credential_binding: String,
     pub redirect_uri: String,
@@ -76,6 +77,7 @@ impl PluginAuthSessions {
         &self,
         plugin_id: &str,
         flow_name: &str,
+        integration_id: &str,
         provider_id: &str,
         credential_binding: &str,
         redirect_uri: &str,
@@ -103,6 +105,7 @@ impl PluginAuthSessions {
             PluginAuthSession {
                 plugin_id: plugin_id.to_string(),
                 flow_name: flow_name.to_string(),
+                integration_id: integration_id.to_string(),
                 provider_id: provider_id.to_string(),
                 credential_binding: credential_binding.to_string(),
                 redirect_uri: redirect_uri.to_string(),
