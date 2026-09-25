@@ -4,6 +4,7 @@ import { Account, Provider } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens, DESIGN_TOKENS } from '../../lib/designSystem';
 import { Kinetix, TestResult } from '../../lib/resources';
+import { useAuthEnrollment } from '../CredentialAuthFlow';
 
 interface AccountsViewProps {
   accounts: Account[];
@@ -12,6 +13,7 @@ interface AccountsViewProps {
   onUpdateAccount: (acc: Account) => void;
   onDeleteAccount: (accountId: string) => void;
   onResetAccount: (accountId: string) => void;
+  onRefresh: () => void | Promise<void>;
 }
 
 export const AccountsView: React.FC<AccountsViewProps> = ({
@@ -21,6 +23,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
   onUpdateAccount,
   onDeleteAccount,
   onResetAccount,
+  onRefresh,
 }) => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -40,6 +43,20 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
   const [validatingAccount, setValidatingAccount] = useState(false);
   const [testingAccountId, setTestingAccountId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, TestResult>>({});
+  const [enrollmentError, setEnrollmentError] = useState<string | null>(null);
+  const [enrollmentNotice, setEnrollmentNotice] = useState<string | null>(null);
+
+  const authEnrollment = useAuthEnrollment({
+    onSuccess: async () => {
+      setEnrollmentError(null);
+      setEnrollmentNotice('Account connected successfully.');
+      await onRefresh();
+    },
+    onError: (message) => {
+      setEnrollmentNotice(null);
+      setEnrollmentError(message);
+    },
+  });
 
   const handleValidateAccount = async () => {
     const prov = providers.find((p) => p.id === providerId) || providers[0];
@@ -168,7 +185,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
             </SketchBadge>
           </h2>
           <p className="text-base font-body text-[var(--ink)]/80">
-            Accounts hold real upstream API keys securely. Individual keys cycle into cooldown on 429s or quota exhaustion without interrupting client requests.
+            Accounts represent provider credentials when a provider needs them. Manual keys, sign-in flows, and credential-free providers use separate enrollment paths.
           </p>
         </div>
 
@@ -194,17 +211,34 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
               </button>
             )}
           </div>
-          <SketchButton
-            variant="primary"
-            size="md"
-            onClick={() => setShowAddModal(true)}
-            className="gap-2 font-heading font-bold whitespace-nowrap"
-          >
-            <Plus className="w-5 h-5" />
-            Add Upstream Credential
-          </SketchButton>
+          {providers.some((provider) => provider.credentialMode === 'manual') && (
+            <SketchButton
+              variant="primary"
+              size="md"
+              onClick={() => {
+                const provider = providers.find((item) => item.credentialMode === 'manual');
+                if (provider) openAddForProvider(provider.id);
+              }}
+              className="gap-2 font-heading font-bold whitespace-nowrap"
+            >
+              <Plus className="w-5 h-5" />
+              Add API Key
+            </SketchButton>
+          )}
         </div>
       </div>
+
+      {authEnrollment.modal}
+      {enrollmentError && (
+        <div className="p-3 bg-[var(--tint-red)] border-2 border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">
+          {enrollmentError}
+        </div>
+      )}
+      {enrollmentNotice && (
+        <div className="p-3 bg-[var(--tint-green)] border-2 border-[var(--pen-green)] text-sm font-mono text-[var(--success-text)]">
+          {enrollmentNotice}
+        </div>
+      )}
 
       {providers.length > 1 && (
         <div className="flex flex-wrap items-center gap-2">
@@ -232,24 +266,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
       )}
 
       {/* Provider account pools */}
-      {accounts.length === 0 ? (
-        <WobblyCard decoration="tack" className="p-10 text-center bg-[var(--surface)]">
-          <KeyRound className="w-12 h-12 text-[var(--pen-blue)] mx-auto mb-3 opacity-60" />
-          <h3 className="text-2xl font-heading font-bold text-[var(--ink)]">No Account Credentials or Pools Configured</h3>
-          <p className="text-base font-body text-[var(--ink)]/80 max-w-lg mx-auto mt-2 mb-6">
-            Store multiple API keys and upstream accounts per provider. Kinetix groups them into active pools, tracks spend against soft quotas, and isolates keys from client applications.
-          </p>
-          <SketchButton
-            variant="primary"
-            size="md"
-            onClick={() => setShowAddModal(true)}
-            className="gap-2 font-heading font-bold"
-          >
-            <Plus className="w-5 h-5" />
-            Add First Upstream Credential
-          </SketchButton>
-        </WobblyCard>
-      ) : normalizedSearch && filteredAccounts.length === 0 ? (
+      {normalizedSearch && filteredAccounts.length === 0 && accounts.length > 0 ? (
         <WobblyCard decoration="tack" className="p-8 text-center bg-[var(--surface)]">
           <Search className="w-10 h-10 text-[var(--ink)]/35 mx-auto mb-2" />
           <p className="font-heading font-bold text-lg">No accounts match “{searchQuery}”.</p>
@@ -276,15 +293,43 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                       {poolAccounts.length} credential(s) · {healthy} healthy · {cooldown} cooldown · {exhausted} exhausted
                     </p>
                   </div>
-                  <SketchButton variant="secondary" size="sm" onClick={() => openAddForProvider(provider.id)} className="gap-1">
-                    <Plus className="w-4 h-4" />
-                    Add Credential
-                  </SketchButton>
+                  {provider.credentialMode === 'manual' ? (
+                    <SketchButton variant="secondary" size="sm" onClick={() => openAddForProvider(provider.id)} className="gap-1">
+                      <Plus className="w-4 h-4" />
+                      {provider.credentialEnrollment.actionLabel || 'Add API Key'}
+                    </SketchButton>
+                  ) : provider.credentialMode === 'auth_flow' ? (
+                    <SketchButton
+                      variant="secondary"
+                      size="sm"
+                      disabled={!provider.credentialEnrollment.available || authEnrollment.busy}
+                      onClick={() => {
+                        setEnrollmentError(null);
+                        setEnrollmentNotice(null);
+                        void authEnrollment.begin(
+                          provider.id,
+                          () => Kinetix.startProviderCredentialEnrollment(provider.id),
+                        );
+                      }}
+                      className="gap-1"
+                    >
+                      <KeyRound className="w-4 h-4" />
+                      {provider.credentialEnrollment.actionLabel || 'Connect account'}
+                    </SketchButton>
+                  ) : (
+                    <SketchBadge variant="green">No credential required</SketchBadge>
+                  )}
                 </div>
 
                 {poolAccounts.length === 0 ? (
                   <div className="p-5 text-sm font-body text-[var(--ink)]/65 bg-[var(--surface)] border-2 border-dashed border-[var(--ink)]/25 rounded">
-                    No credentials in this provider pool.
+                    {provider.credentialMode === 'none'
+                      ? 'No credential required.'
+                      : provider.credentialMode === 'auth_flow'
+                        ? provider.credentialEnrollment.available
+                          ? 'Connect an account to use this provider.'
+                          : 'Authentication plugin is unavailable. Manual API-key entry is disabled.'
+                        : 'No credentials in this provider pool.'}
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -612,7 +657,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                     className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base font-body sketch-shadow-sm focus:outline-none"
                     style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
                   >
-                    {providers.map((p) => (
+                    {providers.filter((p) => p.credentialMode === 'manual').map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name} ({p.wireFormat})
                       </option>

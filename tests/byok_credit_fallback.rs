@@ -127,6 +127,9 @@ async fn insufficient_credit_falls_back_to_second_account() {
             wire_plugin: "",
             credential_plugin: "",
             model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
         },
     )
     .await

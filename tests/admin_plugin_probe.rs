@@ -95,6 +95,9 @@ async fn account_probe_uses_registered_plugin_adapter() {
             wire_plugin: plugin_ref,
             credential_plugin: "",
             model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
         },
     )
     .await

@@ -43,6 +43,14 @@ export interface Provider {
   wirePlugin?: string;
   credentialPlugin?: string;
   modelSourcePlugin?: string;
+  credentialMode: 'manual' | 'auth_flow' | 'none';
+  sourcePluginId?: string;
+  sourceIntegrationId?: string;
+  credentialEnrollment: {
+    mode: 'manual' | 'auth_flow' | 'none';
+    actionLabel?: string | null;
+    available: boolean;
+  };
   /** Write-only: a credential supplied when adding/editing (never returned by the API). */
   apiKey?: string;
   accountLabel?: string;

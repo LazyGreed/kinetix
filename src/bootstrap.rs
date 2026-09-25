@@ -73,6 +73,9 @@ pub async fn seed_if_empty(
                 wire_plugin: p.wire_plugin.as_deref().unwrap_or(""),
                 credential_plugin: p.credential_plugin.as_deref().unwrap_or(""),
                 model_source_plugin: p.model_source_plugin.as_deref().unwrap_or(""),
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
             },
         )
         .await?;

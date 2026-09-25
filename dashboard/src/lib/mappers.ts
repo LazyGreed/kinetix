@@ -50,7 +50,13 @@ export function mapProvider(j: any): Provider {
   const healthy = num(j.healthy_accounts);
   const total = num(j.accounts_count);
   const status: Provider['status'] =
-    total === 0 ? 'degraded' : healthy > 0 ? 'healthy' : 'error';
+    j.credential_mode === 'none'
+      ? 'healthy'
+      : total === 0
+        ? 'degraded'
+        : healthy > 0
+          ? 'healthy'
+          : 'error';
   return {
     id: str(j.id),
     name: str(j.name),
@@ -72,6 +78,20 @@ export function mapProvider(j: any): Provider {
     wirePlugin: str(j.wire_plugin),
     credentialPlugin: str(j.credential_plugin),
     modelSourcePlugin: str(j.model_source_plugin),
+    credentialMode:
+      j.credential_mode === 'auth_flow' || j.credential_mode === 'none'
+        ? j.credential_mode
+        : 'manual',
+    sourcePluginId: j.source_plugin_id ?? undefined,
+    sourceIntegrationId: j.source_integration_id ?? undefined,
+    credentialEnrollment: {
+      mode:
+        j.credential_enrollment?.mode === 'auth_flow' || j.credential_enrollment?.mode === 'none'
+          ? j.credential_enrollment.mode
+          : 'manual',
+      actionLabel: j.credential_enrollment?.action_label ?? null,
+      available: j.credential_enrollment?.available !== false,
+    },
     lastPingMs: 0,
   };
 }

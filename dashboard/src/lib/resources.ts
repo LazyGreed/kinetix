@@ -184,6 +184,7 @@ export interface PluginIntegration {
   provider_adapter?: string | null;
   credential_strategy?: string | null;
   auth_flow?: string | null;
+  credential_mode?: 'manual' | 'auth_flow' | 'none' | null;
   model_source?: string | null;
   provider?: PluginIntegrationProvider | null;
 }
@@ -431,6 +432,17 @@ export const Kinetix = {
     return api.post<{ valid: boolean; problems: string[] }>('/admin/api/validate/account', body);
   },
   createAccount: (body: Record<string, unknown>) => api.post('/admin/api/accounts', body),
+  startProviderCredentialEnrollment: (providerId: string) =>
+    api.post<{
+      authorize_url: string;
+      redirect_uri: string;
+      state: string;
+      expires_in_secs: number;
+      manual_callback_supported: boolean;
+    }>(
+      `/admin/api/providers/${encodeURIComponent(providerId)}/credential-enrollment/start`,
+      {},
+    ),
   updateAccount: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/accounts/${id}`, body),
   deleteAccount: (id: string) => api.del(`/admin/api/accounts/${id}`),
   resetAccount: (id: string) => api.post(`/admin/api/accounts/${id}/reset`),

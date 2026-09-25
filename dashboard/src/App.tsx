@@ -545,6 +545,7 @@ export default function App() {
             onUpdateAccount={handleUpdateAccount}
             onDeleteAccount={handleDeleteAccount}
             onResetAccount={handleResetAccount}
+            onRefresh={refresh}
           />
         )}
 

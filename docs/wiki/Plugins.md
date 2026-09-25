@@ -161,6 +161,22 @@ Every referenced `provider_adapter`, `credential_strategy`, `auth_flow`, or
 rejects duplicate integration IDs, empty integrations, and references to
 undeclared capabilities during installation.
 
+Credential enrollment is explicit and separate from request authentication:
+
+```toml
+[[integrations]]
+id = "example"
+credential_mode = "manual" # manual | auth_flow | none
+```
+
+`manual` means the user supplies a credential, `auth_flow` means Kinetix
+starts the integration's host-managed auth flow, and `none` means no user
+credential is required. Older packages without the field remain compatible:
+an integration with `auth_flow` resolves to `auth_flow`; otherwise plugins
+requesting credential scopes/read resolve to `manual`; all others resolve to
+`none`. Provider rows persist the resolved mode and source plugin/integration
+so the dashboard does not infer enrollment behavior from `credential_plugin`.
+
 ### Credential scopes for generated providers
 
 Credential access may be scoped either to a concrete provider id or to the
