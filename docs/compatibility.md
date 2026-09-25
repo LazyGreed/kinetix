@@ -314,10 +314,14 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   continuation is reported non-portable and translated with the documented
   placeholder (see below) rather than reusing the original signature. Reusing a
   tool-call id with a *different* tool name is rejected with HTTP 400 before any
-  upstream request is sent, and a conflicting explicit session is refused. Those
-  identity checks run before the row is classified as non-portable, so a
-  cross-model switch can never launder a reused tool-call id or a stranger's
-  session into a placeholder.
+  upstream request is sent, and a conflicting explicit session is refused. When
+  a row exists for the exact target model, identity is validated against *that
+  row* first, so another model's row that merely shares the tool-call id can
+  never shadow it into a false non-portable classification; only when no
+  exact-model row exists is the identity check widened to the remaining
+  (cross-model) rows to decide portability. Those identity checks always run
+  before a row is classified as non-portable, so a cross-model switch can never
+  launder a reused tool-call id or a stranger's session into a placeholder.
 - **Portability.** Stored state that the selected target cannot carry feeds the
   Route's existing `reject` / `strip_with_warning` portability policy exactly
   like inline client state — including when neither the provider nor the wire

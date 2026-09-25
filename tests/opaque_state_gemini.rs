@@ -29,6 +29,7 @@ use kinetix::{
     db,
     frontends::FrontendFormat,
     logqueue::UsageLogQueue,
+    opaque_state::{OpaqueClientScope, OpaqueStateKind, OpaqueStateTarget},
     paths::Paths,
     pipeline,
     registry::Registry,
@@ -1258,6 +1259,125 @@ async fn direct_cross_model_switch_with_a_different_session_is_not_translated() 
         1,
         "the mismatched continuation must have reached Gemini unsigned"
     );
+
+    cleanup(harness).await;
+}
+
+/// Two models can share a tool-call id under *different* tool names (a
+/// realistic case: the client id space is not scoped per model). The bug this
+/// guards: once SQLite holds a row for each model under the same id, a lookup
+/// for the exact target model must validate identity against *that model's
+/// own row*, not get shadowed by the other model's row sharing the id. Before
+/// the fix, filtering rows by tool name/session across *every* row for the id
+/// (not just the exact-model one) could drop the exact-model row from the
+/// surviving set and fall through to `Incompatible`, letting a reused id on
+/// the *exact* model it was captured on receive the cross-model placeholder
+/// instead of the correct hard rejection. This only surfaces once RAM no
+/// longer holds the answer (restart or eviction), because the RAM cache key
+/// is already exact-model and never sees the other row — so the regression
+/// captures directly through the store and clears RAM to force the SQLite
+/// fallback, then drives the mismatch through the full pipeline.
+#[tokio::test]
+async fn exact_model_identity_survives_restart_when_another_models_row_shares_the_id() {
+    let harness = setup().await;
+    let key = virtual_key("key-exact-identity");
+
+    let models = db::list_models(&harness.pool).await.unwrap();
+    let flash_model = models
+        .iter()
+        .find(|m| m.upstream_id == "gemini-3-mock")
+        .expect("flash model must exist")
+        .clone();
+    let pro_model = models
+        .iter()
+        .find(|m| m.upstream_id == "gemini-3-mock-pro")
+        .expect("pro model must exist")
+        .clone();
+    let flash_target = OpaqueStateTarget {
+        kind: OpaqueStateKind::GeminiThoughtSignature,
+        provider_id: flash_model.provider_id.clone(),
+        family: "gemini".into(),
+        producer: "native:gemini:v1".into(),
+        model_id: flash_model.upstream_id.clone(),
+    };
+    let pro_target = OpaqueStateTarget {
+        model_id: pro_model.upstream_id.clone(),
+        ..flash_target.clone()
+    };
+    let scope = OpaqueClientScope::for_key(&key.id);
+
+    // Flash captures call_mock_1/get_weather; pro captures the *same*
+    // tool-call id under a *different* tool name (a different historical
+    // call that merely happens to reuse the id).
+    harness.state.opaque_state.capture_tool_signature(
+        &scope,
+        &flash_target,
+        None,
+        TOOL_CALL_ID,
+        TOOL_NAME,
+        SIGNATURE,
+    );
+    harness.state.opaque_state.capture_tool_signature(
+        &scope,
+        &pro_target,
+        None,
+        TOOL_CALL_ID,
+        "read_file",
+        SIGNATURE_PRO,
+    );
+    harness.state.opaque_state.flush().await;
+
+    // Simulate a process restart: a fresh `AppState` over the same database
+    // has an empty RAM cache, so this lookup can only be answered from the
+    // multi-row SQLite scan — the exact bug surface (a hot-RAM lookup is
+    // already keyed per exact model and would never see the other row).
+    let restarted = build_state(&harness).await;
+    assert_eq!(restarted.opaque_state.count_rows().await, 2);
+
+    // Continue on flash (the model that owns the get_weather row) but reuse
+    // the id as pipeline history would if the client resent the pro turn's
+    // tool name. This must be rejected as a tool-name mismatch against
+    // flash's own row — never answered as `Incompatible` (which the pipeline
+    // would translate into a placeholder).
+    let requests_at_upstream_before = harness.mock.requests.lock().await.len();
+    let error = run(
+        &restarted,
+        Some(&key),
+        second_turn_to("opaque-route", false, TOOL_CALL_ID, "read_file"),
+        "req_exact_identity_flash_2",
+    )
+    .await
+    .expect_err("a reused id under a foreign tool name must be rejected");
+    assert!(
+        error.contains("different tool name"),
+        "unexpected rejection message: {error}"
+    );
+    assert_eq!(
+        harness.mock.requests.lock().await.len(),
+        requests_at_upstream_before,
+        "the mismatch must be rejected before any upstream dispatch"
+    );
+    assert_eq!(
+        harness
+            .mock
+            .placeholder_continuations
+            .load(Ordering::SeqCst),
+        0,
+        "a tool-name mismatch on the exact model must never be translated with a placeholder"
+    );
+
+    // Flash's own row, addressed correctly, still restores from SQLite after
+    // the restart.
+    let status = run(
+        &restarted,
+        Some(&key),
+        second_turn_to("opaque-route", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_exact_identity_flash_3",
+    )
+    .await
+    .expect("the exact-model row with the matching tool name must still restore");
+    assert_eq!(status, 200);
+    assert_eq!(harness.mock.signed_continuations.load(Ordering::SeqCst), 1);
 
     cleanup(harness).await;
 }

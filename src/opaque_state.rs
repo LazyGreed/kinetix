@@ -450,6 +450,29 @@ impl OpaqueStateStore {
         // cross-model switch would let `call/read_file/session-B` be continued
         // as `call/get_weather/session-A` and merely receive a placeholder
         // (§10, §20).
+        //
+        // A row for the exact target model is authoritative: it is the row this
+        // request would replay, so its identity is validated first and no other
+        // model's row sharing the tool-call id can launder the answer into
+        // `Incompatible` (which would paint a cross-model placeholder onto
+        // malformed history). Only when no exact-model row exists is the
+        // cross-model/non-portable question asked of the remaining rows.
+        if let Some(target) = capability {
+            if let Some(row) = rows.iter().find(|row| row.matches(target)) {
+                if let Some(mismatch) = self.identity_mismatch(row, session, tool_name) {
+                    return mismatch;
+                }
+                return self.restore_row(row, target, &scope_hash, &call_hash);
+            }
+        }
+
+        // Cross-model (or capability-less) lookup. Identity is validated against
+        // every surviving row so a reused tool-call id is refused even when the
+        // only stored row belongs to another model. With no capability the
+        // newest identity-matching row is inspected only so the pipeline can
+        // tell "stored but non-portable" apart from "nothing stored" (§19 case
+        // C, §22); it is never decrypted.
+        let incoming_session = session.map(session_hash);
         let identity_rows: Vec<&StoredRow> = rows
             .iter()
             .filter(|row| row.tool_name_hash == tool_name_hash(tool_name))
@@ -464,7 +487,6 @@ impl OpaqueStateStore {
         // Session compatibility (§10): a row whose stored session differs from
         // the incoming one cannot belong to this conversation. An absent
         // session on either side is compatible.
-        let incoming_session = session.map(session_hash);
         let session_rows: Vec<&StoredRow> = identity_rows
             .into_iter()
             .filter(|row| match (&row.session_hash, &incoming_session) {
@@ -479,28 +501,48 @@ impl OpaqueStateStore {
             return OpaqueLookupResult::SessionMismatch;
         }
 
-        // Prefer the row this target can actually carry (kind/provider/family/
-        // producer/model all match). With no capability, the newest surviving
-        // row is inspected only so the pipeline can tell "stored but
-        // non-portable" apart from "nothing stored" (§19 case C, §22).
-        let candidate = match capability {
-            Some(target) => session_rows.iter().copied().find(|row| row.matches(target)),
-            None => session_rows.first().copied(),
-        };
-        let Some(row) = candidate else {
-            self.counters
-                .lookup_incompatible
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return OpaqueLookupResult::Incompatible;
-        };
+        self.counters
+            .lookup_incompatible
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OpaqueLookupResult::Incompatible
+    }
 
-        let Some(target) = capability else {
+    /// Validate a stored row's conversation identity: the same tool name and
+    /// (when both sides carry one) the same session. Returns the mismatch
+    /// result when the row cannot belong to this conversation, or `None` when
+    /// it may. The client scope is already implied by the lookup key.
+    fn identity_mismatch(
+        &self,
+        row: &StoredRow,
+        session: Option<&str>,
+        tool_name: &str,
+    ) -> Option<OpaqueLookupResult> {
+        if row.tool_name_hash != tool_name_hash(tool_name) {
             self.counters
-                .lookup_incompatible
+                .lookup_tool_name_mismatch
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return OpaqueLookupResult::Incompatible;
-        };
+            return Some(OpaqueLookupResult::ToolNameMismatch);
+        }
+        if let (Some(stored), Some(incoming)) = (&row.session_hash, session) {
+            if *stored != session_hash(incoming) {
+                self.counters
+                    .lookup_session_mismatch
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(OpaqueLookupResult::SessionMismatch);
+            }
+        }
+        None
+    }
 
+    /// Decrypt a row already matched to `target` and repopulate the RAM hot path
+    /// with it.
+    fn restore_row(
+        &self,
+        row: &StoredRow,
+        target: &OpaqueStateTarget,
+        scope_hash: &str,
+        call_hash: &str,
+    ) -> OpaqueLookupResult {
         let signature = match self.crypto.decrypt_opaque_state(&row.value_enc) {
             Ok(sig) => sig,
             Err(_) => {
@@ -514,16 +556,14 @@ impl OpaqueStateStore {
             }
         };
 
-        // Repopulate the RAM hot path with the decrypted value.
-        let key = self.cache_key(target, &scope_hash, &call_hash);
-        let now = Instant::now();
+        let key = self.cache_key(target, scope_hash, call_hash);
         self.cache.insert(
             key.clone(),
             CachedOpaqueState {
                 signature: signature.clone(),
                 session_hash: row.session_hash.clone(),
                 tool_name_hash: row.tool_name_hash.clone(),
-                expires_at: now + MEMORY_TTL,
+                expires_at: Instant::now() + MEMORY_TTL,
             },
         );
         self.touch_order(key);
@@ -1218,6 +1258,101 @@ mod tests {
             .resolve_tool_signature(&scope, Some(&other_model), Some("sess_1"), "call_1", "bash")
             .await;
         assert_eq!(result, OpaqueLookupResult::Incompatible);
+    }
+
+    #[tokio::test]
+    async fn exact_model_row_identity_is_not_shadowed_by_another_models_row_tool_name() {
+        // Two models can share a tool-call id (bytes_for_a_different_model_do_not_collide).
+        // When the request targets the exact model that owns one of those rows,
+        // that row's identity must be checked first: a Pro row for `call_1` under
+        // a different tool name must never make a Flash row for `call_1` under the
+        // requested tool name disappear behind it. Before the fix, filtering by
+        // tool name across *all* rows for the id could drop the exact-model row
+        // and leave only the foreign-model row, which then failed the `matches`
+        // scan and returned `Incompatible` instead of `ToolNameMismatch`.
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let flash = gemini_target();
+        let mut pro = gemini_target();
+        pro.model_id = "gemini-3-pro".into();
+        capture(
+            &store,
+            &scope,
+            &flash,
+            None,
+            "call_1",
+            "get_weather",
+            "SIG_FLASH",
+        );
+        capture(&store, &scope, &pro, None, "call_1", "read_file", "SIG_PRO");
+        store.flush().await;
+        // Force the SQLite fallback path: the RAM cache is keyed per exact
+        // target/model, so a hot-cache lookup would never exhibit this bug (it
+        // never sees the other model's row). The bug is specifically in the
+        // multi-row SQLite fetch_rows() scan, reached after eviction or restart.
+        store.clear_memory_cache_for_test();
+
+        // Request targets Flash (the exact model that owns the get_weather row)
+        // but supplies the Pro row's tool name: must be rejected as a mismatch,
+        // never answered from the Pro row and never classified Incompatible.
+        let result = store
+            .resolve_tool_signature(&scope, Some(&flash), None, "call_1", "read_file")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::ToolNameMismatch);
+
+        // The exact-model row with the matching tool name still resolves.
+        let result = store
+            .resolve_tool_signature(&scope, Some(&flash), None, "call_1", "get_weather")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::Compatible("SIG_FLASH".into()));
+    }
+
+    #[tokio::test]
+    async fn exact_model_row_identity_is_not_shadowed_by_another_models_row_session() {
+        // Same failure mode as the tool-name case, for session identity: a Pro
+        // row for `call_1` under a different session must not make the exact
+        // Flash row for `call_1` unreachable, and the request must be refused
+        // (not silently answered from the foreign row, not `Incompatible`).
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let flash = gemini_target();
+        let mut pro = gemini_target();
+        pro.model_id = "gemini-3-pro".into();
+        capture(
+            &store,
+            &scope,
+            &flash,
+            Some("sess_flash"),
+            "call_1",
+            "bash",
+            "SIG_FLASH",
+        );
+        capture(
+            &store,
+            &scope,
+            &pro,
+            Some("sess_pro"),
+            "call_1",
+            "bash",
+            "SIG_PRO",
+        );
+        store.flush().await;
+        // Force the SQLite fallback path (see the tool-name test above for why).
+        store.clear_memory_cache_for_test();
+
+        // Request targets Flash (owns sess_flash) but supplies Pro's session:
+        // must be a session mismatch against the exact-model row, not answered
+        // from the Pro row and not Incompatible.
+        let result = store
+            .resolve_tool_signature(&scope, Some(&flash), Some("sess_pro"), "call_1", "bash")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::SessionMismatch);
+
+        // The exact-model row with the matching session still resolves.
+        let result = store
+            .resolve_tool_signature(&scope, Some(&flash), Some("sess_flash"), "call_1", "bash")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::Compatible("SIG_FLASH".into()));
     }
 
     #[tokio::test]
