@@ -246,13 +246,13 @@ impl AppState {
                 );
             };
             let strategy = Arc::clone(strategy.value());
-            return self
-                .credential_refresh
-                .resolve(&provider.id, strategy, account)
-                .await
-                .map_err(Into::into);
+            return Ok(
+                self.credential_refresh
+                    .resolve(&provider.id, strategy, account)
+                    .await?,
+            );
         }
-        self.credentials.resolve(account).await.map_err(Into::into)
+        Ok(self.credentials.resolve(account).await?)
     }
 
     /// Force renewal for a plugin-backed credential after an upstream auth
