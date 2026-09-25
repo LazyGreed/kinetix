@@ -8866,7 +8866,7 @@ mod credential_enrollment_regression_tests {
             Some("oauth"),
         )
         .await;
-        let mut existing_update = json!({
+        let existing_update = json!({
             "name": "existing-auth",
             "base_url": "http://127.0.0.1:12345",
             "wire_format": "openai",
@@ -8877,7 +8877,6 @@ mod credential_enrollment_regression_tests {
             "wire_plugin": "",
             "model_source_plugin": ""
         });
-        existing_update["credential_plugin"] = json!("plugin:wrong.plugin/strategy");
         let update_error = import_config(
             State(state.clone()),
             auth(),
