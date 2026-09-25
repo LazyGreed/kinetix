@@ -8545,6 +8545,12 @@ mod credential_enrollment_regression_tests {
         source_plugin_id: Option<&str>,
         source_integration_id: Option<&str>,
     ) -> String {
+        let credential_plugin = match (mode, source_plugin_id) {
+            (crate::plugins::CredentialMode::AuthFlow, Some(plugin_id)) => {
+                format!("plugin:{plugin_id}/strategy")
+            }
+            _ => String::new(),
+        };
         db::insert_provider(
             &state.pool,
             &db::NewProvider {
@@ -8563,7 +8569,7 @@ mod credential_enrollment_regression_tests {
                 credential_hosts: "",
                 allow_insecure_tls: true,
                 wire_plugin: "",
-                credential_plugin: "",
+                credential_plugin: &credential_plugin,
                 model_source_plugin: "",
                 credential_mode: mode.as_str(),
                 source_plugin_id,
@@ -8774,6 +8780,82 @@ mod credential_enrollment_regression_tests {
             .accounts
             .values()
             .all(|account| account.provider_id != provider_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_rejects_malformed_credential_semantics_before_apply() {
+        let (state, root) = test_state("invalid-import").await;
+
+        let base_provider = json!({
+            "name": "invalid-provider",
+            "base_url": "http://127.0.0.1:12345",
+            "wire_format": "openai",
+            "auth_scheme": "bearer",
+            "extra_headers": {},
+            "rate_limit_rules": {},
+            "credential_plugin": "",
+            "wire_plugin": "",
+            "model_source_plugin": ""
+        });
+
+        let mut none_provider = base_provider.clone();
+        none_provider["credential_mode"] = json!("none");
+        none_provider["credential_plugin"] = json!("plugin:plugin.test/strategy");
+        let none_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [none_provider]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(none_error.0, StatusCode::BAD_REQUEST);
+        assert!(none_error
+            .1
+            .contains("credential_mode 'none' may not declare credential_plugin"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let mut auth_flow_provider = base_provider.clone();
+        auth_flow_provider["credential_mode"] = json!("auth_flow");
+        auth_flow_provider["credential_plugin"] = json!("plugin:wrong.plugin/strategy");
+        auth_flow_provider["source_plugin_id"] = json!("plugin.test");
+        auth_flow_provider["source_integration_id"] = json!("oauth");
+        let auth_flow_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [auth_flow_provider]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(auth_flow_error.0, StatusCode::BAD_REQUEST);
+        assert!(auth_flow_error
+            .1
+            .contains("credential_plugin does not match source_plugin_id"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let mut missing_provenance = base_provider;
+        missing_provenance["credential_mode"] = json!("auth_flow");
+        missing_provenance["credential_plugin"] = json!("plugin:plugin.test/strategy");
+        let missing_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [missing_provenance]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_error.0, StatusCode::BAD_REQUEST);
+        assert!(missing_error.1.contains("requires source_plugin_id"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
