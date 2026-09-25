@@ -1000,6 +1000,62 @@ pub async fn create_provider(
     Ok(Json(json!({ "id": id })))
 }
 
+fn validate_auth_flow_binding_edit(
+    provider: &db::ProviderRow,
+    expected_binding: &str,
+    proposed_binding: &str,
+) -> Result<(), ApiError> {
+    if provider.credential_mode == "auth_flow"
+        && proposed_binding != provider.credential_plugin
+        && proposed_binding != expected_binding
+    {
+        return Err(ApiError::bad(
+            "credential_plugin conflicts with the provider's authentication-flow source integration",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_provider_credential_binding_edit(
+    state: &AppState,
+    provider: &db::ProviderRow,
+    proposed_binding: &str,
+) -> Result<(), ApiError> {
+    if provider.credential_mode != "auth_flow" || proposed_binding == provider.credential_plugin {
+        return Ok(());
+    }
+
+    let plugin_id = provider
+        .source_plugin_id
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+    let integration_id = provider
+        .source_integration_id
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+    let manager = plugin_manager(state)?;
+    let row = manager
+        .get(plugin_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::bad("provider authentication plugin is not installed"))?;
+    let manifest = row
+        .manifest()
+        .ok_or_else(|| ApiError::bad("plugin manifest is unreadable"))?;
+    let integration = manifest
+        .integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
+    let credential_strategy = integration
+        .credential_strategy
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider integration has no credential strategy"))?;
+    let expected_binding = format!("plugin:{plugin_id}/{credential_strategy}");
+
+    validate_auth_flow_binding_edit(provider, &expected_binding, proposed_binding)
+}
+
 pub async fn update_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -1023,6 +1079,7 @@ pub async fn update_provider(
     let rate_limit_rules = body.rate_limit_rules.clone().unwrap_or_else(|| {
         serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
     });
+    validate_provider_credential_binding_edit(&state, &existing, &body.credential_plugin).await?;
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -6114,6 +6171,15 @@ pub async fn start_plugin_auth(
     auth: AdminAuth,
     Json(body): Json<PluginAuthStartBody>,
 ) -> ApiResult {
+    let provider = db::get_provider(&state.pool, &body.provider_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let integration_id = provider
+        .source_integration_id
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("provider auth integration provenance is unavailable"))?;
+
     let manager = plugin_manager(&state)?;
     let row = manager
         .get(&body.plugin_id)
@@ -6127,17 +6193,18 @@ pub async fn start_plugin_auth(
     let integration = manifest
         .integrations
         .iter()
-        .find(|integration| integration.auth_flow.as_deref() == Some(body.flow_name.as_str()))
-        .ok_or_else(|| ApiError::bad("auth flow is not exposed by a plugin integration"))?;
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
+    if integration.auth_flow.as_deref() != Some(body.flow_name.as_str()) {
+        return Err(ApiError::bad(
+            "requested auth flow does not match the provider source integration",
+        ));
+    }
     let credential_strategy = integration
         .credential_strategy
         .as_deref()
         .ok_or_else(|| ApiError::bad("integration has no credential strategy"))?;
 
-    let provider = db::get_provider(&state.pool, &body.provider_id)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let expected_binding = format!("plugin:{}/{}", body.plugin_id, credential_strategy);
     validate_plugin_auth_enrollment(
         &provider,
@@ -6157,6 +6224,7 @@ pub async fn start_plugin_auth(
     let pending = state.plugin_auth_sessions.create(
         &body.plugin_id,
         &body.flow_name,
+        &integration.id,
         &body.provider_id,
         &expected_binding,
         &redirect_uri,
@@ -6354,8 +6422,13 @@ async fn complete_plugin_auth(
     let integration = manifest
         .integrations
         .iter()
-        .find(|integration| integration.auth_flow.as_deref() == Some(session.flow_name.as_str()))
-        .ok_or_else(|| ApiError::bad("auth flow is not exposed by a plugin integration"))?;
+        .find(|integration| integration.id == session.integration_id)
+        .ok_or_else(|| ApiError::bad("provider authentication integration is unavailable"))?;
+    if integration.auth_flow.as_deref() != Some(session.flow_name.as_str()) {
+        return Err(ApiError::bad(
+            "stored auth flow does not match the provider source integration",
+        ));
+    }
     let credential_strategy = integration
         .credential_strategy
         .as_deref()
