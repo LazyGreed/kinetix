@@ -7,7 +7,7 @@ use dashmap::DashMap;
 
 use crate::adapters::AdapterRegistry;
 use crate::config::Config;
-use crate::credentials::{CredentialRotationError, StaticKeyStrategy};
+use crate::credentials::{CredentialRotationError, CredentialStrategy, StaticKeyStrategy};
 use crate::crypto::Crypto;
 use crate::db::Pool;
 use crate::logqueue::UsageLogQueue;
