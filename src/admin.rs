@@ -4375,42 +4375,43 @@ async fn validate_imported_provider_credential_semantics(
             // Preserve portable exports when the plugin is not installed yet.
             // Once present, its manifest becomes authoritative for integration
             // identity and the exact credential strategy binding.
-            if let Some(manager) = state.plugin_manager() {
-                if let Some(row) = manager
+            let installed_plugin = match state.plugin_manager() {
+                Some(manager) => manager
                     .get(plugin_id)
                     .await
-                    .map_err(|error| format!("provider '{name}': {error}"))?
-                {
-                    let manifest = row.manifest().ok_or_else(|| {
-                        format!("provider '{name}': source plugin manifest is unreadable")
-                    })?;
-                    let integration = manifest
-                        .integrations
-                        .iter()
-                        .find(|integration| integration.id == integration_id)
-                        .ok_or_else(|| {
-                            format!(
-                                "provider '{name}': source integration '{integration_id}' is unavailable"
-                            )
-                        })?;
-                    if integration.effective_credential_mode(&manifest.permissions)
-                        != crate::plugins::CredentialMode::AuthFlow
-                    {
-                        return Err(format!(
-                            "provider '{name}': source integration '{integration_id}' is not an auth_flow integration"
-                        ));
-                    }
-                    let strategy = integration.credential_strategy.as_deref().ok_or_else(|| {
+                    .map_err(|error| format!("provider '{name}': {error}"))?,
+                None => None,
+            };
+            if let Some(row) = installed_plugin {
+                let manifest = row.manifest().ok_or_else(|| {
+                    format!("provider '{name}': source plugin manifest is unreadable")
+                })?;
+                let integration = manifest
+                    .integrations
+                    .iter()
+                    .find(|integration| integration.id == integration_id)
+                    .ok_or_else(|| {
                         format!(
-                            "provider '{name}': source integration '{integration_id}' has no credential strategy"
+                            "provider '{name}': source integration '{integration_id}' is unavailable"
                         )
                     })?;
-                    let expected_binding = format!("plugin:{plugin_id}/{strategy}");
-                    if credential_plugin != expected_binding {
-                        return Err(format!(
-                            "provider '{name}': credential_plugin does not match source integration '{integration_id}'"
-                        ));
-                    }
+                if integration.effective_credential_mode(&manifest.permissions)
+                    != crate::plugins::CredentialMode::AuthFlow
+                {
+                    return Err(format!(
+                        "provider '{name}': source integration '{integration_id}' is not an auth_flow integration"
+                    ));
+                }
+                let strategy = integration.credential_strategy.as_deref().ok_or_else(|| {
+                    format!(
+                        "provider '{name}': source integration '{integration_id}' has no credential strategy"
+                    )
+                })?;
+                let expected_binding = format!("plugin:{plugin_id}/{strategy}");
+                if credential_plugin != expected_binding {
+                    return Err(format!(
+                        "provider '{name}': credential_plugin does not match source integration '{integration_id}'"
+                    ));
                 }
             }
         }
