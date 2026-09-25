@@ -124,6 +124,21 @@ pub trait Adapter: Send + Sync {
     fn opaque_state_target(&self, _model: &crate::db::ModelRow) -> Option<OpaqueStateTarget> {
         None
     }
+
+    /// A protocol-defined placeholder to place on a historical function-call
+    /// part whose *real* opaque signature this target cannot carry (for example
+    /// a different model in the same protocol family, where the provider only
+    /// accepts the originating model's signature). Returning `Some` means the
+    /// adapter has a documented, provider-accepted way to keep the call in the
+    /// history without inventing real reasoning state; returning `None` (the
+    /// default) means the pipeline must fall back to the ordinary
+    /// strip/reject portability policy.
+    ///
+    /// This is a wire-protocol detail, so it lives on the adapter, never in the
+    /// pipeline: the value must be exactly what the upstream documents.
+    fn opaque_state_placeholder(&self, _model: &crate::db::ModelRow) -> Option<&'static str> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]

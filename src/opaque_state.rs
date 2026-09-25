@@ -243,6 +243,9 @@ pub struct OpaqueStateStore {
     order: Mutex<VecDeque<OpaqueCacheKey>>,
     counters: Arc<Counters>,
     durability: mpsc::Sender<DurabilityJob>,
+    /// Bound on RAM-cache rows. A field (not just the const) so the eviction
+    /// regression can exercise capacity without filling thousands of entries.
+    max_memory_rows: usize,
 }
 
 /// A queued SQLite durability job. Encryption and the SQLite UPSERT happen on
@@ -281,7 +284,13 @@ impl OpaqueStateStore {
             order: Mutex::new(VecDeque::new()),
             counters,
             durability: tx,
+            max_memory_rows: MAX_MEMORY_ROWS,
         }
+    }
+
+    #[cfg(test)]
+    fn set_max_memory_rows_for_test(&mut self, rows: usize) {
+        self.max_memory_rows = rows;
     }
 
     /// Wait until every queued durability write has been processed. Used by
@@ -525,8 +534,15 @@ impl OpaqueStateStore {
 
     fn touch_order(&self, key: OpaqueCacheKey) {
         let mut order = self.order.lock();
+        // Move-to-back: a re-captured key must not leave a stale occurrence at
+        // the front. Otherwise, once the deque is at capacity, evicting that
+        // stale occurrence would `cache.remove()` the *newly written* value and
+        // silently drop a live signature (an immediate continuation would then
+        // miss RAM). `retain` keeps `order` free of duplicates so one cache
+        // entry always has exactly one eviction slot.
+        order.retain(|existing| existing != &key);
         order.push_back(key);
-        while order.len() > MAX_MEMORY_ROWS {
+        while order.len() > self.max_memory_rows {
             if let Some(evicted) = order.pop_front() {
                 self.cache.remove(&evicted);
             }
@@ -637,6 +653,20 @@ impl OpaqueStateStore {
     #[cfg(test)]
     pub fn memory_entry_count_for_test(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Test-only: read a value from the RAM cache only, never SQLite. Used by
+    /// the eviction regression to observe the hot path deterministically
+    /// (a SQLite read could race the asynchronous durability worker).
+    #[cfg(test)]
+    fn cached_signature_for_test(
+        &self,
+        scope: &OpaqueClientScope,
+        target: &OpaqueStateTarget,
+        tool_call_id: &str,
+    ) -> Option<String> {
+        let key = self.cache_key(target, &scope.hash(), &tool_call_hash(scope, tool_call_id));
+        self.cache.get(&key).map(|entry| entry.signature.clone())
     }
 
     /// Test-only: mark every stored row expired and drop the RAM cache so the
@@ -894,6 +924,59 @@ mod tests {
                 .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
                 .await,
             OpaqueLookupResult::Compatible("SIG_A".into())
+        );
+    }
+
+    /// Regression: re-capturing the oldest key while the RAM cache is at
+    /// capacity must move that key to the back, not leave a stale duplicate at
+    /// the front. Before the fix, the stale occurrence was evicted and its
+    /// `cache.remove()` deleted the value that had just been written, so an
+    /// immediate continuation missed RAM (and could read stale SQLite state).
+    #[tokio::test]
+    async fn recapturing_oldest_key_at_capacity_keeps_the_new_value_in_ram() {
+        let mut store = test_store().await;
+        store.set_max_memory_rows_for_test(3);
+        let scope = OpaqueClientScope::for_key("key_lru");
+        let target = gemini_target();
+
+        // Fill exactly to capacity: call_1 is now the oldest entry.
+        for index in 1..=3 {
+            capture(
+                &store,
+                &scope,
+                &target,
+                None,
+                &format!("call_{index}"),
+                "bash",
+                &format!("SIG_{index}"),
+            );
+        }
+        assert_eq!(store.memory_entry_count_for_test(), 3);
+
+        // Replace the oldest entry with a new value. Pre-fix this removed the
+        // freshly inserted value instead of the stale ordering slot.
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_1_NEW");
+
+        // Observe the RAM hot path directly (no SQLite read, so the async
+        // durability worker cannot make the assertion race).
+        assert_eq!(
+            store.cached_signature_for_test(&scope, &target, "call_1"),
+            Some("SIG_1_NEW".to_string()),
+            "re-capturing the oldest key must keep the new value resident"
+        );
+        assert_eq!(
+            store.memory_entry_count_for_test(),
+            3,
+            "re-capturing must not grow the cache beyond capacity"
+        );
+
+        // An immediate continuation resolves the new value without touching
+        // SQLite or missing the cache.
+        assert_eq!(
+            store
+                .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
+                .await,
+            OpaqueLookupResult::Compatible("SIG_1_NEW".into())
         );
     }
 

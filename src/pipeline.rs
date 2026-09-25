@@ -894,6 +894,11 @@ pub async fn run(
         // Route's reject/strip_with_warning policy would be bypassed and the
         // state silently dropped.
         if cross_provider || cross_format || opaque_report.nonportable() {
+            // A target that cannot carry the real stored state may still have a
+            // documented placeholder for it (e.g. Gemini's cross-model
+            // sentinel). The adapter owns that wire detail; the pipeline only
+            // decides whether the Route policy allows proceeding.
+            let placeholder = adapter.opaque_state_placeholder(&target.model);
             if let Some(route) = &route {
                 apply_portability(
                     &mut target_req,
@@ -901,6 +906,7 @@ pub async fn run(
                     target,
                     inline_opaque,
                     &opaque_report,
+                    placeholder,
                     &mut trace,
                 )?;
             } else if inline_opaque || opaque_report.nonportable() {
@@ -2428,6 +2434,10 @@ struct OpaqueHydrationReport {
     restored: usize,
     /// Stored signatures that exist but this target cannot carry.
     incompatible: usize,
+    /// Tool-call ids whose stored state exists but this target cannot carry.
+    /// Lets the portability policy translate those specific historical calls
+    /// (e.g. with a provider placeholder) instead of stripping them blindly.
+    incompatible_ids: Vec<String>,
     /// Stored signatures that could not be decrypted (treated as lost, never
     /// surfaced to the client).
     unavailable: usize,
@@ -2509,7 +2519,10 @@ async fn resolve_opaque_state(
                     report.restored += 1;
                     report.restorations.push((id.clone(), signature));
                 }
-                OpaqueLookupResult::Incompatible => report.incompatible += 1,
+                OpaqueLookupResult::Incompatible => {
+                    report.incompatible += 1;
+                    report.incompatible_ids.push(id.clone());
+                }
                 OpaqueLookupResult::Unavailable => report.unavailable += 1,
                 OpaqueLookupResult::ToolNameMismatch => {
                     // Malformed/reused conversation history: fail closed with a
@@ -2562,12 +2575,20 @@ fn hydrate_opaque_state(req: &mut InternalRequest, report: &OpaqueHydrationRepor
 /// (thinking parts, tool-call signatures) and `report` reflects host-owned
 /// stored continuation state resolved for this target. Either source can make
 /// the conversation non-portable for the candidate target.
+///
+/// `placeholder` is the target adapter's documented stand-in for a historical
+/// call whose real signature cannot be carried (e.g. a different model in the
+/// same protocol family). When present, the incompatible call is translated
+/// with that placeholder rather than left unsigned — an unsigned historical
+/// call is exactly what the provider rejects. Routing policy still wins: a
+/// `reject` Route refuses before any placeholder is applied.
 fn apply_portability(
     req: &mut InternalRequest,
     route: &db::RouteRow,
     target: &ResolvedTarget,
     inline_opaque: bool,
     report: &OpaqueHydrationReport,
+    placeholder: Option<&'static str>,
     trace: &mut RouteTrace,
 ) -> Result<(), ProxyError> {
     if !inline_opaque && !report.nonportable() {
@@ -2582,20 +2603,37 @@ fn apply_portability(
     }
 
     // portability=strip_with_warning
+    let mut placed = 0usize;
     for msg in &mut req.messages {
         msg.parts
             .retain(|p| !matches!(p, crate::types::Part::Thinking { .. }));
         for part in &mut msg.parts {
-            if let crate::types::Part::ToolCall { signature, .. } = part {
+            if let crate::types::Part::ToolCall { id, signature, .. } = part {
                 *signature = None;
+                let was_incompatible = id
+                    .as_deref()
+                    .is_some_and(|id| report.incompatible_ids.iter().any(|known| known == id));
+                if was_incompatible {
+                    if let Some(placeholder) = placeholder {
+                        *signature = Some(placeholder.to_string());
+                        placed += 1;
+                    }
+                }
             }
         }
     }
     strip_opaque_raw_body(req);
-    let warning = format!(
-        "non-portable provider continuation state was omitted for fallback to '{}'",
-        target.model.display_name
-    );
+    let warning = if placed > 0 {
+        format!(
+            "non-portable provider continuation state was replaced with the provider's documented placeholder for fallback to '{}'",
+            target.model.display_name
+        )
+    } else {
+        format!(
+            "non-portable provider continuation state was omitted for fallback to '{}'",
+            target.model.display_name
+        )
+    };
     trace.warn(warning.clone());
     tracing::warn!(route = %route.name, "{}", warning);
     Ok(())
@@ -4972,7 +5010,7 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, true, &report, &mut trace).unwrap();
+        apply_portability(&mut req, &route, &target, true, &report, None, &mut trace).unwrap();
 
         assert!(!request_has_opaque_state(&req));
         assert!(!trace.warnings.is_empty());
@@ -4995,7 +5033,10 @@ mod route_policy_tests {
         route.portability_policy = "reject".into();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        assert!(apply_portability(&mut req, &route, &target(), true, &report, &mut trace).is_err());
+        assert!(
+            apply_portability(&mut req, &route, &target(), true, &report, None, &mut trace)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5010,8 +5051,109 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        apply_portability(&mut req, &route, &target, false, &report, &mut trace).unwrap();
+        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
         assert_eq!(trace.warnings.len(), 1);
+    }
+
+    #[test]
+    fn portability_placeholder_translates_incompatible_stored_calls() {
+        // A stored signature exists for a different model in the same family:
+        // the target cannot carry the real value. With a documented placeholder
+        // the incompatible historical call is translated rather than left
+        // unsigned (which the provider would reject), while a call with no
+        // stored state is never given a signature it has no state for.
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![
+                crate::types::Part::ToolCall {
+                    id: Some("call_incompatible".into()),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                    signature: None,
+                },
+                crate::types::Part::ToolCall {
+                    id: Some("call_unrelated".into()),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                    signature: None,
+                },
+            ],
+        }];
+        let route = route(serde_json::json!({}));
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        let report = OpaqueHydrationReport {
+            incompatible: 1,
+            incompatible_ids: vec!["call_incompatible".into()],
+            ..Default::default()
+        };
+
+        apply_portability(
+            &mut req,
+            &route,
+            &target,
+            false,
+            &report,
+            Some("PLACEHOLDER"),
+            &mut trace,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &req.messages[0].parts[0],
+            crate::types::Part::ToolCall { signature: Some(sig), .. } if sig == "PLACEHOLDER"
+        ));
+        assert!(matches!(
+            &req.messages[0].parts[1],
+            crate::types::Part::ToolCall {
+                signature: None,
+                ..
+            }
+        ));
+        assert_eq!(trace.warnings.len(), 1);
+        assert!(
+            trace.warnings[0].contains("placeholder"),
+            "a substituted placeholder must be reported, got {:?}",
+            trace.warnings[0]
+        );
+    }
+
+    #[test]
+    fn portability_without_placeholder_strips_incompatible_stored_calls() {
+        // No adapter placeholder (e.g. an OpenAI target): the old behaviour
+        // stands, the incompatible call is stripped and the warning does not
+        // claim a substitution happened.
+        let mut req = request();
+        req.messages = vec![crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![crate::types::Part::ToolCall {
+                id: Some("call_incompatible".into()),
+                name: "bash".into(),
+                arguments: "{}".into(),
+                signature: None,
+            }],
+        }];
+        let route = route(serde_json::json!({}));
+        let target = target();
+        let mut trace = RouteTrace::new("req_test".into(), "route".into());
+        let report = OpaqueHydrationReport {
+            incompatible: 1,
+            incompatible_ids: vec!["call_incompatible".into()],
+            ..Default::default()
+        };
+
+        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+
+        assert!(matches!(
+            &req.messages[0].parts[0],
+            crate::types::Part::ToolCall {
+                signature: None,
+                ..
+            }
+        ));
+        assert_eq!(trace.warnings.len(), 1);
+        assert!(!trace.warnings[0].contains("placeholder"));
     }
 
     #[test]
@@ -5025,7 +5167,9 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        assert!(apply_portability(&mut req, &route, &target, false, &report, &mut trace).is_err());
+        assert!(
+            apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).is_err()
+        );
     }
 
     #[test]
@@ -5035,7 +5179,7 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, false, &report, &mut trace).unwrap();
+        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
         assert!(trace.warnings.is_empty());
     }
 
@@ -5111,7 +5255,7 @@ mod route_policy_tests {
 
         let inline = request_has_opaque_state(&req);
         assert!(inline);
-        apply_portability(&mut req, &route, &target, inline, &report, &mut trace).unwrap();
+        apply_portability(&mut req, &route, &target, inline, &report, None, &mut trace).unwrap();
         hydrate_opaque_state(&mut req, &report);
 
         assert_eq!(req.messages[0].parts.len(), 1);

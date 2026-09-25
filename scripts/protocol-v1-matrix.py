@@ -541,6 +541,68 @@ def run_http_case(case_id):
         continuation_turn(True)
         return
 
+    if case_id == "chat.translate.gemini.cross_model_placeholder":
+        # A trace that originated on one Gemini model and is continued on
+        # another. The stored signature is real but belongs to a different
+        # model: replaying it is wrong, and stripping it makes the provider
+        # reject the unsigned historical call. Gemini documents a placeholder
+        # for exactly this transfer, and the strict upstream accepts only that
+        # placeholder on the second model.
+        marker = "fixture:gemini-cross-model-placeholder"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+
+        first = {
+            "model": "syn-gemini",
+            "stream": False,
+            "messages": [{"role": "user", "content": marker}],
+            "tools": [tool],
+        }
+        status, _, body = request("/v1/chat/completions", first)
+        need(status == 200, f"cross-model turn 1: {status}: {body}")
+        calls = json.loads(body)["choices"][0]["message"].get("tool_calls") or []
+        need(len(calls) == 1, f"cross-model turn 1 calls: {calls}")
+        call_id = calls[0]["id"]
+        need(bool(call_id), "cross-model turn 1 tool call had no client-visible id")
+
+        second = {
+            "model": "syn-gemini-pro",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": marker},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                }]},
+                {"role": "tool", "tool_call_id": call_id, "content": "18C"},
+            ],
+            "tools": [tool],
+        }
+        status, headers, body = request("/v1/chat/completions", second)
+        need(status == 200, f"cross-model turn 2 (placeholder not substituted?): {status}: {body}")
+        need(
+            bool(headers.get("x-kinetix-warning")),
+            "a substituted cross-model placeholder must be reported to the client",
+        )
+
+        # Negative control: an id that was never captured has no state at all,
+        # so no placeholder is painted and the strict upstream rejects it. This
+        # proves the positive turn really used stored state rather than passing
+        # because the model accepts anything.
+        unknown = json.loads(json.dumps(second))
+        unknown["messages"][1]["tool_calls"][0]["id"] = "call_never_captured"
+        unknown["messages"][2]["tool_call_id"] = "call_never_captured"
+        status, _, _ = request("/v1/chat/completions", unknown)
+        need(status != 200, "an uncaptured id must not be given an invented placeholder")
+        return
+
     if case_id == "chat.fallback.tool_continuation":
         payload = {
             "model": "syn-fallback",

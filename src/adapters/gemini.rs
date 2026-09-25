@@ -13,6 +13,15 @@ use crate::types::{
     SamplingParams, StreamEvent, TokenUsage, ToolChoice, UpstreamFailure,
 };
 
+/// Google's documented sentinel for replaying a historical `functionCall` whose
+/// real `thoughtSignature` is not available to this request (for example a
+/// conversation transferred from a different Gemini model). Gemini accepts it
+/// in place of a real signature and skips signature validation, which keeps the
+/// call in the history instead of failing with HTTP 400. It is *not* real
+/// reasoning state; passing it trades reasoning continuity for a working turn.
+/// See <https://ai.google.dev/gemini-api/docs/thought-signatures>.
+pub const GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
 pub struct GeminiAdapter;
 
 impl GeminiAdapter {
@@ -778,12 +787,9 @@ impl Adapter for GeminiAdapter {
     }
 
     /// Native Gemini opts into automatic opaque `thoughtSignature`
-    /// persistence/replay (§6). The state family is deliberately the coarse
-    /// `"gemini"` protocol family rather than the exact model id: Google
-    /// documents thought-signature continuation as surviving a model switch on
-    /// the same provider, so scoping by exact model id would needlessly
-    /// invalidate valid continuation state on an ordinary model change. The
-    /// producer string is an adapter *encoding* version, bumped only if
+    /// persistence/replay (§6).
+    ///
+    /// The producer string is an adapter *encoding* version, bumped only if
     /// Kinetix's interpretation of the signature payload changes
     /// incompatibly — never the crate release version.
     fn opaque_state_target(
@@ -795,11 +801,20 @@ impl Adapter for GeminiAdapter {
             provider_id: model.provider_id.clone(),
             family: "gemini".to_string(),
             producer: "native:gemini:v1".to_string(),
-            // generateContent thought signatures are only replayed onto the
-            // exact model that produced them; cross-model restoration is not
-            // assumed.
+            // `generateContent` only accepts a thought signature on the model
+            // that produced it, so state is keyed by the exact model id and a
+            // model switch is reported non-portable rather than handed a
+            // maybe-invalid signature.
             model_id: model.upstream_id.clone(),
         })
+    }
+
+    /// `generateContent` documents an explicit placeholder for a historical
+    /// `functionCall` whose real signature cannot be reused: the sentinel keeps
+    /// the call in the conversation (with degraded reasoning continuity)
+    /// instead of failing the whole request with HTTP 400.
+    fn opaque_state_placeholder(&self, _model: &crate::db::ModelRow) -> Option<&'static str> {
+        Some(GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
     }
 }
 
@@ -1120,6 +1135,35 @@ mod schema_tests {
         assert_eq!(other_target.family, target.family);
         assert_eq!(other_target.producer, target.producer);
         assert_ne!(other_target.model_id, target.model_id);
+    }
+
+    #[test]
+    fn native_gemini_declares_the_documented_placeholder_signature() {
+        // Cross-model continuation keeps exact signatures model-scoped, so the
+        // target cannot carry the stored value; Gemini documents this sentinel
+        // for exactly that case, and the pipeline paints it instead of sending
+        // an unsigned (rejected) historical function call.
+        let model = crate::db::ModelRow {
+            id: "m".into(),
+            provider_id: "ai-studio".into(),
+            upstream_id: "gemini-3.8-pro".into(),
+            display_name: "Gemini 3.8 Pro".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        };
+        assert_eq!(
+            GeminiAdapter::new().opaque_state_placeholder(&model),
+            Some("skip_thought_signature_validator")
+        );
     }
 
     #[test]

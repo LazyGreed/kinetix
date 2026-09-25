@@ -105,6 +105,15 @@ models_path = "/models"
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
 
+  [[providers.models]]
+  upstream_id = "syn-gemini-pro"
+  display_name = "Synthetic Gemini Pro"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "vision", "reasoning", "tool_calling"]
+  thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+
 
 [[providers]]
 name = "Synth Failure"
@@ -262,6 +271,20 @@ max_attempts = 2
   [[routes.targets]]
   model = "Synth Gemini/syn-gemini"
   priority = 2
+  weight = 1
+
+
+# Cross-model Gemini continuation: a signature captured on syn-gemini must not
+# be replayed onto syn-gemini-pro; the documented placeholder is used instead.
+[[routes]]
+name = "syn-gemini-pro"
+strategy = "priority"
+max_attempts = 1
+portability_policy = "strip_with_warning"
+
+  [[routes.targets]]
+  model = "Synth Gemini/syn-gemini-pro"
+  priority = 1
   weight = 1
 
 

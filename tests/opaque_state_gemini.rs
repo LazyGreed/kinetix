@@ -6,6 +6,10 @@
 //! thought_signature" 400. That makes every passing assertion below evidence
 //! that Kinetix really captured, persisted, and replayed the signature rather
 //! than accidentally satisfying the mock.
+//!
+//! It is also model-strict: a signature captured on one Gemini model must
+//! never be replayed onto another, and a cross-model continuation must use the
+//! documented placeholder instead of a real-but-foreign signature.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -34,8 +38,37 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 const SIGNATURE: &str = "MOCK_GEMINI_SIGNATURE";
+/// The signature the `gemini-mock-pro` model produces. Used to prove that a
+/// Flash signature is never replayed onto Pro (and vice-versa).
+const SIGNATURE_PRO: &str = "MOCK_GEMINI_SIGNATURE_PRO";
+/// Google's documented placeholder for a historical function call whose real
+/// signature this model cannot carry (a trace transferred from another model).
+const GEMINI_PLACEHOLDER: &str = "skip_thought_signature_validator";
 const TOOL_CALL_ID: &str = "call_mock_1";
 const TOOL_NAME: &str = "get_weather";
+
+/// The exact signature a given upstream model is allowed to receive.
+fn expected_signature(model: &str) -> &'static str {
+    if model.ends_with("pro") {
+        SIGNATURE_PRO
+    } else {
+        SIGNATURE
+    }
+}
+
+/// How the mock classified a continuation request. `Invalid` is exactly what
+/// real Gemini rejects with HTTP 400.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Continuation {
+    Unrelated,
+    /// Every historical function call carried this model's exact signature.
+    Signed,
+    /// Every call carried the documented cross-model placeholder.
+    Placeholder,
+    /// A call was unsigned, or carried a signature that does not belong to
+    /// this model (e.g. another model's real signature).
+    Invalid,
+}
 
 #[derive(Clone, Default)]
 struct MockUpstream {
@@ -43,26 +76,45 @@ struct MockUpstream {
     /// Continuations that arrived with the expected signature on every
     /// function-call part.
     signed_continuations: Arc<AtomicUsize>,
-    /// Continuations that arrived unsigned (or with the wrong signature).
+    /// Continuations that arrived with the documented placeholder instead of a
+    /// real signature (cross-model transfer).
+    placeholder_continuations: Arc<AtomicUsize>,
+    /// Continuations that arrived unsigned, with a foreign model's signature,
+    /// or with no function-call part at all.
     unsigned_continuations: Arc<AtomicUsize>,
 }
 
 impl MockUpstream {
-    async fn record(&self, body: &Value) -> bool {
+    async fn record(&self, body: &Value) -> Continuation {
         self.requests.lock().await.push(body.clone());
+        if !contains_key(body, "functionResponse") {
+            return Continuation::Unrelated;
+        }
+        let expected = expected_signature(body.get("model").and_then(Value::as_str).unwrap_or(""));
         let calls = function_call_parts(body);
-        let missing = calls.is_empty()
-            || calls.iter().any(|part| {
-                part.get("thoughtSignature").and_then(Value::as_str) != Some(SIGNATURE)
-            });
-        if contains_key(body, "functionResponse") {
-            if missing {
-                self.unsigned_continuations.fetch_add(1, Ordering::SeqCst);
-            } else {
-                self.signed_continuations.fetch_add(1, Ordering::SeqCst);
+        let mut placeholder = false;
+        let mut invalid = calls.is_empty();
+        for part in &calls {
+            match part.get("thoughtSignature").and_then(Value::as_str) {
+                Some(sig) if sig == expected => {}
+                Some(GEMINI_PLACEHOLDER) => placeholder = true,
+                _ => {
+                    invalid = true;
+                    break;
+                }
             }
         }
-        missing
+        if invalid {
+            self.unsigned_continuations.fetch_add(1, Ordering::SeqCst);
+            Continuation::Invalid
+        } else if placeholder {
+            self.placeholder_continuations
+                .fetch_add(1, Ordering::SeqCst);
+            Continuation::Placeholder
+        } else {
+            self.signed_continuations.fetch_add(1, Ordering::SeqCst);
+            Continuation::Signed
+        }
     }
 }
 
@@ -95,13 +147,34 @@ fn function_call_parts(value: &Value) -> Vec<Value> {
     found
 }
 
+/// The upstream model id from a Gemini `.../models/<id>:method` path. The
+/// Gemini wire format carries the model in the URL, not the body.
+fn path_model(path: &str) -> Option<String> {
+    let rest = path.split("/models/").nth(1)?;
+    let id = rest.split([':', '?']).next()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 /// One mock server serves both a Gemini-wire and an OpenAI-wire provider so a
 /// Route can mix them and exercise portability across formats/providers.
-async fn upstream(State(mock): State<MockUpstream>, Json(body): Json<Value>) -> Response {
+async fn upstream(
+    State(mock): State<MockUpstream>,
+    uri: axum::http::Uri,
+    Json(body): Json<Value>,
+) -> Response {
     let is_gemini = contains_key(&body, "contents");
-    let missing = mock.record(&body).await;
+    // Gemini puts the model in the URL path, so resolve it from there first;
+    // falling back to the body keeps the OpenAI-wire path working.
+    let model = path_model(uri.path())
+        .or_else(|| {
+            body.get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
     let has_response = contains_key(&body, "functionResponse");
-    if is_gemini && has_response && missing {
+    let continuation = mock.record(&body).await;
+    if is_gemini && continuation == Continuation::Invalid {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -116,7 +189,7 @@ async fn upstream(State(mock): State<MockUpstream>, Json(body): Json<Value>) -> 
     }
 
     let sse = if is_gemini {
-        gemini_sse(has_response)
+        gemini_sse(&model, has_response)
     } else {
         openai_sse()
     };
@@ -127,7 +200,8 @@ async fn upstream(State(mock): State<MockUpstream>, Json(body): Json<Value>) -> 
         .unwrap()
 }
 
-fn gemini_sse(has_response: bool) -> String {
+fn gemini_sse(model: &str, has_response: bool) -> String {
+    let signature = expected_signature(model);
     let frames = if has_response {
         vec![
             json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "done"}]}}]}),
@@ -140,7 +214,7 @@ fn gemini_sse(has_response: bool) -> String {
         vec![
             json!({"candidates": [{"content": {"role": "model", "parts": [{
                 "functionCall": {"id": TOOL_CALL_ID, "name": TOOL_NAME, "args": {"city": "Paris"}},
-                "thoughtSignature": SIGNATURE
+                "thoughtSignature": signature
             }]}}]}),
             json!({
                 "candidates": [{"content": {"role": "model", "parts": []}, "finishReason": "STOP"}],
@@ -318,6 +392,29 @@ async fn setup() -> Harness {
     .await
     .unwrap();
 
+    // A second Gemini model on the same provider. State captured on one model
+    // must never be replayed onto the other; a cross-model continuation must
+    // use the documented placeholder instead.
+    let pro_model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "gemini-mock-pro",
+            display_name: "Gemini Mock Pro",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: json!(["text", "tool_calling"]),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
     let route_id = db::insert_route(
         &pool,
         &db::NewRoute {
@@ -334,6 +431,25 @@ async fn setup() -> Harness {
     .await
     .unwrap();
     db::insert_route_target(&pool, &route_id, None, &model_id, 1, 1, "{}", "{}")
+        .await
+        .unwrap();
+
+    let pro_route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "pro-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "strip_with_warning",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(&pool, &pro_route_id, None, &pro_model_id, 1, 1, "{}", "{}")
         .await
         .unwrap();
 
@@ -532,8 +648,12 @@ fn virtual_key(id: &str) -> db::VirtualKeyRow {
 }
 
 fn first_turn(stream: bool) -> InternalRequest {
+    first_turn_to("opaque-route", stream)
+}
+
+fn first_turn_to(model: &str, stream: bool) -> InternalRequest {
     InternalRequest {
-        requested_model: "opaque-route".into(),
+        requested_model: model.into(),
         system: vec![],
         messages: vec![Message {
             role: Role::User,
@@ -726,6 +846,103 @@ async fn translated_tool_signature_is_replayed_on_streaming_path() {
     .expect("streaming turn 2 should replay the signature");
 
     assert_eq!(harness.mock.signed_continuations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        harness.mock.unsigned_continuations.load(Ordering::SeqCst),
+        0
+    );
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn cross_model_flash_to_pro_continuation_uses_documented_placeholder() {
+    let harness = setup().await;
+    let key = virtual_key("key-flash-pro");
+
+    // Turn 1 runs on the flash model and stores its signature.
+    run(
+        &harness.state,
+        Some(&key),
+        first_turn_to("opaque-route", false),
+        "req_xmodel_fp_1",
+    )
+    .await
+    .expect("flash turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
+
+    // Turn 2 is routed to the *pro* model. The stored flash signature is not
+    // portable, so Kinetix must translate the historical call with Gemini's
+    // documented placeholder instead of stripping it (which the model rejects).
+    let (status, warning) = run_with_warning(
+        &harness.state,
+        Some(&key),
+        second_turn_to("pro-route", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_xmodel_fp_2",
+    )
+    .await
+    .expect("a cross-model continuation must dispatch with the placeholder");
+    assert_eq!(status, 200);
+    assert!(
+        warning.as_deref().is_some_and(|value| !value.is_empty()),
+        "the substituted placeholder must be reported, got {warning:?}"
+    );
+    assert_eq!(
+        harness
+            .mock
+            .placeholder_continuations
+            .load(Ordering::SeqCst),
+        1,
+        "the pro model must have received the documented placeholder"
+    );
+    assert_eq!(
+        harness.mock.signed_continuations.load(Ordering::SeqCst),
+        0,
+        "flash's real signature must never be replayed onto pro"
+    );
+    assert_eq!(
+        harness.mock.unsigned_continuations.load(Ordering::SeqCst),
+        0
+    );
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn cross_model_pro_to_flash_continuation_uses_documented_placeholder() {
+    let harness = setup().await;
+    let key = virtual_key("key-pro-flash");
+
+    run(
+        &harness.state,
+        Some(&key),
+        first_turn_to("pro-route", false),
+        "req_xmodel_pf_1",
+    )
+    .await
+    .expect("pro turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
+
+    let (status, warning) = run_with_warning(
+        &harness.state,
+        Some(&key),
+        second_turn_to("opaque-route", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_xmodel_pf_2",
+    )
+    .await
+    .expect("a cross-model continuation must dispatch with the placeholder");
+    assert_eq!(status, 200);
+    assert!(
+        warning.as_deref().is_some_and(|value| !value.is_empty()),
+        "the substituted placeholder must be reported, got {warning:?}"
+    );
+    assert_eq!(
+        harness
+            .mock
+            .placeholder_continuations
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(harness.mock.signed_continuations.load(Ordering::SeqCst), 0);
     assert_eq!(
         harness.mock.unsigned_continuations.load(Ordering::SeqCst),
         0

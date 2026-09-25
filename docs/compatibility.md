@@ -109,6 +109,14 @@ replayed the signature without the client ever seeing it. The same case includes
 negative control: a never-seen tool-call id must *not* be given an invented
 signature, and the strict upstream rejects it.
 
+The `chat.translate.gemini.cross_model_placeholder` case continues a trace that
+started on one Gemini model onto a second model. The strict upstream accepts only
+the provider's documented `skip_thought_signature_validator` placeholder on the
+second model and rejects both an unsigned call and the first model's real
+signature, so a 200 is evidence that Kinetix substituted the documented
+placeholder rather than replaying a foreign signature or stripping the call. Its
+negative control proves an uncaptured id is never given an invented placeholder.
+
 Positive mixed fixtures send the documented sampling, tool-choice, vision, and
 reasoning fields. `scripts/synthetic_upstream.py` rejects the request if required
 translated wire fields are missing, so a 200 response is evidence that those fields
@@ -284,7 +292,9 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   a bounded background worker: a slow or locked database can never stall the
   streaming tool-call event, the immediately following request never races
   persistence (the RAM entry is already present), and a saturated durability
-  queue drops the write with a counter rather than blocking the response.
+  queue drops the write with a counter rather than blocking the response. A
+  graceful shutdown flushes the queue after request draining, so a signature the
+  client was already told was accepted survives a restart.
 - **Replay.** On the next request, tool-call parts whose signature slot is empty
   are looked up. A compatible value is restored onto the exact historical part
   before dispatch. An explicit client/canonical signature is never overwritten,
@@ -292,12 +302,13 @@ Kinetix keeps this state host-side instead of pushing it through the client:
 - **Scope and compatibility.** Replay is scoped to the originating virtual key.
   A stored value is only reused when the target's provider id, protocol family,
   producer, and **exact originating model** all match; the account may change
-  (same-provider account failover stays compatible). Cross-model restoration is
-  deliberately not attempted: Google's `generateContent` contract only
-  guarantees a signature is accepted by the model that produced it, and
-  switching models is documented to require dummy signatures rather than reuse
-  of the original one. Reusing a tool-call id with a *different* tool name is
-  rejected with HTTP 400 before any upstream request is sent.
+  (same-provider account failover stays compatible). The originating model is
+  deliberately part of the identity: Google's `generateContent` contract only
+  guarantees a signature is accepted by the model that produced it. A cross-model
+  continuation is reported non-portable and translated with the documented
+  placeholder (see below) rather than reusing the original signature. Reusing a
+  tool-call id with a *different* tool name is rejected with HTTP 400 before any
+  upstream request is sent.
 - **Portability.** Stored state that the selected target cannot carry feeds the
   Route's existing `reject` / `strip_with_warning` portability policy exactly
   like inline client state — including when neither the provider nor the wire
@@ -307,6 +318,18 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   `strip_with_warning` boundary never deletes state that the chosen target can
   use, and a direct cross-format target with no Route refuses known non-portable
   state instead of silently dropping it.
+- **Cross-model continuation.** Exact-model scoping stops a real signature from
+  being replayed onto a model that did not produce it, but leaving the
+  historical `functionCall` unsigned would still fail the next `generateContent`
+  call. When the target adapter declares a documented placeholder for
+  non-portable state (the Gemini adapter returns the provider's
+  `skip_thought_signature_validator` sentinel), a `strip_with_warning` Route
+  substitutes that placeholder onto the specific incompatible historical call
+  instead of stripping it, and reports the substitution in the
+  `X-Kinetix-Warning` header. The placeholder is painted only onto calls the
+  store knew about but the target cannot carry — an id that was never captured is
+  still left untouched, so missing state is never invented. A `reject` Route and a
+  direct target with no Route policy still refuse before dispatch.
 - **Observability.** `GET /admin/metrics` exports
   `kinetix_opaque_state_entries`, `kinetix_opaque_state_captured_total`,
   `kinetix_opaque_state_replaced_total`,
