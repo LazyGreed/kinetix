@@ -142,11 +142,15 @@ impl AnthropicAdapter {
             .tools
             .iter()
             .map(|t| {
-                json!({
+                let mut tool = json!({
                     "name": t.name,
                     "description": t.description.clone().unwrap_or_default(),
                     "input_schema": if t.parameters.is_null() { json!({"type":"object","properties":{}}) } else { t.parameters.clone() }
-                })
+                });
+                if let Some(defer_loading) = t.defer_loading {
+                    tool["defer_loading"] = json!(defer_loading);
+                }
+                tool
             })
             .collect();
         Some(Value::Array(tools))
@@ -924,11 +928,15 @@ mod tests {
                 name: "read".into(),
                 description: Some("read a file".into()),
                 parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            
+                defer_loading: None,
             },
             ToolDef {
                 name: "write".into(),
                 description: Some("write a file".into()),
                 parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            
+                defer_loading: None,
             },
         ];
         let ctx = UpstreamContext {
@@ -973,6 +981,8 @@ mod tests {
             name: "read".into(),
             description: Some("read a file".into()),
             parameters: json!({"type":"object"}),
+        
+            defer_loading: None,
         }];
         let mut second = first.clone();
         second.messages.push(Message {
@@ -1003,6 +1013,8 @@ mod tests {
             name: "read".into(),
             description: None,
             parameters: json!({"type":"object"}),
+        
+            defer_loading: None,
         }];
         let ctx = UpstreamContext {
             provider: &p,
@@ -1048,17 +1060,70 @@ mod tests {
     }
 
     #[test]
-    fn cache_tool_anchor_skips_deferred_tools() {
-        let mut tools = json!([
-            {"name":"cacheable","input_schema":{"type":"object"}},
-            {"name":"deferred","defer_loading":true,"input_schema":{"type":"object"}}
-        ]);
-        mark_last_cacheable_tool(&mut tools);
+    fn anthropic_frontend_preserves_defer_loading_in_canonical_tools() {
+        let req = crate::frontends::anthropic::decode_request(json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role":"user","content":"Hello"}],
+            "tools": [{
+                "name": "deferred",
+                "description": "loaded on demand",
+                "input_schema": {"type":"object","properties":{}},
+                "defer_loading": true
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(req.tools[0].defer_loading, Some(true));
+    }
+
+    #[test]
+    fn translated_request_preserves_deferred_tool_and_anchors_previous_tool() {
+        let req = crate::frontends::openai::decode_request(json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role":"user","content":"Hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "cacheable",
+                        "description": "always loaded",
+                        "parameters": {"type":"object","properties":{}}
+                    }
+                },
+                {
+                    "type": "function",
+                    "defer_loading": true,
+                    "function": {
+                        "name": "deferred",
+                        "description": "loaded on demand",
+                        "parameters": {"type":"object","properties":{}}
+                    }
+                }
+            ],
+            "stream": true
+        }))
+        .unwrap();
+        assert_eq!(req.tools[1].defer_loading, Some(true));
+
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+
+        assert_eq!(tools[1]["defer_loading"], true);
+        assert!(tools[1].get("cache_control").is_none());
         assert_eq!(
             tools[0]["cache_control"],
             json!({"type":"ephemeral","ttl":"1h"})
         );
-        assert!(tools[1].get("cache_control").is_none());
     }
 
     #[test]
@@ -1075,6 +1140,8 @@ mod tests {
             name: "read".into(),
             description: None,
             parameters: json!({"type":"object"}),
+        
+            defer_loading: None,
         }];
 
         let sonnet_ctx = UpstreamContext {

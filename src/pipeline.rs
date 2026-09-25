@@ -4902,6 +4902,8 @@ mod route_policy_tests {
                 },
                 "required": ["path"]
             }),
+        
+            defer_loading: None,
         });
 
         assert!(estimated_input_tokens(&with_tool) > base_count);

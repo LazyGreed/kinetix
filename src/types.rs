@@ -389,6 +389,8 @@ pub struct ToolDef {
     pub description: Option<String>,
     #[serde(default)]
     pub parameters: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -392,6 +392,7 @@ fn decode_tools(tools: Option<&Value>) -> Vec<ToolDef> {
                 .get("input_schema")
                 .cloned()
                 .unwrap_or(json!({ "type": "object", "properties": {} })),
+            defer_loading: t.get("defer_loading").and_then(Value::as_bool),
         });
     }
     out
