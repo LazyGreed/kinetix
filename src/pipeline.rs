@@ -632,7 +632,7 @@ pub async fn run(
             trace.step(
                 "skip",
                 Some(t.account.label.clone()),
-                "provider not permitted by virtual key",
+                format!("model={} provider_not_permitted", t.model.display_name),
             );
             return false;
         }
@@ -640,7 +640,7 @@ pub async fn run(
             trace.step(
                 "skip",
                 Some(t.model.display_name.clone()),
-                "capabilities unsatisfied (strict provider)",
+                format!("model={} capability mismatch", t.model.display_name),
             );
             return false;
         }
@@ -649,7 +649,10 @@ pub async fn run(
                 trace.step(
                     "skip",
                     Some(t.model.display_name.clone()),
-                    format!("input exceeds context window ({ctx})"),
+                    format!(
+                        "model={} context-window mismatch: input exceeds context window ({ctx})",
+                        t.model.display_name
+                    ),
                 );
                 return false;
             }
@@ -791,8 +794,9 @@ pub async fn run(
                     format!("half-open recovery probe ({})", status.as_str()),
                 );
             } else {
-                let why = format!("{}:skipped({})", target.account.label, status.as_str());
-                meta.fallback_path.push(why.clone());
+                let why = account_skip_detail(target, status);
+                meta.fallback_path
+                    .push(format!("{}:{why}", target.account.label));
                 trace.step("skip", Some(target.account.label.clone()), why);
                 state.record_skip();
                 continue;
@@ -814,7 +818,7 @@ pub async fn run(
             trace.step(
                 "skip",
                 Some(target.account.label.clone()),
-                "soft quota reached",
+                format!("model={} soft quota reached", target.model.display_name),
             );
             state.record_skip();
             if !allow_fallback
@@ -2152,6 +2156,36 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             ProxyError::upstream(failure.message.clone())
         }
     }
+}
+
+fn account_skip_detail(target: &ResolvedTarget, status: pool::AccountStatus) -> String {
+    let mut detail = format!(
+        "model={} skipped({}); effective_status={}",
+        target.model.display_name,
+        status.as_str(),
+        status.as_str()
+    );
+    match status {
+        pool::AccountStatus::Cooldown => {
+            if let Some(until) = target.account.cooldown_until.as_deref() {
+                detail.push_str(&format!("; cooldown_until={until}"));
+            }
+        }
+        pool::AccountStatus::Exhausted => {
+            if let Some(reset) = target.account.quota_reset_at.as_deref() {
+                detail.push_str(&format!("; quota_reset_at={reset}"));
+            }
+        }
+        pool::AccountStatus::CircuitOpen => {
+            detail.push_str("; circuit_prevented_execution=true");
+            if let Some(until) = target.account.circuit_open_until.as_deref() {
+                detail.push_str(&format!("; circuit_open_until={until}"));
+            }
+        }
+        pool::AccountStatus::Disabled => {}
+        pool::AccountStatus::Healthy => {}
+    }
+    detail
 }
 
 /// Select healthy accounts for a provider's pool (single-model route).
