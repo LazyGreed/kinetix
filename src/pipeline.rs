@@ -4387,6 +4387,9 @@ mod route_policy_tests {
             assert!(kind.is_retryable());
             assert!(!kind.is_account_scoped());
         }
+        for kind in [FailureKind::TargetError, FailureKind::BadRequest] {
+            assert!(!kind.is_account_scoped());
+        }
         for kind in [
             FailureKind::RateLimit,
             FailureKind::QuotaExhausted,
