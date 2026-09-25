@@ -1522,7 +1522,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                       </label>
                       <input
                         type="number"
-                        step={0.01}
+                        step="any"
                         min={0}
                         value={value ?? ''}
                         placeholder="unknown"
