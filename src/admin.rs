@@ -4401,10 +4401,32 @@ pub async fn import_config(
         let allow_insecure_tls = p["allow_insecure_tls"].as_bool().unwrap_or(false);
         let custom_header = p["custom_header_name"].as_str();
         let custom_param = p["custom_param_name"].as_str();
-        if let Some(existing) = provider_ids.get(name) {
+        let explicit_mode = p["credential_mode"]
+            .as_str()
+            .and_then(crate::plugins::CredentialMode::parse);
+
+        if let Some(existing_id) = provider_ids.get(name).cloned() {
+            let existing = db::get_provider(&state.pool, &existing_id)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("provider not found"))?;
+            let credential_mode = explicit_mode
+                .or_else(|| crate::plugins::CredentialMode::parse(&existing.credential_mode))
+                .unwrap_or(crate::plugins::CredentialMode::Manual);
+            let source_plugin_id = if p.get("source_plugin_id").is_some() {
+                p["source_plugin_id"].as_str().map(str::to_string)
+            } else {
+                existing.source_plugin_id.clone()
+            };
+            let source_integration_id = if p.get("source_integration_id").is_some() {
+                p["source_integration_id"].as_str().map(str::to_string)
+            } else {
+                existing.source_integration_id.clone()
+            };
+
             db::update_provider(
                 &state.pool,
-                existing,
+                &existing_id,
                 name,
                 base_url,
                 wire,
@@ -4425,7 +4447,19 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::internal)?;
+            db::update_provider_credential_semantics(
+                &state.pool,
+                &existing_id,
+                credential_mode.as_str(),
+                source_plugin_id.as_deref(),
+                source_integration_id.as_deref(),
+            )
+            .await
+            .map_err(ApiError::internal)?;
+            reconcile_provider_account_mode(&state, &existing_id, credential_mode).await?;
         } else {
+            let credential_mode =
+                explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
             let id = db::insert_provider(
                 &state.pool,
                 &db::NewProvider {
@@ -4446,28 +4480,39 @@ pub async fn import_config(
                     wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
                     credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
                     model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
-                    credential_mode: p["credential_mode"].as_str().unwrap_or("manual"),
+                    credential_mode: credential_mode.as_str(),
                     source_plugin_id: p["source_plugin_id"].as_str(),
                     source_integration_id: p["source_integration_id"].as_str(),
                 },
             )
             .await
             .map_err(ApiError::internal)?;
+            reconcile_provider_account_mode(&state, &id, credential_mode).await?;
             provider_ids.insert(name.to_string(), id);
         }
     }
 
     // Accounts: only created when they carry an encrypted secret blob; an
     // account without a secret cannot be materialized (FR-3.4 write-only).
+    // Accounts: only restored when the provider mode permits credentials and
+    // the export carries an encrypted secret blob. Internal no-auth accounts
+    // are always synthesized by reconciliation, never imported as user state.
     for a in accounts {
         let provider = a["provider"].as_str().unwrap_or("");
         let Some(pid) = provider_ids.get(provider) else {
             continue;
         };
+        let provider_row = db::get_provider(&state.pool, pid)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("provider not found"))?;
+        let label = a["label"].as_str().unwrap_or("Default key");
+        if provider_row.credential_mode == "none" || label == "__kinetix_noauth__" {
+            continue;
+        }
         let Some(secret_enc) = a["secret_enc"].as_str() else {
             continue;
         };
-        let label = a["label"].as_str().unwrap_or("Default key");
         let exists = db::accounts_for_provider(&state.pool, pid)
             .await
             .map_err(ApiError::internal)?
