@@ -11,6 +11,7 @@ use crate::credentials::{CredentialRotationError, CredentialStrategy, StaticKeyS
 use crate::crypto::Crypto;
 use crate::db::Pool;
 use crate::logqueue::UsageLogQueue;
+use crate::opaque_state::OpaqueStateStore;
 use crate::registry::Registry;
 use crate::trace::FlightRecorder;
 
@@ -40,6 +41,9 @@ pub struct AppState {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Diagnostic flight recorder (FR-13).
     pub flight: Arc<FlightRecorder>,
+    /// Host-owned opaque provider continuation-state store (Gemini
+    /// `thoughtSignature` persistence/replay for translated frontends).
+    pub opaque_state: Arc<OpaqueStateStore>,
     /// Session id -> last successful route target. Used for optional
     /// sticky/cache affinity and FR-2.11 opaque-state provenance. TTL-bounded.
     sticky: Arc<DashMap<String, StickyEntry>>,
@@ -134,6 +138,8 @@ impl AppState {
         log_queue: UsageLogQueue,
         config_ip_limit: u64,
     ) -> Self {
+        let pool_clone = pool.clone();
+        let crypto_clone = crypto.clone();
         let credentials = Arc::new(StaticKeyStrategy::new(crypto.clone()));
         let sessions = Arc::new(crate::auth::Sessions::new(config.session_ttl_minutes));
         let plugin_auth_sessions = Arc::new(crate::auth::PluginAuthSessions::new());
@@ -153,6 +159,7 @@ impl AppState {
             log_queue,
             started_at: chrono::Utc::now(),
             flight: Arc::new(FlightRecorder::new(512, 128)),
+            opaque_state: Arc::new(OpaqueStateStore::new(pool_clone, crypto_clone)),
             live: crate::live::LiveRequests::new(512),
             sticky: Arc::new(DashMap::new()),
             rr_counters: Arc::new(DashMap::new()),

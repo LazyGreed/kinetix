@@ -40,6 +40,7 @@ pub mod live;
 pub mod logqueue;
 pub mod model_catalog;
 pub mod net;
+pub mod opaque_state;
 pub mod outbound;
 pub mod passthrough;
 pub mod paths;
