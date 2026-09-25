@@ -13,6 +13,27 @@ use crate::types::{
 
 pub struct AnthropicAdapter;
 
+fn is_claude_code_oauth(ctx: &UpstreamContext<'_>) -> bool {
+    ctx.credential.starts_with("sk-ant-oat")
+        || ctx.provider.credential_plugin.contains("claude-code")
+}
+
+fn mark_last_cacheable_tool(tools: &mut Value) {
+    let Some(tools) = tools.as_array_mut() else {
+        return;
+    };
+    if let Some(tool) = tools.iter_mut().rev().find(|tool| {
+        tool.get("defer_loading").and_then(Value::as_bool) != Some(true)
+    }) {
+        if let Some(tool) = tool.as_object_mut() {
+            tool.insert(
+                "cache_control".to_string(),
+                json!({ "type": "ephemeral", "ttl": "1h" }),
+            );
+        }
+    }
+}
+
 fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
     let parts: Vec<&str> = path.split('.').collect();
     insert_dotted_rec(obj, &parts, value);
@@ -313,8 +334,7 @@ impl Adapter for AnthropicAdapter {
         mut req: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
-        if ctx.credential.starts_with("sk-ant-oat")
-            || ctx.provider.credential_plugin.contains("claude-code")
+        if is_claude_code_oauth(ctx)
         {
             req = req.header("user-agent", "claude-cli/1.18.31 (external, cli)");
         }
@@ -361,9 +381,7 @@ impl Adapter for AnthropicAdapter {
             }
         }
 
-        if ctx.credential.starts_with("sk-ant-oat")
-            || ctx.provider.credential_plugin.contains("claude-code")
-        {
+        if is_claude_code_oauth(ctx) {
             const BILLING_HEADER: &str =
                 "x-anthropic-billing-header: cc_version=1.18.31; cc_entrypoint=cli; cch=00000;";
             const SENTINEL: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -380,7 +398,27 @@ impl Adapter for AnthropicAdapter {
         }
 
         if !system.is_empty() {
-            body.insert("system".to_string(), json!(system.join("\n\n")));
+            if is_claude_code_oauth(ctx) {
+                let last = system.len().saturating_sub(1);
+                let blocks = system
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        if index == last {
+                            json!({
+                                "type": "text",
+                                "text": text,
+                                "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                            })
+                        } else {
+                            json!({ "type": "text", "text": text })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                body.insert("system".to_string(), Value::Array(blocks));
+            } else {
+                body.insert("system".to_string(), json!(system.join("\n\n")));
+            }
         }
         body.insert("messages".to_string(), json!(Self::build_messages(req)));
 
@@ -417,7 +455,10 @@ impl Adapter for AnthropicAdapter {
             body.insert("stop_sequences".to_string(), json!(req.params.stop));
         }
 
-        if let Some(tools) = Self::build_tools(req) {
+        if let Some(mut tools) = Self::build_tools(req) {
+            if is_claude_code_oauth(ctx) {
+                mark_last_cacheable_tool(&mut tools);
+            }
             body.insert("tools".to_string(), tools);
         }
         if let Some(tc) = Self::build_tool_choice(req) {
@@ -748,7 +789,7 @@ mod tests {
         assert!((1..=60).contains(&delay));
     }
     use crate::db::{ModelRow, ProviderRow};
-    use crate::types::Message;
+    use crate::types::{Message, ToolDef};
 
     fn provider() -> ProviderRow {
         ProviderRow {
@@ -835,6 +876,141 @@ mod tests {
                 .as_deref(),
             Some("https://api.anthropic.com/v1/messages/count_tokens")
         );
+    }
+
+    #[test]
+    fn claude_code_translated_request_adds_stable_cache_anchors() {
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let m = model();
+        let mut req = base_request();
+        req.system = vec!["stable project instructions".into()];
+        req.tools = vec![
+            ToolDef {
+                name: "read".into(),
+                description: Some("read a file".into()),
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            },
+            ToolDef {
+                name: "write".into(),
+                description: Some("write a file".into()),
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            },
+        ];
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        let system = body["system"].as_array().expect("structured system");
+        assert_eq!(
+            system.last().unwrap()["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(
+            tools[1]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+
+        let markers = system
+            .iter()
+            .filter(|block| block.get("cache_control").is_some())
+            .count()
+            + tools
+                .iter()
+                .filter(|tool| tool.get("cache_control").is_some())
+                .count();
+        assert_eq!(markers, 2);
+    }
+
+    #[test]
+    fn claude_code_cache_prefix_is_stable_across_turns() {
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let m = model();
+        let mut first = base_request();
+        first.system = vec!["stable project instructions".into()];
+        first.tools = vec![ToolDef {
+            name: "read".into(),
+            description: Some("read a file".into()),
+            parameters: json!({"type":"object"}),
+        }];
+        let mut second = first.clone();
+        second.messages.push(Message {
+            role: Role::User,
+            parts: vec![Part::Text("next turn".into())],
+        });
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+
+        let first_body = AnthropicAdapter::new().build_body(&ctx, &first).unwrap();
+        let second_body = AnthropicAdapter::new().build_body(&ctx, &second).unwrap();
+        assert_eq!(first_body["system"], second_body["system"]);
+        assert_eq!(first_body["tools"], second_body["tools"]);
+        assert_ne!(first_body["messages"], second_body["messages"]);
+    }
+
+    #[test]
+    fn non_claude_translated_request_does_not_generate_cache_controls() {
+        let p = provider();
+        let m = model();
+        let mut req = base_request();
+        req.system = vec!["system".into()];
+        req.tools = vec![ToolDef {
+            name: "read".into(),
+            description: None,
+            parameters: json!({"type":"object"}),
+        }];
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        assert!(body["system"].is_string());
+        assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn passthrough_normalization_preserves_client_cache_controls() {
+        let p = provider();
+        let m = model();
+        let req = base_request();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+        let mut body = json!({
+            "model": "claude-sonnet-5",
+            "stream": true,
+            "system": [{
+                "type": "text",
+                "text": "stable",
+                "cache_control": {"type":"ephemeral","ttl":"1h"}
+            }],
+            "messages": [{"role":"user","content":"hello"}],
+            "max_tokens": 128
+        });
+        let before = body.clone();
+
+        AnthropicAdapter::new()
+            .normalize_passthrough_body(&ctx, &req, &mut body)
+            .unwrap();
+
+        assert_eq!(body, before);
     }
 
     #[test]
