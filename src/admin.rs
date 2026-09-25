@@ -4330,6 +4330,96 @@ pub async fn export_config(
     })))
 }
 
+async fn validate_imported_provider_credential_semantics(
+    state: &AppState,
+    name: &str,
+    credential_mode: crate::plugins::CredentialMode,
+    credential_plugin: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+) -> Result<(), String> {
+    match credential_mode {
+        crate::plugins::CredentialMode::None => {
+            if !credential_plugin.trim().is_empty() {
+                return Err(format!(
+                    "provider '{name}': credential_mode 'none' may not declare credential_plugin"
+                ));
+            }
+        }
+        crate::plugins::CredentialMode::AuthFlow => {
+            let plugin_id = source_plugin_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "provider '{name}': credential_mode 'auth_flow' requires source_plugin_id"
+                    )
+                })?;
+            let integration_id = source_integration_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "provider '{name}': credential_mode 'auth_flow' requires source_integration_id"
+                    )
+                })?;
+            let binding = crate::plugins::PluginRef::parse(credential_plugin).ok_or_else(|| {
+                format!(
+                    "provider '{name}': credential_mode 'auth_flow' requires a credential_plugin binding"
+                )
+            })?;
+            if binding.plugin_id != plugin_id {
+                return Err(format!(
+                    "provider '{name}': credential_plugin does not match source_plugin_id"
+                ));
+            }
+
+            // Preserve portable exports when the plugin is not installed yet.
+            // Once present, its manifest becomes authoritative for integration
+            // identity and the exact credential strategy binding.
+            if let Some(manager) = state.plugin_manager() {
+                if let Some(row) = manager
+                    .get(plugin_id)
+                    .await
+                    .map_err(|error| format!("provider '{name}': {error}"))?
+                {
+                    let manifest = row.manifest().ok_or_else(|| {
+                        format!("provider '{name}': source plugin manifest is unreadable")
+                    })?;
+                    let integration = manifest
+                        .integrations
+                        .iter()
+                        .find(|integration| integration.id == integration_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "provider '{name}': source integration '{integration_id}' is unavailable"
+                            )
+                        })?;
+                    if integration.effective_credential_mode(&manifest.permissions)
+                        != crate::plugins::CredentialMode::AuthFlow
+                    {
+                        return Err(format!(
+                            "provider '{name}': source integration '{integration_id}' is not an auth_flow integration"
+                        ));
+                    }
+                    let strategy = integration.credential_strategy.as_deref().ok_or_else(|| {
+                        format!(
+                            "provider '{name}': source integration '{integration_id}' has no credential strategy"
+                        )
+                    })?;
+                    let expected_binding = format!("plugin:{plugin_id}/{strategy}");
+                    if credential_plugin != expected_binding {
+                        return Err(format!(
+                            "provider '{name}': credential_plugin does not match source integration '{integration_id}'"
+                        ));
+                    }
+                }
+            }
+        }
+        crate::plugins::CredentialMode::Manual => {}
+    }
+
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct ImportBody {
     pub config: Value,
@@ -4377,26 +4467,64 @@ pub async fn import_config(
                 p["wire_format"].as_str().unwrap_or("")
             ));
         }
-        if let Some(mode) = p.get("credential_mode").filter(|mode| !mode.is_null()) {
-            match mode
-                .as_str()
-                .and_then(crate::plugins::CredentialMode::parse)
-            {
-                Some(_) => {}
-                None => problems.push(format!(
-                    "provider '{name}': credential_mode must be 'manual', 'auth_flow', or 'none'"
-                )),
-            }
-        }
-        let existing = db::list_providers(&state.pool)
+        let existing_provider = db::list_providers(&state.pool)
             .await
             .map_err(ApiError::internal)?
             .into_iter()
-            .any(|x| x.name == name);
+            .find(|provider| provider.name == name);
+        let explicit_mode = match p.get("credential_mode").filter(|mode| !mode.is_null()) {
+            Some(mode) => match mode
+                .as_str()
+                .and_then(crate::plugins::CredentialMode::parse)
+            {
+                Some(mode) => Some(mode),
+                None => {
+                    problems.push(format!(
+                        "provider '{name}': credential_mode must be 'manual', 'auth_flow', or 'none'"
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        let effective_mode = explicit_mode
+            .or_else(|| {
+                existing_provider.as_ref().and_then(|provider| {
+                    crate::plugins::CredentialMode::parse(&provider.credential_mode)
+                })
+            })
+            .unwrap_or(crate::plugins::CredentialMode::Manual);
+        let source_plugin_id = if p.get("source_plugin_id").is_some() {
+            p["source_plugin_id"].as_str()
+        } else {
+            existing_provider
+                .as_ref()
+                .and_then(|provider| provider.source_plugin_id.as_deref())
+        };
+        let source_integration_id = if p.get("source_integration_id").is_some() {
+            p["source_integration_id"].as_str()
+        } else {
+            existing_provider
+                .as_ref()
+                .and_then(|provider| provider.source_integration_id.as_deref())
+        };
+        if let Err(problem) = validate_imported_provider_credential_semantics(
+            &state,
+            name,
+            effective_mode,
+            p["credential_plugin"].as_str().unwrap_or(""),
+            source_plugin_id,
+            source_integration_id,
+        )
+        .await
+        {
+            problems.push(problem);
+        }
+
         plan.push(json!({
             "kind": "provider",
             "name": name,
-            "action": if existing { "update" } else { "create" },
+            "action": if existing_provider.is_some() { "update" } else { "create" },
         }));
     }
     for m in models {
