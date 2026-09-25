@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::credentials::{
@@ -22,7 +21,7 @@ use super::manager::PluginManager;
 /// The KV key prefix under which a plugin stores a leased secret.
 const LEASE_PREFIX: &str = "lease:";
 
-fn rotation_error(fault: super::runtime::PluginFault) -> CredentialRotationError {
+fn credential_error(fault: super::runtime::PluginFault) -> CredentialRotationError {
     match fault {
         super::runtime::PluginFault::PluginError {
             code,
@@ -59,17 +58,40 @@ impl PluginCredentialStrategy {
         }
     }
 
-    async fn lease_secret(&self, handle: &str) -> Result<String> {
+    async fn lease_secret(
+        &self,
+        handle: &str,
+    ) -> std::result::Result<String, CredentialRotationError> {
         let key = format!("{LEASE_PREFIX}{handle}");
         let bytes = super::store::kv_get(&self.pool, &self.crypto, &self.plugin_id, &key)
-            .await?
+            .await
+            .map_err(|error| {
+                CredentialRotationError::new(
+                    "plugin_internal",
+                    format!("reading plugin credential lease: {error}"),
+                    true,
+                    None,
+                )
+            })?
             .ok_or_else(|| {
-                anyhow!(
-                    "plugin '{}' returned lease '{handle}' but stored no secret for it",
-                    self.plugin_id
+                CredentialRotationError::new(
+                    "plugin_internal",
+                    format!(
+                        "plugin '{}' returned lease '{handle}' but stored no secret for it",
+                        self.plugin_id
+                    ),
+                    false,
+                    None,
                 )
             })?;
-        String::from_utf8(bytes).map_err(|_| anyhow!("leased credential is not utf-8"))
+        String::from_utf8(bytes).map_err(|_| {
+            CredentialRotationError::new(
+                "plugin_internal",
+                "leased credential is not utf-8",
+                false,
+                None,
+            )
+        })
     }
 }
 
@@ -79,7 +101,10 @@ impl CredentialStrategy for PluginCredentialStrategy {
         "plugin_credential_strategy"
     }
 
-    async fn resolve(&self, account: &AccountRow) -> Result<ResolvedCredential> {
+    async fn resolve(
+        &self,
+        account: &AccountRow,
+    ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
         let lease = self
             .manager
             .credential_resolve(
@@ -89,7 +114,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
                 &account.label,
             )
             .await
-            .map_err(|f| anyhow!("plugin credential error: {}", f.message()))?;
+            .map_err(credential_error)?;
         let secret = self.lease_secret(&lease.handle).await?;
         Ok(ResolvedCredential {
             secret,
@@ -106,7 +131,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
         self.manager
             .credential_rotate(&self.plugin_id, &account.provider_id, &account.id)
             .await
-            .map_err(rotation_error)
+            .map_err(credential_error)
     }
 
     async fn health(&self, account: &AccountRow) -> CredentialHealth {
@@ -134,7 +159,7 @@ mod tests {
 
     #[test]
     fn rotation_error_preserves_retryable_plugin_evidence() {
-        let error = rotation_error(PluginFault::PluginError {
+        let error = credential_error(PluginFault::PluginError {
             code: "upstream_unavailable".into(),
             message: "refresh endpoint unavailable".into(),
             retryable: true,
