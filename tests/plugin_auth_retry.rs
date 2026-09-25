@@ -206,7 +206,7 @@ impl CredentialStrategy for ResolveRefreshingCredential {
         let now = chrono::Utc::now();
         Ok(ResolvedCredential {
             secret: self.secret.lock().await.clone(),
-            expires_at: Some((now + chrono::Duration::hours(2)).to_rfc3339()),
+            expires_at: Some((now.to_owned() + chrono::Duration::hours(2)).to_rfc3339()),
             refresh_after: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
             rotated: stale,
         })
@@ -822,6 +822,34 @@ async fn confirmed_missing_account_forgets_refresh_schedule() {
 }
 
 #[tokio::test]
+async fn confirmed_missing_provider_forgets_refresh_schedule() {
+    let strategy = Arc::new(TestCredential::new(RotationMode::Success { delay_ms: 0 }));
+    let harness = setup(strategy, None, 1).await;
+    let missing_provider = "prov_missing";
+
+    harness.state.credential_refresh.observe(
+        missing_provider,
+        &harness.account_id,
+        &ResolvedCredential {
+            secret: "stale-token".into(),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
+            rotated: false,
+        },
+    );
+
+    harness.state.refresh_due_credentials().await;
+
+    let future = chrono::Utc::now() + chrono::Duration::minutes(2);
+    assert!(
+        harness.state.credential_refresh.claim_due(future).is_empty(),
+        "confirmed missing provider must permanently forget its refresh schedule"
+    );
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
 async fn transient_account_lookup_failure_keeps_refresh_schedule() {
     let strategy = Arc::new(TestCredential::new(RotationMode::Success { delay_ms: 0 }));
     let harness = setup(strategy, None, 1).await;
@@ -843,8 +871,8 @@ async fn transient_account_lookup_failure_keeps_refresh_schedule() {
     let future = chrono::Utc::now() + chrono::Duration::minutes(2);
     let due = harness.state.credential_refresh.claim_due(future);
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].provider_id, harness.provider_id);
-    assert_eq!(due[0].account_id, harness.account_id);
+    assert_eq!(due[0].provider_id.as_str(), harness.provider_id.as_str());
+    assert_eq!(due[0].account_id.as_str(), harness.account_id.as_str());
 
     cleanup(harness).await;
 }
