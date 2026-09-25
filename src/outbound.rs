@@ -21,8 +21,8 @@ const MAX_PINNED_CLIENTS: usize = 256;
 /// TCP/TLS establishment has its own bound. Provider `timeout_ms` is enforced
 /// by the pipeline as first-event/idle phase budgets, never as total wall time.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_EMPTY_BAD_GATEWAY_RETRIES: usize = 1;
-const EMPTY_BAD_GATEWAY_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_TRANSIENT_GATEWAY_RETRIES: usize = 1;
+const TRANSIENT_GATEWAY_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ResolvedDestination {
@@ -249,16 +249,19 @@ fn redirected_method(status: StatusCode, method: &Method) -> (Method, bool) {
 /// Every redirect target is re-resolved and revalidated. Provider credentials
 /// and provider-defined headers are stripped at each hop and only reapplied when
 /// the redirect host is authorized by the provider credential binding.
-fn should_retry_empty_bad_gateway(
+fn should_retry_transient_gateway(
     accept_event_stream: bool,
     status: StatusCode,
-    content_length: Option<u64>,
     retries_done: usize,
 ) -> bool {
     accept_event_stream
-        && retries_done < MAX_EMPTY_BAD_GATEWAY_RETRIES
-        && status == StatusCode::BAD_GATEWAY
-        && content_length == Some(0)
+        && retries_done < MAX_TRANSIENT_GATEWAY_RETRIES
+        && matches!(
+            status,
+            StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        )
 }
 
 pub async fn send_provider_request(
@@ -281,20 +284,20 @@ pub async fn send_provider_request(
         )
         .await?;
 
-        if should_retry_empty_bad_gateway(
+        if should_retry_transient_gateway(
             request.accept_event_stream,
             response.status(),
-            response.content_length(),
             retries_done,
         ) {
             retries_done += 1;
             tracing::warn!(
                 account_id = ctx.account_id.unwrap_or("<unknown>"),
                 provider = %ctx.provider.name,
+                status = %response.status(),
                 retry = retries_done,
-                "retrying empty upstream 502 before route fallback"
+                "retrying transient upstream gateway failure before route fallback"
             );
-            tokio::time::sleep(EMPTY_BAD_GATEWAY_BACKOFF).await;
+            tokio::time::sleep(TRANSIENT_GATEWAY_BACKOFF).await;
             continue;
         }
 
@@ -444,41 +447,34 @@ mod tests {
     }
 
     #[test]
-    fn retries_only_explicitly_empty_streaming_bad_gateways() {
-        assert!(should_retry_empty_bad_gateway(
-            true,
+    fn retries_only_transient_streaming_gateway_failures_once() {
+        for status in [
             StatusCode::BAD_GATEWAY,
-            Some(0),
-            0,
-        ));
-        assert!(!should_retry_empty_bad_gateway(
-            true,
-            StatusCode::BAD_GATEWAY,
-            Some(1),
-            0,
-        ));
-        assert!(!should_retry_empty_bad_gateway(
-            true,
-            StatusCode::BAD_GATEWAY,
-            None,
-            0,
-        ));
-        assert!(!should_retry_empty_bad_gateway(
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(should_retry_transient_gateway(true, status, 0));
+            assert!(!should_retry_transient_gateway(true, status, 1));
+        }
+
+        assert!(!should_retry_transient_gateway(
             false,
             StatusCode::BAD_GATEWAY,
-            Some(0),
             0,
         ));
-        assert!(!should_retry_empty_bad_gateway(
+        assert!(!should_retry_transient_gateway(
             true,
-            StatusCode::BAD_GATEWAY,
-            Some(0),
-            1,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            0,
         ));
-        assert!(!should_retry_empty_bad_gateway(
+        assert!(!should_retry_transient_gateway(
             true,
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some(0),
+            StatusCode::TOO_MANY_REQUESTS,
+            0,
+        ));
+        assert!(!should_retry_transient_gateway(
+            true,
+            StatusCode::BAD_REQUEST,
             0,
         ));
     }
