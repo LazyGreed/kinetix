@@ -881,6 +881,18 @@ mod tests {
         }
     }
 
+    fn rendered_system_text(body: &Value) -> String {
+        match body.get("system") {
+            Some(Value::String(system)) => system.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            _ => panic!("system prompt present"),
+        }
+    }
+
     #[test]
     fn count_tokens_url_uses_messages_subresource() {
         let p = provider();
@@ -1220,10 +1232,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.contains("x-anthropic-billing-header: cc_version="));
         assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
     }
@@ -1242,10 +1251,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.contains("x-anthropic-billing-header: cc_version="));
         assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
     }
@@ -1264,10 +1270,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.starts_with("x-anthropic-billing-header: cc_version="));
         assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
         assert!(system.ends_with("You are a helpful coding assistant."));
@@ -1290,10 +1293,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         let count = system.matches("x-anthropic-billing-header:").count();
         assert_eq!(count, 1);
         let sentinel_count = system.matches("You are Claude Code").count();
@@ -1320,10 +1320,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.contains("Be concise."));
 
         let messages = body
