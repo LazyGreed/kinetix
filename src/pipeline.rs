@@ -5026,8 +5026,7 @@ mod route_policy_tests {
         let url = format!("sqlite://{}?mode=rwc", dir.join("t.db").display());
         let pool = crate::db::connect(&url).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
-        let store =
-            OpaqueStateStore::new(pool, Arc::new(crate::crypto::Crypto::new(&[11u8; 32])));
+        let store = OpaqueStateStore::new(pool, Arc::new(crate::crypto::Crypto::new(&[11u8; 32])));
         let scope = OpaqueClientScope::internal();
         let target = OpaqueStateTarget {
             kind: crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
