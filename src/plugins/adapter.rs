@@ -17,7 +17,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::adapters::{Adapter, DiscoveredModel, UpstreamContext};
+use crate::adapters::{
+    parse_plugin_opaque_state_capability, Adapter, DiscoveredModel, OpaqueStateCapabilityKind,
+    OpaqueStateCapabilityV1, OpaqueStatePlaceholderStrategy, UpstreamContext,
+};
 use crate::plugins::manager::PluginManager;
 use crate::plugins::runtime::PluginFault;
 use crate::types::{
@@ -158,6 +161,24 @@ impl PluginAdapter {
             quota_reset_at: None,
         }
     }
+
+    fn opaque_state_descriptor(
+        &self,
+        model: &crate::db::ModelRow,
+    ) -> Option<OpaqueStateCapabilityV1> {
+        if model.opaque_state_plugin != self.plugin_id {
+            return None;
+        }
+        let discovery: Value = serde_json::from_str(&model.discovery).ok()?;
+        let descriptor =
+            parse_plugin_opaque_state_capability(discovery.get("opaque_state")?)?;
+        if descriptor.encoding_version != 1
+            || !matches!(descriptor.family.as_str(), "gemini" | "claude")
+        {
+            return None;
+        }
+        Some(descriptor)
+    }
 }
 
 #[async_trait]
@@ -168,6 +189,42 @@ impl Adapter for PluginAdapter {
 
     fn handles_thinking_translation(&self) -> bool {
         self.thinking_translation
+    }
+
+    fn opaque_state_target(
+        &self,
+        model: &crate::db::ModelRow,
+    ) -> Option<crate::opaque_state::OpaqueStateTarget> {
+        let descriptor = self.opaque_state_descriptor(model)?;
+        if descriptor.kind != OpaqueStateCapabilityKind::GeminiThoughtSignature {
+            return None;
+        }
+        Some(crate::opaque_state::OpaqueStateTarget {
+            kind: crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
+            provider_id: model.provider_id.clone(),
+            family: descriptor.family,
+            producer: format!(
+                "plugin:{}:gemini-thought-signature:v{}",
+                self.plugin_id, descriptor.encoding_version
+            ),
+            model_id: model.upstream_id.clone(),
+        })
+    }
+
+    fn opaque_state_placeholder(
+        &self,
+        model: &crate::db::ModelRow,
+    ) -> Option<&'static str> {
+        let descriptor = self.opaque_state_descriptor(model)?;
+        if descriptor.kind != OpaqueStateCapabilityKind::GeminiThoughtSignature
+            || descriptor.family != "gemini"
+            || descriptor.placeholder_strategy
+                != Some(OpaqueStatePlaceholderStrategy::Gemini3SkipValidator)
+            || !crate::adapters::gemini::is_gemini_three(&model.upstream_id)
+        {
+            return None;
+        }
+        Some(crate::adapters::gemini::GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
