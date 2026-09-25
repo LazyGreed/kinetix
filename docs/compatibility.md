@@ -331,9 +331,9 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   instead of stripping it, and reports the substitution in the
   `X-Kinetix-Warning` header. The same documented translation applies to a
   direct same-family switch with no Route policy (for example a deliberate
-  Flash
-  → Pro change): the adapter's placeholder is a protocol-valid substitute, so
-  the request proceeds with a warning rather than being refused. The placeholder
+  Flash→Pro change): the adapter's placeholder is a protocol-valid
+  substitute, so the request proceeds with a warning rather than being refused.
+  The placeholder
   is painted only onto calls the store knew about but the target cannot carry —
   an id that was never captured is still left untouched, so missing state is
   never invented. A `reject` Route still refuses before dispatch, and a direct
