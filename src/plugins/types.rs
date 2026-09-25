@@ -210,6 +210,15 @@ impl CredentialMode {
             CredentialMode::None => "none",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "manual" => Some(Self::Manual),
+            "auth_flow" => Some(Self::AuthFlow),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// A user-facing integration assembled from one or more capabilities provided
