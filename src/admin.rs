@@ -8051,3 +8051,416 @@ mod reasoning_discovery_control_plane_tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod credential_enrollment_regression_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-credential-enrollment-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = crate::paths::Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+        };
+        paths.ensure_dirs().unwrap();
+        let database_url = paths.database_url();
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let config = Arc::new(crate::config::Config {
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://127.0.0.1".into(),
+            database_url,
+            master_key: [42_u8; 32],
+            admin_token: "test-admin".into(),
+            cf_access_aud: None,
+            cf_access_team_domain: None,
+            log_json: false,
+            bootstrap_file: None,
+            allow_private_upstreams: true,
+            allow_insecure_tls: true,
+            data_dir: paths.data_dir.clone(),
+            shutdown_grace_secs: 1,
+            alert_webhook_url: None,
+            alert_fallback_rate: 1.0,
+            alert_error_rate: 1.0,
+            alert_min_requests: 1,
+            alert_interval_secs: 60,
+            alert_p95_latency_ms: 1_000,
+            ip_rate_limit_per_min: 0,
+            session_ttl_minutes: 60,
+            export_retention_days: 1,
+            paths,
+            generated_admin_password: None,
+        });
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry,
+            Arc::new(crate::crypto::Crypto::new(&[42_u8; 32])),
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool, 16),
+            0,
+        );
+        (state, root)
+    }
+
+    fn auth() -> AdminAuth {
+        AdminAuth {
+            actor: "test".into(),
+            token: "test-admin".into(),
+        }
+    }
+
+    async fn insert_provider(
+        state: &AppState,
+        name: &str,
+        mode: crate::plugins::CredentialMode,
+        source_plugin_id: Option<&str>,
+        source_integration_id: Option<&str>,
+    ) -> String {
+        db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name,
+                base_url: "http://127.0.0.1:12345",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: mode.as_str(),
+                source_plugin_id,
+                source_integration_id,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn provider_body(name: &str, api_key: Option<&str>) -> ProviderBody {
+        ProviderBody {
+            name: name.into(),
+            base_url: "http://127.0.0.1:12345".into(),
+            wire_format: "openai".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::Map::new(),
+            timeout_ms: 1_000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: Some(json!({})),
+            follow_redirects: false,
+            credential_hosts: String::new(),
+            allow_insecure_tls: true,
+            wire_plugin: String::new(),
+            credential_plugin: String::new(),
+            model_source_plugin: String::new(),
+            api_key: api_key.map(str::to_string),
+            account_label: Some("manual-key".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_update_rejects_manual_key_for_non_manual_enrollment() {
+        let (state, root) = test_state("provider-update").await;
+
+        for (name, mode) in [
+            ("oauth", crate::plugins::CredentialMode::AuthFlow),
+            ("public", crate::plugins::CredentialMode::None),
+        ] {
+            let id = insert_provider(&state, name, mode, Some("plugin.test"), Some(name)).await;
+            let error = update_provider(
+                State(state.clone()),
+                auth(),
+                Path(id.clone()),
+                Json(provider_body(name, Some("manual-secret"))),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(db::accounts_for_provider(&state.pool, &id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_removes_accounts_invalid_for_the_new_mode() {
+        let (state, root) = test_state("transitions").await;
+        let provider_id = insert_provider(
+            &state,
+            "transition-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+
+        let encrypted = state.crypto.encrypt("manual-secret").unwrap();
+        db::insert_account(
+            &state.pool,
+            &provider_id,
+            "manual",
+            &encrypted,
+            &crate::crypto::mask_secret("manual-secret"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::None,
+            "plugin.test",
+            "public",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let accounts = db::accounts_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].label, "__kinetix_noauth__");
+        assert_eq!(state.crypto.decrypt(&accounts[0].secret_enc).unwrap(), "");
+        assert_eq!(
+            state
+                .registry
+                .snapshot()
+                .accounts
+                .values()
+                .filter(|account| account.provider_id == provider_id)
+                .count(),
+            1
+        );
+
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::Manual,
+            "plugin.test",
+            "manual",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        assert!(db::accounts_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .registry
+            .snapshot()
+            .accounts
+            .values()
+            .all(|account| account.provider_id != provider_id));
+
+        let encrypted = state.crypto.encrypt("stale-secret").unwrap();
+        db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale",
+            &encrypted,
+            &crate::crypto::mask_secret("stale-secret"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::None,
+            "plugin.test",
+            "public",
+        )
+        .await
+        .unwrap();
+        reconcile_provider_credential_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::AuthFlow,
+            "plugin.test",
+            "oauth",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        assert!(db::accounts_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .registry
+            .snapshot()
+            .accounts
+            .values()
+            .all(|account| account.provider_id != provider_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_export_import_round_trips_credential_semantics() {
+        let (source, source_root) = test_state("export-source").await;
+        let auth_provider = insert_provider(
+            &source,
+            "oauth-provider",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("plugin.oauth"),
+            Some("oauth"),
+        )
+        .await;
+        let noauth_provider = insert_provider(
+            &source,
+            "public-provider",
+            crate::plugins::CredentialMode::None,
+            Some("plugin.public"),
+            Some("public"),
+        )
+        .await;
+
+        let encrypted = source.crypto.encrypt("oauth-secret").unwrap();
+        db::insert_account(
+            &source.pool,
+            &auth_provider,
+            "connected",
+            &encrypted,
+            &crate::crypto::mask_secret("oauth-secret"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        reconcile_provider_credential_semantics(
+            &source,
+            &noauth_provider,
+            crate::plugins::CredentialMode::None,
+            "plugin.public",
+            "public",
+        )
+        .await
+        .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let oauth = exported["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["name"] == "oauth-provider")
+            .unwrap();
+        assert_eq!(oauth["credential_mode"], "auth_flow");
+        assert_eq!(oauth["source_plugin_id"], "plugin.oauth");
+        assert_eq!(oauth["source_integration_id"], "oauth");
+
+        let public = exported["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["name"] == "public-provider")
+            .unwrap();
+        assert_eq!(public["credential_mode"], "none");
+        assert_eq!(public["source_plugin_id"], "plugin.public");
+        assert_eq!(public["source_integration_id"], "public");
+        assert!(exported["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|account| account["label"] != "__kinetix_noauth__"));
+
+        let (target, target_root) = test_state("export-target").await;
+        import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let providers = db::list_providers(&target.pool).await.unwrap();
+        let oauth = providers
+            .iter()
+            .find(|provider| provider.name == "oauth-provider")
+            .unwrap();
+        assert_eq!(oauth.credential_mode, "auth_flow");
+        assert_eq!(oauth.source_plugin_id.as_deref(), Some("plugin.oauth"));
+        assert_eq!(oauth.source_integration_id.as_deref(), Some("oauth"));
+
+        let oauth_accounts = db::accounts_for_provider(&target.pool, &oauth.id)
+            .await
+            .unwrap();
+        assert_eq!(oauth_accounts.len(), 1);
+        assert_eq!(
+            target.crypto.decrypt(&oauth_accounts[0].secret_enc).unwrap(),
+            "oauth-secret"
+        );
+
+        let public = providers
+            .iter()
+            .find(|provider| provider.name == "public-provider")
+            .unwrap();
+        assert_eq!(public.credential_mode, "none");
+        assert_eq!(public.source_plugin_id.as_deref(), Some("plugin.public"));
+        assert_eq!(public.source_integration_id.as_deref(), Some("public"));
+
+        let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
+            .await
+            .unwrap();
+        assert_eq!(public_accounts.len(), 1);
+        assert_eq!(public_accounts[0].label, "__kinetix_noauth__");
+        assert_eq!(
+            target.crypto.decrypt(&public_accounts[0].secret_enc).unwrap(),
+            ""
+        );
+
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+}
