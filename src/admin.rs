@@ -4081,6 +4081,12 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
             "kinetix_opaque_state_replaced_total {}\n",
             m.capture_replaced
         ));
+        body.push_str("# HELP kinetix_opaque_state_capture_dropped_total Captures whose durability job was dropped because the async queue was full\n");
+        body.push_str("# TYPE kinetix_opaque_state_capture_dropped_total counter\n");
+        body.push_str(&format!(
+            "kinetix_opaque_state_capture_dropped_total {}\n",
+            m.capture_dropped
+        ));
         body.push_str("# HELP kinetix_opaque_state_capture_storage_errors_total Async durability failures while capturing\n");
         body.push_str("# TYPE kinetix_opaque_state_capture_storage_errors_total counter\n");
         body.push_str(&format!(

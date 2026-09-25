@@ -795,6 +795,10 @@ impl Adapter for GeminiAdapter {
             provider_id: model.provider_id.clone(),
             family: "gemini".to_string(),
             producer: "native:gemini:v1".to_string(),
+            // generateContent thought signatures are only replayed onto the
+            // exact model that produced them; cross-model restoration is not
+            // assumed.
+            model_id: model.upstream_id.clone(),
         })
     }
 }
@@ -1103,10 +1107,11 @@ mod schema_tests {
         assert_eq!(target.provider_id, "ai-studio");
         assert_eq!(target.family, "gemini");
         assert_eq!(target.producer, "native:gemini:v1");
+        assert_eq!(target.model_id, "gemini-3.8-flash");
 
-        // A different exact model id on the same provider must resolve to the
-        // same family/producer, proving compatibility is not scoped to the
-        // exact model id (§6).
+        // A different exact model id on the same provider keeps the same
+        // family/producer provenance but a distinct model id, so state is
+        // never replayed across models (§6).
         let mut other_model = model.clone();
         other_model.upstream_id = "gemini-3.8-pro".into();
         let other_target = adapter
@@ -1114,6 +1119,7 @@ mod schema_tests {
             .expect("gemini opts in");
         assert_eq!(other_target.family, target.family);
         assert_eq!(other_target.producer, target.producer);
+        assert_ne!(other_target.model_id, target.model_id);
     }
 
     #[test]

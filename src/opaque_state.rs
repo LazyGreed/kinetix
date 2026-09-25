@@ -32,6 +32,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use tokio::sync::mpsc;
 
 use crate::crypto::Crypto;
 use crate::db::Pool;
@@ -59,21 +60,31 @@ impl OpaqueStateKind {
 
 /// What an adapter/target is prepared to produce and accept opaque state as.
 /// Compatibility between a stored record and a candidate target requires an
-/// exact match on `provider_id`, `family`, and `producer` (§6, §41).
+/// exact match on `provider_id`, `family`, `producer`, and the originating
+/// model id (§6, §41).
+///
+/// The model id is part of the key deliberately. Google's `generateContent`
+/// contract only guarantees a thought signature is accepted by the model that
+/// produced it; switching models is documented to require dummy signatures,
+/// not reuse of the original one. Cross-model restoration is therefore not
+/// assumed until it has real acceptance evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpaqueStateTarget {
     pub kind: OpaqueStateKind,
     pub provider_id: String,
-    /// The opaque-state protocol family (e.g. `"gemini"`). Deliberately
-    /// coarser than the exact model id: Gemini continuation state survives a
-    /// model switch on the same provider (§6 "Why the family is not the exact
-    /// model ID").
+    /// The opaque-state protocol family (e.g. `"gemini"`); a coarse
+    /// provenance tag retained for diagnostics and future protocol variants.
+    /// It is not sufficient on its own to authorize restoration.
     pub family: String,
     /// Adapter encoding-version provenance, e.g. `"native:gemini:v1"` or
     /// `"plugin:<plugin-id>@<version>/<capability>"` (§41). A version bump
     /// intentionally invalidates old rows rather than risk misinterpreting
     /// them.
     pub producer: String,
+    /// Exact upstream model id that produced the state (e.g.
+    /// `"gemini-2.5-flash"`). State captured on one model is never restored
+    /// onto a different model.
+    pub model_id: String,
 }
 
 /// A resolved client scope: identifies *who* is allowed to read back opaque
@@ -153,6 +164,10 @@ const PERSISTENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MEMORY_ROWS: usize = 2_048;
 const MAX_DB_ROWS: i64 = 10_000;
 const PRUNE_EVERY_N_WRITES: u64 = 100;
+/// Bound on queued SQLite durability jobs. The RAM cache is the synchronous
+/// hot path; when this queue saturates, writes are dropped and counted rather
+/// than blocking the streaming response (§13, §63).
+const DURABILITY_QUEUE_CAPACITY: usize = 4_096;
 
 // ---------------------------------------------------------------------------
 // In-memory hot-path cache (§13, §40).
@@ -166,6 +181,7 @@ struct OpaqueCacheKey {
     provider_id: String,
     family: String,
     producer: String,
+    model_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -173,8 +189,6 @@ struct CachedOpaqueState {
     signature: String,
     session_hash: Option<String>,
     tool_name_hash: String,
-    #[allow(dead_code)] // retained for diagnostics/future admin surfacing.
-    origin_model: String,
     expires_at: Instant,
 }
 
@@ -187,6 +201,7 @@ struct CachedOpaqueState {
 struct Counters {
     capture_stored: std::sync::atomic::AtomicU64,
     capture_replaced: std::sync::atomic::AtomicU64,
+    capture_dropped: std::sync::atomic::AtomicU64,
     capture_storage_error: std::sync::atomic::AtomicU64,
     lookup_hit: std::sync::atomic::AtomicU64,
     lookup_miss: std::sync::atomic::AtomicU64,
@@ -203,6 +218,7 @@ struct Counters {
 pub struct OpaqueStateMetrics {
     pub capture_stored: u64,
     pub capture_replaced: u64,
+    pub capture_dropped: u64,
     pub capture_storage_error: u64,
     pub lookup_hit: u64,
     pub lookup_miss: u64,
@@ -225,19 +241,55 @@ pub struct OpaqueStateStore {
     /// Insertion order for bounded LRU-ish eviction (oldest first). Kept
     /// separate from the DashMap so eviction never needs to scan.
     order: Mutex<VecDeque<OpaqueCacheKey>>,
-    writes_since_prune: std::sync::atomic::AtomicU64,
-    counters: Counters,
+    counters: Arc<Counters>,
+    durability: mpsc::Sender<DurabilityJob>,
+}
+
+/// A queued SQLite durability job. Encryption and the SQLite UPSERT happen on
+/// the worker task, never inline in a streaming response, so a slow or locked
+/// database cannot stall a tool-call event before the client receives it.
+enum DurabilityJob {
+    Write(Box<DurabilityWrite>),
+    /// Ordering barrier: mpsc preserves order, so once the worker receives
+    /// this it has processed every previously queued write. Used by tests and
+    /// graceful shutdown, never on the request path.
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+struct DurabilityWrite {
+    kind: &'static str,
+    scope_hash: String,
+    tool_call_hash: String,
+    session_hash: String,
+    provider_id: String,
+    family: String,
+    producer: String,
+    origin_model: String,
+    tool_name_hash: String,
+    signature: String,
 }
 
 impl OpaqueStateStore {
     pub fn new(pool: Pool, crypto: Arc<Crypto>) -> Self {
+        let (tx, rx) = mpsc::channel::<DurabilityJob>(DURABILITY_QUEUE_CAPACITY);
+        let counters = Arc::new(Counters::default());
+        spawn_durability_worker(pool.clone(), crypto.clone(), rx, counters.clone());
         Self {
             pool,
             crypto,
             cache: DashMap::new(),
             order: Mutex::new(VecDeque::new()),
-            writes_since_prune: std::sync::atomic::AtomicU64::new(0),
-            counters: Counters::default(),
+            counters,
+            durability: tx,
+        }
+    }
+
+    /// Wait until every queued durability write has been processed. Used by
+    /// tests and graceful shutdown; never called on the request path.
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.durability.send(DurabilityJob::Flush(tx)).await.is_ok() {
+            let _ = rx.await;
         }
     }
 
@@ -246,6 +298,7 @@ impl OpaqueStateStore {
         OpaqueStateMetrics {
             capture_stored: self.counters.capture_stored.load(Relaxed),
             capture_replaced: self.counters.capture_replaced.load(Relaxed),
+            capture_dropped: self.counters.capture_dropped.load(Relaxed),
             capture_storage_error: self.counters.capture_storage_error.load(Relaxed),
             lookup_hit: self.counters.lookup_hit.load(Relaxed),
             lookup_miss: self.counters.lookup_miss.load(Relaxed),
@@ -258,23 +311,24 @@ impl OpaqueStateStore {
         }
     }
 
-    /// Persist an opaque continuation value under the client-visible tool-call
-    /// id. RAM is populated synchronously (so an immediate next request never
-    /// races ahead of durability, §39); the SQLite write happens before this
-    /// call returns so capture is durable before the client can plausibly act
-    /// on the tool call, but a write failure is swallowed (never crashes an
-    /// otherwise-successful response, §13) and only recorded internally.
+    /// Record an opaque continuation value under the client-visible tool-call
+    /// id. The RAM cache is written synchronously so an immediate next request
+    /// never races ahead of it (§39); the SQLite UPSERT/pruning is handed to a
+    /// bounded background worker so a slow or locked database cannot stall the
+    /// streaming response that carries the tool call (§13, §63). A saturated
+    /// queue drops the durability write (counted) rather than blocking the
+    /// data plane; a storage failure is likewise swallowed and counted.
     #[allow(clippy::too_many_arguments)]
-    pub async fn capture_tool_signature(
+    pub fn capture_tool_signature(
         &self,
         scope: &OpaqueClientScope,
         target: &OpaqueStateTarget,
         session: Option<&str>,
         tool_call_id: &str,
         tool_name: &str,
-        origin_model: &str,
         signature: &str,
     ) {
+        use std::sync::atomic::Ordering::Relaxed;
         if signature.is_empty() || tool_call_id.is_empty() {
             return;
         }
@@ -283,15 +337,7 @@ impl OpaqueStateStore {
         let sess_hash = session.map(session_hash);
         let name_hash = tool_name_hash(tool_name);
 
-        let key = OpaqueCacheKey {
-            kind: target.kind.as_str(),
-            scope_hash: scope_hash.clone(),
-            tool_call_hash: call_hash.clone(),
-            provider_id: target.provider_id.clone(),
-            family: target.family.clone(),
-            producer: target.producer.clone(),
-        };
-
+        let key = self.cache_key(target, &scope_hash, &call_hash);
         let now = Instant::now();
         let replaced = self
             .cache
@@ -305,93 +351,38 @@ impl OpaqueStateStore {
                 signature: signature.to_string(),
                 session_hash: sess_hash.clone(),
                 tool_name_hash: name_hash.clone(),
-                origin_model: origin_model.to_string(),
                 expires_at: now + MEMORY_TTL,
             },
         );
-        {
-            let mut order = self.order.lock();
-            order.push_back(key);
-            while order.len() > MAX_MEMORY_ROWS {
-                if let Some(evicted) = order.pop_front() {
-                    self.cache.remove(&evicted);
-                }
-            }
-        }
+        self.touch_order(key);
 
         if replaced {
-            self.counters
-                .capture_replaced
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.counters.capture_replaced.fetch_add(1, Relaxed);
             tracing::warn!(kind = target.kind.as_str(), "opaque_state_replaced");
         }
 
-        let value_enc = match self.crypto.encrypt_opaque_state(signature) {
-            Ok(enc) => enc,
-            Err(_) => {
-                self.counters
-                    .capture_storage_error
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!(kind = target.kind.as_str(), "opaque_state_encrypt_failed");
-                return;
-            }
+        let job = DurabilityWrite {
+            kind: target.kind.as_str(),
+            scope_hash,
+            tool_call_hash: call_hash,
+            session_hash: sess_hash.unwrap_or_default(),
+            provider_id: target.provider_id.clone(),
+            family: target.family.clone(),
+            producer: target.producer.clone(),
+            origin_model: target.model_id.clone(),
+            tool_name_hash: name_hash,
+            signature: signature.to_string(),
         };
-
-        let created_at = crate::db::now_iso();
-        let expires_at =
-            (chrono::Utc::now() + chrono::Duration::from_std(PERSISTENT_TTL).unwrap()).to_rfc3339();
-
-        let write = sqlx::query(
-            "INSERT INTO opaque_provider_state
-                (kind, scope_hash, tool_call_hash, session_hash, provider_id, family,
-                 producer, origin_model, tool_name_hash, value_enc, created_at, expires_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT (kind, scope_hash, tool_call_hash, provider_id, family, producer)
-             DO UPDATE SET
-                session_hash = excluded.session_hash,
-                origin_model = excluded.origin_model,
-                tool_name_hash = excluded.tool_name_hash,
-                value_enc = excluded.value_enc,
-                created_at = excluded.created_at,
-                expires_at = excluded.expires_at",
-        )
-        .bind(target.kind.as_str())
-        .bind(&scope_hash)
-        .bind(&call_hash)
-        .bind(sess_hash.clone().unwrap_or_default())
-        .bind(&target.provider_id)
-        .bind(&target.family)
-        .bind(&target.producer)
-        .bind(origin_model)
-        .bind(&name_hash)
-        .bind(&value_enc)
-        .bind(&created_at)
-        .bind(&expires_at)
-        .execute(&self.pool)
-        .await;
-
-        match write {
-            Ok(_) => {
-                self.counters
-                    .capture_stored
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(error) => {
-                self.counters
-                    .capture_storage_error
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Never crash the client response on a storage failure; the
-                // next Gemini turn may fail naturally instead (§13, §63).
-                tracing::error!(error = %error, "opaque_state_capture_failed");
-            }
-        }
-
-        let writes = self
-            .writes_since_prune
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        if writes.is_multiple_of(PRUNE_EVERY_N_WRITES) {
-            self.prune().await;
+        if self
+            .durability
+            .try_send(DurabilityJob::Write(Box::new(job)))
+            .is_err()
+        {
+            self.counters.capture_dropped.fetch_add(1, Relaxed);
+            tracing::warn!(
+                kind = target.kind.as_str(),
+                "opaque_state_durability_queue_full"
+            );
         }
     }
 
@@ -434,11 +425,27 @@ impl OpaqueStateStore {
             }
         }
 
-        let Some(row) = self.fetch_row(&scope_hash, &call_hash).await else {
+        let rows = self.fetch_rows(&scope_hash, &call_hash).await;
+        if rows.is_empty() {
             self.counters
                 .lookup_miss
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return OpaqueLookupResult::Missing;
+        }
+
+        // Prefer the row this target can actually carry (kind/provider/family/
+        // producer/model all match). With no capability, the newest row is
+        // inspected only so the pipeline can tell "stored but non-portable"
+        // apart from "nothing stored" (§19 case C, §22).
+        let candidate = match capability {
+            Some(target) => rows.iter().find(|row| row.matches(target)),
+            None => rows.first(),
+        };
+        let Some(row) = candidate else {
+            self.counters
+                .lookup_incompatible
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return OpaqueLookupResult::Incompatible;
         };
 
         // Tool-name and session identity are checked before provider
@@ -459,7 +466,7 @@ impl OpaqueStateStore {
             }
         }
 
-        let Some(target) = capability.filter(|t| row.matches(t)) else {
+        let Some(target) = capability else {
             self.counters
                 .lookup_incompatible
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -488,7 +495,6 @@ impl OpaqueStateStore {
                 signature: signature.clone(),
                 session_hash: row.session_hash.clone(),
                 tool_name_hash: row.tool_name_hash.clone(),
-                origin_model: row.origin_model.clone(),
                 expires_at: now + MEMORY_TTL,
             },
         );
@@ -513,6 +519,7 @@ impl OpaqueStateStore {
             provider_id: target.provider_id.clone(),
             family: target.family.clone(),
             producer: target.producer.clone(),
+            model_id: target.model_id.clone(),
         }
     }
 
@@ -557,11 +564,12 @@ impl OpaqueStateStore {
         OpaqueLookupResult::Compatible(entry.signature.clone())
     }
 
-    /// Fetch the newest non-expired row for a tool-call id. The query is
-    /// scoped by `scope_hash` + `tool_call_hash` only (not by provider/family/
-    /// producer) so a target with no opaque-state capability can still observe
-    /// that *some* non-portable continuation state exists for this tool call.
-    async fn fetch_row(&self, scope_hash: &str, call_hash: &str) -> Option<StoredRow> {
+    /// Fetch every non-expired row for a tool-call id, newest first. The query
+    /// is scoped by `scope_hash` + `tool_call_hash` only (not by provider/
+    /// family/producer/model) so a target with no opaque-state capability can
+    /// still observe that *some* non-portable continuation state exists for
+    /// this tool call; the caller selects the compatible row.
+    async fn fetch_rows(&self, scope_hash: &str, call_hash: &str) -> Vec<StoredRow> {
         let now = chrono::Utc::now().to_rfc3339();
         let rows = sqlx::query(
             "SELECT kind, provider_id, family, producer, session_hash, tool_name_hash,
@@ -576,59 +584,36 @@ impl OpaqueStateStore {
         .await
         .unwrap_or_default();
 
-        for row in rows {
-            let expires_at: String = row.get("expires_at");
-            if expires_at.as_str() < now.as_str() {
-                continue;
-            }
-            let session_hash: String = row.get("session_hash");
-            return Some(StoredRow {
-                kind: row.get("kind"),
-                provider_id: row.get("provider_id"),
-                family: row.get("family"),
-                producer: row.get("producer"),
-                session_hash: if session_hash.is_empty() {
-                    None
-                } else {
-                    Some(session_hash)
-                },
-                tool_name_hash: row.get("tool_name_hash"),
-                origin_model: row.get("origin_model"),
-                value_enc: row.get("value_enc"),
-            });
-        }
-        None
+        rows.into_iter()
+            .filter(|row| {
+                let expires_at: String = row.get("expires_at");
+                expires_at.as_str() >= now.as_str()
+            })
+            .map(|row| {
+                let session_hash: String = row.get("session_hash");
+                StoredRow {
+                    kind: row.get("kind"),
+                    provider_id: row.get("provider_id"),
+                    family: row.get("family"),
+                    producer: row.get("producer"),
+                    session_hash: if session_hash.is_empty() {
+                        None
+                    } else {
+                        Some(session_hash)
+                    },
+                    tool_name_hash: row.get("tool_name_hash"),
+                    origin_model: row.get("origin_model"),
+                    value_enc: row.get("value_enc"),
+                }
+            })
+            .collect()
     }
 
     /// Delete expired rows, and if still over the row cap, delete the oldest
-    /// rows above the limit (§12). Called lazily every `PRUNE_EVERY_N_WRITES`
-    /// writes; kept public so tests can invoke it directly.
+    /// rows above the limit (§12). Called lazily by the durability worker every
+    /// `PRUNE_EVERY_N_WRITES` writes; kept public so tests can invoke it.
     pub async fn prune(&self) {
-        let now = chrono::Utc::now().to_rfc3339();
-        let _ = sqlx::query("DELETE FROM opaque_provider_state WHERE expires_at < ?")
-            .bind(&now)
-            .execute(&self.pool)
-            .await;
-
-        if let Ok(row) = sqlx::query("SELECT COUNT(*) as n FROM opaque_provider_state")
-            .fetch_one(&self.pool)
-            .await
-        {
-            let count: i64 = row.get("n");
-            if count > MAX_DB_ROWS {
-                let overflow = count - MAX_DB_ROWS;
-                let _ = sqlx::query(
-                    "DELETE FROM opaque_provider_state WHERE rowid IN (
-                        SELECT rowid FROM opaque_provider_state
-                        ORDER BY created_at ASC
-                        LIMIT ?
-                    )",
-                )
-                .bind(overflow)
-                .execute(&self.pool)
-                .await;
-            }
-        }
+        prune_pool(&self.pool).await;
     }
 
     /// Row count, exposed for tests/diagnostics only.
@@ -658,6 +643,10 @@ impl OpaqueStateStore {
     /// next lookup exercises the expiry path deterministically.
     #[cfg(test)]
     pub async fn expire_all_for_test(&self) {
+        // Flush first so the expiry UPDATE lands on the rows that were just
+        // queued; otherwise the worker would persist them with a future
+        // expiry after this returns.
+        self.flush().await;
         let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let _ = sqlx::query("UPDATE opaque_provider_state SET expires_at = ?")
             .bind(past)
@@ -685,6 +674,126 @@ impl StoredRow {
             && self.provider_id == target.provider_id
             && self.family == target.family
             && self.producer == target.producer
+            && self.origin_model == target.model_id
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Durability worker: encryption + SQLite UPSERT + periodic pruning, entirely
+// off the data plane.
+// ---------------------------------------------------------------------------
+
+fn spawn_durability_worker(
+    pool: Pool,
+    crypto: Arc<Crypto>,
+    mut rx: mpsc::Receiver<DurabilityJob>,
+    counters: Arc<Counters>,
+) {
+    tokio::spawn(async move {
+        let mut writes: u64 = 0;
+        while let Some(job) = rx.recv().await {
+            match job {
+                DurabilityJob::Write(job) => {
+                    persist_opaque_state(&pool, &crypto, &counters, &job).await;
+                    writes += 1;
+                    if writes.is_multiple_of(PRUNE_EVERY_N_WRITES) {
+                        prune_pool(&pool).await;
+                    }
+                }
+                DurabilityJob::Flush(reply) => {
+                    let _ = reply.send(());
+                }
+            }
+        }
+    });
+}
+
+async fn persist_opaque_state(
+    pool: &Pool,
+    crypto: &Crypto,
+    counters: &Counters,
+    job: &DurabilityWrite,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let value_enc = match crypto.encrypt_opaque_state(&job.signature) {
+        Ok(enc) => enc,
+        Err(_) => {
+            counters.capture_storage_error.fetch_add(1, Relaxed);
+            tracing::error!(kind = job.kind, "opaque_state_encrypt_failed");
+            return;
+        }
+    };
+
+    let created_at = crate::db::now_iso();
+    let expires_at =
+        (chrono::Utc::now() + chrono::Duration::from_std(PERSISTENT_TTL).unwrap()).to_rfc3339();
+
+    let write = sqlx::query(
+        "INSERT INTO opaque_provider_state
+            (kind, scope_hash, tool_call_hash, session_hash, provider_id, family,
+             producer, origin_model, tool_name_hash, value_enc, created_at, expires_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT (kind, scope_hash, tool_call_hash, provider_id, family, producer, origin_model)
+         DO UPDATE SET
+            session_hash = excluded.session_hash,
+            tool_name_hash = excluded.tool_name_hash,
+            value_enc = excluded.value_enc,
+            created_at = excluded.created_at,
+            expires_at = excluded.expires_at",
+    )
+    .bind(job.kind)
+    .bind(&job.scope_hash)
+    .bind(&job.tool_call_hash)
+    .bind(&job.session_hash)
+    .bind(&job.provider_id)
+    .bind(&job.family)
+    .bind(&job.producer)
+    .bind(&job.origin_model)
+    .bind(&job.tool_name_hash)
+    .bind(&value_enc)
+    .bind(&created_at)
+    .bind(&expires_at)
+    .execute(pool)
+    .await;
+
+    match write {
+        Ok(_) => {
+            counters.capture_stored.fetch_add(1, Relaxed);
+        }
+        Err(error) => {
+            counters.capture_storage_error.fetch_add(1, Relaxed);
+            // Never crash the client response on a storage failure; the next
+            // provider turn may fail naturally instead (§13, §63).
+            tracing::error!(error = %error, "opaque_state_capture_failed");
+        }
+    }
+}
+
+async fn prune_pool(pool: &Pool) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = sqlx::query("DELETE FROM opaque_provider_state WHERE expires_at < ?")
+        .bind(&now)
+        .execute(pool)
+        .await;
+
+    if let Ok(row) = sqlx::query("SELECT COUNT(*) as n FROM opaque_provider_state")
+        .fetch_one(pool)
+        .await
+    {
+        let count: i64 = row.get("n");
+        if count > MAX_DB_ROWS {
+            let overflow = count - MAX_DB_ROWS;
+            let _ = sqlx::query(
+                "DELETE FROM opaque_provider_state WHERE rowid IN (
+                    SELECT rowid FROM opaque_provider_state
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                )",
+            )
+            .bind(overflow)
+            .execute(pool)
+            .await;
+        }
     }
 }
 
@@ -715,7 +824,20 @@ mod tests {
             provider_id: "ai-studio".into(),
             family: "gemini".into(),
             producer: "native:gemini:v1".into(),
+            model_id: "gemini-3".into(),
         }
+    }
+
+    fn capture(
+        store: &OpaqueStateStore,
+        scope: &OpaqueClientScope,
+        target: &OpaqueStateTarget,
+        session: Option<&str>,
+        id: &str,
+        name: &str,
+        sig: &str,
+    ) {
+        store.capture_tool_signature(scope, target, session, id, name, sig);
     }
 
     #[tokio::test]
@@ -723,9 +845,7 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
         let result = store
             .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
             .await;
@@ -737,9 +857,8 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
         store.clear_memory_cache_for_test();
         assert_eq!(store.memory_entry_count_for_test(), 0);
         let result = store
@@ -748,6 +867,34 @@ mod tests {
         assert_eq!(result, OpaqueLookupResult::Compatible("SIG_A".into()));
         // The fallback lookup must repopulate RAM.
         assert_eq!(store.memory_entry_count_for_test(), 1);
+    }
+
+    #[tokio::test]
+    async fn durability_write_is_queued_and_flushable() {
+        // `capture_tool_signature` is a synchronous `fn` (it cannot be awaited),
+        // so the data plane never blocks on SQLite. The RAM hit below is
+        // therefore immediate, and the durable copy appears after the worker
+        // drains the queue (observed via the `flush()` barrier). This is the
+        // invariant that keeps a locked DB off the streaming path.
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let target = gemini_target();
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        assert_eq!(
+            store
+                .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
+                .await,
+            OpaqueLookupResult::Compatible("SIG_A".into())
+        );
+        // Drop RAM, wait for the durability barrier, then read back from SQLite.
+        store.clear_memory_cache_for_test();
+        store.flush().await;
+        assert_eq!(
+            store
+                .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
+                .await,
+            OpaqueLookupResult::Compatible("SIG_A".into())
+        );
     }
 
     #[tokio::test]
@@ -767,17 +914,16 @@ mod tests {
         let target = gemini_target();
         let scope_a = OpaqueClientScope::for_key("key_a");
         let scope_b = OpaqueClientScope::for_key("key_b");
-        store
-            .capture_tool_signature(
-                &scope_a,
-                &target,
-                None,
-                "call_same",
-                "bash",
-                "gemini-3",
-                "SIG_A",
-            )
-            .await;
+        capture(
+            &store,
+            &scope_a,
+            &target,
+            None,
+            "call_same",
+            "bash",
+            "SIG_A",
+        );
+        store.flush().await;
         let result = store
             .resolve_tool_signature(&scope_b, Some(&target), None, "call_same", "bash")
             .await;
@@ -789,17 +935,15 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(
-                &scope,
-                &target,
-                Some("sess_1"),
-                "call_1",
-                "bash",
-                "gemini-3",
-                "SIG_A",
-            )
-            .await;
+        capture(
+            &store,
+            &scope,
+            &target,
+            Some("sess_1"),
+            "call_1",
+            "bash",
+            "SIG_A",
+        );
         let result = store
             .resolve_tool_signature(&scope, Some(&target), Some("sess_1"), "call_1", "bash")
             .await;
@@ -811,17 +955,15 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(
-                &scope,
-                &target,
-                Some("sess_1"),
-                "call_1",
-                "bash",
-                "gemini-3",
-                "SIG_A",
-            )
-            .await;
+        capture(
+            &store,
+            &scope,
+            &target,
+            Some("sess_1"),
+            "call_1",
+            "bash",
+            "SIG_A",
+        );
         let result = store
             .resolve_tool_signature(&scope, Some(&target), Some("sess_2"), "call_1", "bash")
             .await;
@@ -833,9 +975,7 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
         // Request now carries a session even though none was stored: allowed.
         let result = store
             .resolve_tool_signature(&scope, Some(&target), Some("sess_new"), "call_1", "bash")
@@ -848,9 +988,7 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
         let result = store
             .resolve_tool_signature(&scope, Some(&target), None, "call_1", "read")
             .await;
@@ -862,9 +1000,8 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
         let mut other = gemini_target();
         other.producer = "native:gemini:v2".into();
         let result = store
@@ -878,9 +1015,8 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
         let mut other = gemini_target();
         other.family = "antigravity-claude".into();
         let result = store
@@ -890,17 +1026,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn different_model_in_same_family_is_incompatible() {
+        // generateContent signatures are only guaranteed on the originating
+        // model, so a different model must never be handed stored state.
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let target = gemini_target();
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
+        let mut other_model = gemini_target();
+        other_model.model_id = "gemini-3-pro".into();
+        let result = store
+            .resolve_tool_signature(&scope, Some(&other_model), None, "call_1", "bash")
+            .await;
+        assert_eq!(result, OpaqueLookupResult::Incompatible);
+    }
+
+    #[tokio::test]
     async fn account_change_within_same_provider_stays_compatible() {
-        // Compatibility is keyed on provider_id/family/producer only — not
+        // Compatibility is keyed on provider/model/family/producer only — not
         // account. Same-provider account failover must not destroy state.
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
-        // Simulate a different account by resolving with the exact same
-        // target (account is intentionally not part of OpaqueStateTarget).
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
         let result = store
             .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
             .await;
@@ -912,12 +1061,9 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
         assert_eq!(store.count_rows().await, 1);
         let result = store
             .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
@@ -930,17 +1076,40 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_B")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_B");
         let result = store
             .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
             .await;
         assert_eq!(result, OpaqueLookupResult::Compatible("SIG_B".into()));
+        store.flush().await;
         assert_eq!(store.count_rows().await, 1);
+    }
+
+    #[tokio::test]
+    async fn bytes_for_a_different_model_do_not_collide() {
+        // Two models may share a tool-call id; each keeps its own row.
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let flash = gemini_target();
+        let mut pro = gemini_target();
+        pro.model_id = "gemini-3-pro".into();
+        capture(&store, &scope, &flash, None, "call_1", "bash", "SIG_FLASH");
+        capture(&store, &scope, &pro, None, "call_1", "bash", "SIG_PRO");
+        store.flush().await;
+        assert_eq!(store.count_rows().await, 2);
+        assert_eq!(
+            store
+                .resolve_tool_signature(&scope, Some(&flash), None, "call_1", "bash")
+                .await,
+            OpaqueLookupResult::Compatible("SIG_FLASH".into())
+        );
+        assert_eq!(
+            store
+                .resolve_tool_signature(&scope, Some(&pro), None, "call_1", "bash")
+                .await,
+            OpaqueLookupResult::Compatible("SIG_PRO".into())
+        );
     }
 
     #[tokio::test]
@@ -951,18 +1120,17 @@ mod tests {
         // Insert a handful of rows and force a prune; cheap smoke test that
         // prune() does not error and respects the expiry predicate.
         for i in 0..5 {
-            store
-                .capture_tool_signature(
-                    &scope,
-                    &target,
-                    None,
-                    &format!("call_{i}"),
-                    "bash",
-                    "gemini-3",
-                    "SIG",
-                )
-                .await;
+            capture(
+                &store,
+                &scope,
+                &target,
+                None,
+                &format!("call_{i}"),
+                "bash",
+                "SIG",
+            );
         }
+        store.flush().await;
         store.prune().await;
         assert_eq!(store.count_rows().await, 5);
     }
@@ -972,12 +1140,9 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "")
-            .await;
-        store
-            .capture_tool_signature(&scope, &target, None, "", "bash", "gemini-3", "SIG")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "");
+        capture(&store, &scope, &target, None, "", "bash", "SIG");
+        store.flush().await;
         assert_eq!(store.count_rows().await, 0);
     }
 
@@ -986,9 +1151,8 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
         // A target that cannot carry Gemini opaque state (capability = None)
         // must still observe that stored state exists, so portability policy
         // can act on it.
@@ -1003,9 +1167,7 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
         store.expire_all_for_test().await;
         let result = store
             .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
@@ -1018,9 +1180,8 @@ mod tests {
         let store = test_store().await;
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
-        store
-            .capture_tool_signature(&scope, &target, None, "call_1", "bash", "gemini-3", "SIG_A")
-            .await;
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
         let _ = store
             .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
             .await;
@@ -1029,6 +1190,7 @@ mod tests {
             .await;
         let metrics = store.metrics();
         assert_eq!(metrics.capture_stored, 1);
+        assert_eq!(metrics.capture_dropped, 0);
         assert_eq!(metrics.lookup_hit, 1);
         assert_eq!(metrics.lookup_miss, 1);
         assert_eq!(metrics.entries, 1);

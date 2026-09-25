@@ -27,12 +27,13 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - An adapter indicates that it produces opaque provider state (e.g. Gemini `thoughtSignature`) by returning `Some(OpaqueStateTarget)` from the `Adapter::opaque_state_target` trait method; the default is `None`, and plugin adapters are never assumed compatible with another adapter's opaque-state protocol.
 - **Opaque Provider State (`src/opaque_state.rs`)**:
   - Host-owned subsystem that persists provider continuation state the client protocol cannot represent (currently Gemini `thoughtSignature`) and replays it on later turns.
-  - Captures signatures keyed by the post-normalization client-visible tool-call id, the client scope (virtual key id or `internal`), and the coarse provider family/producer; state from one virtual key is never served to another.
+  - Captures signatures keyed by the post-normalization client-visible tool-call id, the client scope (virtual key id or `internal`), the provider, and the **exact originating model** plus family/producer; state from one virtual key is never served to another, and (for `generateContent`) state is never restored onto a different model.
   - Encrypts values at rest with a cipher derived specifically for this subsystem (`kinetix-opaque-provider-state`, distinct from the credential and plugin-KV ciphers); only SHA-256 hashes of scope, tool-call id, session id, and tool name are persisted.
-  - Uses a bounded RAM cache written synchronously plus asynchronous SQLite durability, and is consumed by `src/pipeline.rs` around the existing portability decision: compatible state is restored only after a `strip_with_warning`/`reject` boundary is settled.
+  - Uses a bounded RAM cache written synchronously for the data plane; encryption, the SQLite UPSERT, and periodic pruning run on a bounded background durability worker (`DurabilityJob` channel + `flush()` barrier), so a slow or locked database never stalls a streaming tool call. A saturated queue or a storage failure is counted, never fatal to a live response.
+  - Consumed by `src/pipeline.rs` around the existing portability decision: compatible state is restored only after a `strip_with_warning`/`reject` boundary is settled, and any known-but-incompatible stored state enters that decision even when neither the provider nor the wire format crossed over.
 - **Control Plane & Storage (`src/db.rs`, `migrations/`, `src/admin.rs`)**:
   - SQLite database running with WAL mode (`PRAGMA journal_mode=WAL`) managed via SQLx migrations.
-  - Persists providers, accounts, models, routes, virtual keys, request logs, token usage, cost accounting, plugin state, and opaque provider state (`opaque_provider_state`, migration `20260926120000_opaque_provider_state.sql`).
+  - Persists providers, accounts, models, routes, virtual keys, request logs, token usage, cost accounting, plugin state, and opaque provider state (`opaque_provider_state`, migrated by `20260926120000_opaque_provider_state.sql` and re-keyed for model scoping by `20260927090000_opaque_provider_state_model_scope.sql`).
   - Admin REST API (`/api/*`) for administration, metrics, exports (`src/export.rs`), and diagnostic traces.
 - **Embedded Admin Dashboard (`dashboard/`, `src/assets.rs`)**:
   - React 19 + TypeScript + Vite + Tailwind CSS v4 single-page application.
@@ -52,7 +53,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 - **Canonical Representation Boundary**: Frontends decode wire requests into internal canonical types. Outbound adapters encode canonical types into upstream wire payloads. Frontends and adapters never couple directly.
 - **Outbound Upstream Boundary**: Network requests to upstreams are strictly isolated within adapters. Credentials are leased dynamically and injected at dispatch time; upstream credentials and URLs are scrubbed before logging or downstream propagation.
 - **Host / Guest WASM Plugin Boundary**: Plugins run sandboxed in Wasmtime. They interact with the host solely via the WIT contract (`wit/kinetix-plugin.wit`) and are restricted by configured `HostPolicy`.
-- **Data Plane vs Control Plane Boundary**: Core request routing and streaming (data plane) remain resilient even if control plane/database operations experience transient latency. Usage logs are queued asynchronously (`src/logqueue.rs`), and opaque-state capture never fails a live response (storage errors are counted and swallowed).
+- **Data Plane vs Control Plane Boundary**: Core request routing and streaming (data plane) remain resilient even if control plane/database operations experience transient latency. Usage logs are queued asynchronously (`src/logqueue.rs`), and opaque-state capture never fails a live response (RAM write is synchronous; SQLite durability runs on a bounded async worker and storage errors/queue drops are counted and swallowed).
 - **Opaque Provider-State Boundary**: Adapters only parse/encode provider continuation state; they never persist it. Persistence, scope isolation, and replay live in `src/opaque_state.rs` and are orchestrated by `src/pipeline.rs`. Opaque signatures never appear in client responses, logs, traces, the dashboard, or metrics.
 
 ## dependency direction
@@ -61,7 +62,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - Entry point: `src/main.rs` -> `src/cli.rs` -> `src/server.rs` -> `src/app.rs`.
   - HTTP routing: `src/server.rs` mounts `src/frontends/`, `src/admin.rs`, and embedded `src/assets.rs`.
   - Request execution: `src/pipeline.rs` orchestrates `src/router.rs`, `src/registry.rs`, `src/pool.rs`, `src/adapters/`, `src/db.rs`, and `src/plugins/`.
-  - Opaque state: `src/pipeline.rs` orchestrates `src/opaque_state.rs` (RAM cache + SQLite) and `src/crypto.rs` (derived cipher); `src/adapters/` only opts in via `Adapter::opaque_state_target` and never calls the store.
+  - Opaque state: `src/pipeline.rs` orchestrates `src/opaque_state.rs` (RAM cache + bounded async durability worker over SQLite) and `src/crypto.rs` (derived cipher); `src/adapters/` only opts in via `Adapter::opaque_state_target` and never calls the store.
   - Leaf modules: `src/types.rs`, `src/crypto.rs`, `src/paths.rs`, `src/sse.rs`, `src/cost.rs`, `src/limits.rs` provide pure types and utilities with zero inward dependencies on pipeline or server.
   - Plugin host: `src/plugins/` depends on Wasmtime and the host WIT definition. Guest SDK/plugins are maintained independently in `PrightCord/kinetix-plugins`.
 
@@ -253,7 +254,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - `scripts/release-client-acceptance.sh`: Manual release-only Pi/Claude Code/Codex and optional real-`.kxp` acceptance. It may consume provider quota and must never be added to normal CI.
   - `scripts/synthetic_upstream.py` must fail closed when a fixture expects Kinetix to have translated a field: e.g. the `gemini-signature-continuation` fixture returns the provider's real "missing thought_signature" 400 unless the replayed function call carries the exact stored signature, and rejects a never-captured tool-call id. A 200 is thus evidence of replay rather than a vacuous pass.
 - **Opaque provider state**:
-  - `tests/opaque_state_gemini.rs`: Drives two-turn OpenAI->Gemini tool conversations against a strict mock upstream, covering streaming and non-streaming replay, SQLite-only durability across a simulated restart, cross-scope isolation, and tool-call-id/name reuse rejection before dispatch.
+  - `tests/opaque_state_gemini.rs`: Drives two-turn OpenAI->Gemini tool conversations against a strict mock upstream, covering streaming and non-streaming replay, SQLite-only durability across a simulated restart, cross-scope isolation, and tool-call-id/name reuse rejection before dispatch. It also regresses the portability boundary without session provenance: stored Gemini state reaching an OpenAI-wire target must be rejected by a `reject` Route, stripped with a warning by a `strip_with_warning` Route, and refused outright on a direct target.
 - **WASM plugin runtime**:
   - `tests/plugins.rs`: Tests plugin store, capabilities, lifecycle, and host policy.
   - `tests/plugin_e2e.rs`: Tests end-to-end installation, instantiation, and invocation of an external compiled `.kxp` supplied with `KINETIX_PLUGIN_E2E_PACKAGE`.

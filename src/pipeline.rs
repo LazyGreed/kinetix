@@ -886,7 +886,14 @@ pub async fn run(
         )
         .await?;
 
-        if cross_provider || cross_format {
+        // `opaque_report.nonportable()` must independently enter portability
+        // handling: stored state can be incompatible with a target even when
+        // neither cross_provider nor cross_format is set (e.g. an OpenAI
+        // client whose earlier Gemini turn stored a signature, now routed to
+        // an OpenAI target with no session provenance). Without this, the
+        // Route's reject/strip_with_warning policy would be bypassed and the
+        // state silently dropped.
+        if cross_provider || cross_format || opaque_report.nonportable() {
             if let Some(route) = &route {
                 apply_portability(
                     &mut target_req,
@@ -2947,7 +2954,6 @@ struct OpaqueCaptureContext {
     scope: OpaqueClientScope,
     session: Option<String>,
     target: OpaqueStateTarget,
-    origin_model: String,
 }
 
 impl OpaqueCaptureContext {
@@ -2969,17 +2975,19 @@ impl OpaqueCaptureContext {
             scope,
             session: session.map(str::to_string),
             target,
-            origin_model: attempt.target.model.upstream_id.clone(),
         })
     }
 }
 
-/// Persist every opaque signature observed on normalized `ToolCallStart`
+/// Record every opaque signature observed on normalized `ToolCallStart`
 /// events, keyed by the **client-visible** tool-call id (after
 /// `ToolStreamState::normalize`) so a later translated request can recover it
-/// by the id the client actually saw. Shared by both drivers; a storage
-/// failure is recorded by the store and never interrupts the response.
-async fn capture_opaque_state(
+/// by the id the client actually saw. Shared by both drivers. This is
+/// synchronous by design: it only writes the RAM cache and enqueues an
+/// asynchronous durability job, so a slow/locked database never stalls the
+/// streaming response (a storage failure is recorded by the store and never
+/// interrupts the response).
+fn capture_opaque_state(
     events: &[StreamEvent],
     ctx: &OpaqueCaptureContext,
     store: &OpaqueStateStore,
@@ -2992,17 +3000,14 @@ async fn capture_opaque_state(
             ..
         } = event
         {
-            store
-                .capture_tool_signature(
-                    &ctx.scope,
-                    &ctx.target,
-                    ctx.session.as_deref(),
-                    id,
-                    name,
-                    &ctx.origin_model,
-                    signature,
-                )
-                .await;
+            store.capture_tool_signature(
+                &ctx.scope,
+                &ctx.target,
+                ctx.session.as_deref(),
+                id,
+                name,
+                signature,
+            );
         }
     }
 }
@@ -3119,7 +3124,7 @@ async fn drive_stream(
     if let Some(events) = attempt.full_events.take() {
         let events = tool_stream.normalize(events);
         if let Some(ctx) = &opaque_ctx {
-            capture_opaque_state(&events, ctx, &state.opaque_state).await;
+            capture_opaque_state(&events, ctx, &state.opaque_state);
         }
         if !emit_translated_events(
             events,
@@ -3261,7 +3266,7 @@ async fn drive_stream(
                             }
                             let events = tool_stream.normalize(events);
                             if let Some(ctx) = &opaque_ctx {
-                                capture_opaque_state(&events, ctx, &state.opaque_state).await;
+                                capture_opaque_state(&events, ctx, &state.opaque_state);
                             }
                             if !emit_translated_events(
                                 events,
@@ -3680,7 +3685,7 @@ async fn drive_aggregate(
     if let Some(full_events) = attempt.full_events.take() {
         let normalized = tool_stream.normalize(full_events);
         if let Some(ctx) = &opaque_ctx {
-            capture_opaque_state(&normalized, ctx, &state.opaque_state).await;
+            capture_opaque_state(&normalized, ctx, &state.opaque_state);
         }
         for event in normalized {
             if let StreamEvent::Usage(value) = &event {
@@ -3745,8 +3750,7 @@ async fn drive_aggregate(
                                 }
                                 let normalized = tool_stream.normalize(parsed);
                                 if let Some(ctx) = &opaque_ctx {
-                                    capture_opaque_state(&normalized, ctx, &state.opaque_state)
-                                        .await;
+                                    capture_opaque_state(&normalized, ctx, &state.opaque_state);
                                 }
                                 for event in normalized {
                                     if let StreamEvent::Usage(value) = &event {

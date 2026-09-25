@@ -273,33 +273,44 @@ Kinetix keeps this state host-side instead of pushing it through the client:
 - **Capture.** As a translated response streams, the Gemini adapter surfaces the
   signature on the normalized tool-call event. The pipeline captures it keyed by
   the *post-normalization* client-visible tool-call id (so generated ids work
-  too), the coarse provider family, and the client scope (the virtual key id, or
-  `internal` for keyless requests).
+  too), the provider, the exact originating model, the protocol family/producer,
+  and the client scope (the virtual key id, or `internal` for keyless requests).
 - **Storage.** Values are encrypted at rest with a cipher derived specifically
   for this subsystem (distinct from the credential and plugin-KV ciphers), and
   stored in the `opaque_provider_state` table. Only SHA-256 hashes of the scope,
   tool-call id, session id, and tool name are persisted; raw identifiers and raw
-  signatures never are. A bounded RAM cache is written synchronously and the
-  SQLite row is written asynchronously, so the immediately following request
-  never races persistence.
+  signatures never are. A bounded RAM cache is written synchronously on the
+  request path, while encryption, the SQLite UPSERT, and periodic pruning run on
+  a bounded background worker: a slow or locked database can never stall the
+  streaming tool-call event, the immediately following request never races
+  persistence (the RAM entry is already present), and a saturated durability
+  queue drops the write with a counter rather than blocking the response.
 - **Replay.** On the next request, tool-call parts whose signature slot is empty
   are looked up. A compatible value is restored onto the exact historical part
   before dispatch. An explicit client/canonical signature is never overwritten,
   and a missing/unknown id is never given an invented signature.
 - **Scope and compatibility.** Replay is scoped to the originating virtual key.
   A stored value is only reused when the target's provider id, protocol family,
-  and producer match; the account may change (same-provider failover and
-  different Gemini models in the same family both stay compatible). Reusing a
-  tool-call id with a *different* tool name is rejected with HTTP 400 before any
-  upstream request is sent.
+  producer, and **exact originating model** all match; the account may change
+  (same-provider account failover stays compatible). Cross-model restoration is
+  deliberately not attempted: Google's `generateContent` contract only
+  guarantees a signature is accepted by the model that produced it, and
+  switching models is documented to require dummy signatures rather than reuse
+  of the original one. Reusing a tool-call id with a *different* tool name is
+  rejected with HTTP 400 before any upstream request is sent.
 - **Portability.** Stored state that the selected target cannot carry feeds the
   Route's existing `reject` / `strip_with_warning` portability policy exactly
-  like inline client state. Compatible stored state is restored only after the
-  portability decision, so a `strip_with_warning` boundary never deletes state
-  that the chosen target can use.
+  like inline client state — including when neither the provider nor the wire
+  format crossed over (for example an OpenAI client whose earlier Gemini turn
+  stored a signature is later routed to an OpenAI target). Compatible stored
+  state is restored only after the portability decision, so a
+  `strip_with_warning` boundary never deletes state that the chosen target can
+  use, and a direct cross-format target with no Route refuses known non-portable
+  state instead of silently dropping it.
 - **Observability.** `GET /admin/metrics` exports
   `kinetix_opaque_state_entries`, `kinetix_opaque_state_captured_total`,
   `kinetix_opaque_state_replaced_total`,
+  `kinetix_opaque_state_capture_dropped_total`,
   `kinetix_opaque_state_capture_storage_errors_total`, and
   `kinetix_opaque_state_lookups_total{outcome=...}`. These are counts and bucket
   sizes only; no signature, tool-call id, or session identifier is exported.

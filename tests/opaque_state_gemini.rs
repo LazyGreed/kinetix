@@ -95,10 +95,13 @@ fn function_call_parts(value: &Value) -> Vec<Value> {
     found
 }
 
-async fn gemini_upstream(State(mock): State<MockUpstream>, Json(body): Json<Value>) -> Response {
+/// One mock server serves both a Gemini-wire and an OpenAI-wire provider so a
+/// Route can mix them and exercise portability across formats/providers.
+async fn upstream(State(mock): State<MockUpstream>, Json(body): Json<Value>) -> Response {
+    let is_gemini = contains_key(&body, "contents");
     let missing = mock.record(&body).await;
     let has_response = contains_key(&body, "functionResponse");
-    if has_response && missing {
+    if is_gemini && has_response && missing {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -112,6 +115,19 @@ async fn gemini_upstream(State(mock): State<MockUpstream>, Json(body): Json<Valu
             .into_response();
     }
 
+    let sse = if is_gemini {
+        gemini_sse(has_response)
+    } else {
+        openai_sse()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(sse))
+        .unwrap()
+}
+
+fn gemini_sse(has_response: bool) -> String {
     let frames = if has_response {
         vec![
             json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "done"}]}}]}),
@@ -139,11 +155,25 @@ async fn gemini_upstream(State(mock): State<MockUpstream>, Json(body): Json<Valu
         sse.push_str(&frame.to_string());
         sse.push_str("\r\n\r\n");
     }
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .body(Body::from(sse))
-        .unwrap()
+    sse
+}
+
+/// Minimal, valid OpenAI streaming completion. Only reached on the
+/// `strip_with_warning` path, where a non-portable continuation is dropped and
+/// dispatch must still succeed.
+fn openai_sse() -> String {
+    let frames = [
+        json!({"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1,"model":"openai-mock","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}),
+        json!({"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1,"model":"openai-mock","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ];
+    let mut sse = String::new();
+    for frame in frames {
+        sse.push_str("data: ");
+        sse.push_str(&frame.to_string());
+        sse.push_str("\n\n");
+    }
+    sse.push_str("data: [DONE]\n\n");
+    sse
 }
 
 struct Harness {
@@ -204,7 +234,7 @@ async fn setup() -> Harness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = Router::new()
-        .fallback(post(gemini_upstream))
+        .fallback(post(upstream))
         .with_state(mock.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -307,6 +337,125 @@ async fn setup() -> Harness {
         .await
         .unwrap();
 
+    // A second, OpenAI-wire provider behind the same mock. Its model is the
+    // target of the portability-bypass regressions below: an OpenAI client
+    // whose earlier Gemini turn stored a signature, now routed here.
+    let openai_provider_id = db::insert_provider(
+        &pool,
+        &db::NewProvider {
+            name: "mock-openai",
+            base_url: &base_url,
+            wire_format: WireFormat::Openai,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 2_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: true,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_account(
+        &pool,
+        &openai_provider_id,
+        "mock-openai-account",
+        &crypto.encrypt("mock-key").unwrap(),
+        "mock-key",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let openai_model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &openai_provider_id,
+            upstream_id: "openai-mock",
+            display_name: "OpenAI Mock",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: json!(["text", "tool_calling"]),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    let reject_route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "reject-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &pool,
+        &reject_route_id,
+        None,
+        &openai_model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+
+    let strip_route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "strip-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "strip_with_warning",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &pool,
+        &strip_route_id,
+        None,
+        &openai_model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+
     let registry = Arc::new(Registry::new());
     registry.reload(&pool).await.unwrap();
 
@@ -403,8 +552,17 @@ fn first_turn(stream: bool) -> InternalRequest {
 }
 
 fn second_turn(stream: bool, tool_call_id: &str, tool_name: &str) -> InternalRequest {
+    second_turn_to("opaque-route", stream, tool_call_id, tool_name)
+}
+
+fn second_turn_to(
+    model: &str,
+    stream: bool,
+    tool_call_id: &str,
+    tool_name: &str,
+) -> InternalRequest {
     InternalRequest {
-        requested_model: "opaque-route".into(),
+        requested_model: model.into(),
         system: vec![],
         messages: vec![
             Message {
@@ -470,6 +628,36 @@ async fn run(
     Ok(status)
 }
 
+/// Like [`run`], but also returns the `x-kinetix-warning` header (used to
+/// prove a `strip_with_warning` portability decision actually happened).
+async fn run_with_warning(
+    state: &AppState,
+    key: Option<&db::VirtualKeyRow>,
+    req: InternalRequest,
+    request_id: &str,
+) -> Result<(u16, Option<String>), String> {
+    let response = pipeline::run(
+        state,
+        FrontendFormat::OpenAi,
+        key.cloned(),
+        req,
+        request_id.into(),
+        true,
+        None,
+        vec![],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let status = response.status().as_u16();
+    let warning = response
+        .headers()
+        .get("x-kinetix-warning")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+    Ok((status, warning))
+}
+
 #[tokio::test]
 async fn translated_tool_signature_is_replayed_after_restart() {
     let harness = setup().await;
@@ -485,6 +673,9 @@ async fn translated_tool_signature_is_replayed_after_restart() {
     .await
     .expect("turn 1 should dispatch and capture the signature");
     assert_eq!(harness.mock.requests.lock().await.len(), 1);
+    // Ensure the asynchronous durability write has landed before a fresh
+    // process (empty RAM cache) reads it back.
+    harness.state.opaque_state.flush().await;
 
     // A fresh AppState over the same database has an empty RAM cache: this is
     // the process-restart case where only SQLite survives.
@@ -557,6 +748,7 @@ async fn cross_scope_replay_is_never_served_to_another_key() {
     )
     .await
     .expect("owner turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
 
     // The stranger reuses the same client-visible tool-call id. It must not be
     // handed the owner's signature.
@@ -614,6 +806,105 @@ async fn reusing_a_tool_call_id_with_a_different_name_is_rejected_before_dispatc
         harness.mock.requests.lock().await.len(),
         1,
         "the mismatch must be rejected before any upstream dispatch"
+    );
+
+    cleanup(harness).await;
+}
+
+/// Capture a Gemini signature for `key` and flush it to SQLite. The
+/// regressions below then look the state up for an OpenAI target, whose
+/// adapter reports no opaque-state capability and therefore reads SQLite
+/// directly (never the Gemini-keyed RAM entry).
+async fn capture_gemini_signature(harness: &Harness, key: &db::VirtualKeyRow, request_id: &str) {
+    run(&harness.state, Some(key), first_turn(false), request_id)
+        .await
+        .expect("gemini turn 1 should capture the signature");
+    harness.state.opaque_state.flush().await;
+}
+
+/// A stored Gemini signature reached a *reject* Route whose target is an
+/// OpenAI-wire model. Neither `cross_provider` nor `cross_format` is set (the
+/// client is OpenAI, the target is OpenAI, and there is no session
+/// provenance), but the stored state is still non-portable and the Route's
+/// reject policy must apply before dispatch.
+#[tokio::test]
+async fn stored_nonportable_state_is_rejected_by_route_without_session_provenance() {
+    let harness = setup().await;
+    let key = virtual_key("key-reject");
+    capture_gemini_signature(&harness, &key, "req_reject_1").await;
+    let requests_before = harness.mock.requests.lock().await.len();
+
+    let error = run(
+        &harness.state,
+        Some(&key),
+        second_turn_to("reject-route", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_reject_2",
+    )
+    .await
+    .expect_err("a reject route must refuse non-portable stored state");
+    assert!(
+        error.contains("forbids"),
+        "unexpected rejection message: {error}"
+    );
+    assert_eq!(
+        harness.mock.requests.lock().await.len(),
+        requests_before,
+        "rejection must happen before upstream dispatch"
+    );
+
+    cleanup(harness).await;
+}
+
+/// The same non-portable state on a *strip_with_warning* Route must be
+/// dropped with a client-visible warning rather than silently ignored.
+#[tokio::test]
+async fn stored_nonportable_state_is_stripped_with_warning_without_session_provenance() {
+    let harness = setup().await;
+    let key = virtual_key("key-strip");
+    capture_gemini_signature(&harness, &key, "req_strip_1").await;
+
+    let (status, warning) = run_with_warning(
+        &harness.state,
+        Some(&key),
+        second_turn_to("strip-route", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_strip_2",
+    )
+    .await
+    .expect("strip_with_warning must dispatch after dropping the state");
+    assert_eq!(status, 200);
+    assert!(
+        warning.as_deref().is_some_and(|value| !value.is_empty()),
+        "the portability decision must surface a warning header, got {warning:?}"
+    );
+
+    cleanup(harness).await;
+}
+
+/// A direct target (no Route, so no policy) must refuse known non-portable
+/// stored state instead of silently dropping it.
+#[tokio::test]
+async fn stored_nonportable_state_is_rejected_for_direct_target_without_session_provenance() {
+    let harness = setup().await;
+    let key = virtual_key("key-direct");
+    capture_gemini_signature(&harness, &key, "req_direct_1").await;
+    let requests_before = harness.mock.requests.lock().await.len();
+
+    let error = run(
+        &harness.state,
+        Some(&key),
+        second_turn_to("openai-mock", false, TOOL_CALL_ID, TOOL_NAME),
+        "req_direct_2",
+    )
+    .await
+    .expect_err("a direct target must refuse non-portable stored state");
+    assert!(
+        error.contains("non-portable"),
+        "unexpected rejection message: {error}"
+    );
+    assert_eq!(
+        harness.mock.requests.lock().await.len(),
+        requests_before,
+        "rejection must happen before upstream dispatch"
     );
 
     cleanup(harness).await;
