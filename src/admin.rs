@@ -4340,7 +4340,7 @@ async fn validate_imported_provider_credential_semantics(
 ) -> Result<(), String> {
     match credential_mode {
         crate::plugins::CredentialMode::None => {
-            if !credential_plugin.trim().is_empty() {
+            if !credential_plugin.is_empty() {
                 return Err(format!(
                     "provider '{name}': credential_mode 'none' may not declare credential_plugin"
                 ));
@@ -8857,6 +8857,47 @@ mod credential_enrollment_regression_tests {
         assert_eq!(missing_error.0, StatusCode::BAD_REQUEST);
         assert!(missing_error.1.contains("requires source_plugin_id"));
         assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let existing_id = insert_provider(
+            &state,
+            "existing-auth",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("plugin.test"),
+            Some("oauth"),
+        )
+        .await;
+        let mut existing_update = json!({
+            "name": "existing-auth",
+            "base_url": "http://127.0.0.1:12345",
+            "wire_format": "openai",
+            "auth_scheme": "bearer",
+            "extra_headers": {},
+            "rate_limit_rules": {},
+            "credential_plugin": "plugin:wrong.plugin/strategy",
+            "wire_plugin": "",
+            "model_source_plugin": ""
+        });
+        existing_update["credential_plugin"] = json!("plugin:wrong.plugin/strategy");
+        let update_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [existing_update]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(update_error.0, StatusCode::BAD_REQUEST);
+        assert!(update_error
+            .1
+            .contains("credential_plugin does not match source_plugin_id"));
+        let existing = db::get_provider(&state.pool, &existing_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing.credential_mode, "auth_flow");
+        assert_eq!(existing.credential_plugin, "plugin:plugin.test/strategy");
 
         let _ = std::fs::remove_dir_all(root);
     }
