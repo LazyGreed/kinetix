@@ -92,7 +92,16 @@ impl Registry {
             snap.providers.insert(p.id.clone(), p);
         }
         for a in accounts {
-            snap.accounts.insert(a.id.clone(), a);
+            let allowed = snap
+                .providers
+                .get(&a.provider_id)
+                .is_some_and(|provider| match provider.credential_mode.as_str() {
+                    "none" => a.label == "__kinetix_noauth__",
+                    _ => a.label != "__kinetix_noauth__",
+                });
+            if allowed {
+                snap.accounts.insert(a.id.clone(), a);
+            }
         }
         for m in models {
             snap.model_by_upstream
