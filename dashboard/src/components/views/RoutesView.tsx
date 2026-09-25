@@ -5,6 +5,14 @@ import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
 import { Kinetix } from '../../lib/resources';
 
+const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], string]> = [
+  ['priority', 'Priority (Ordered fallback on failure)'],
+  ['round-robin', 'Round-robin load balancing'],
+  ['weighted', 'Weighted distribution'],
+  ['least-used', 'Least-used (prefer idle accounts)'],
+];
+
+
 interface RoutesViewProps {
   routes: Route[];
   accounts: Account[];
@@ -35,7 +43,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   // New route form
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [strategy, setStrategy] = useState<'priority' | 'round-robin' | 'weighted' | 'least-used'>('priority');
+  const [strategy, setStrategy] = useState<Route['selectionStrategy']>('priority');
   const [on429, setOn429] = useState(true);
   const [onQuota, setOnQuota] = useState(true);
   const [on5xx, setOn5xx] = useState(true);
@@ -507,6 +515,28 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
 
               {/* Route Policies & Triggers Settings */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-[var(--paper)] p-4 border-2 border-[var(--ink)] rounded-lg">
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Selection Strategy
+                  </label>
+                  <select
+                    value={activeRoute.selectionStrategy}
+                    onChange={(e) =>
+                      onUpdateRoute({
+                        ...activeRoute,
+                        selectionStrategy: e.target.value as Route['selectionStrategy'],
+                      })
+                    }
+                    className="w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded"
+                  >
+                    {ROUTE_STRATEGIES.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 <div>
                   <h5 className="font-heading font-bold text-base text-[var(--ink)] mb-2 flex items-center gap-1">
                     <Shield className="w-4 h-4 text-[var(--pen-blue)]" />
@@ -739,14 +769,15 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                   </label>
                   <select
                     value={strategy}
-                    onChange={(e) => setStrategy(e.target.value as any)}
+                    onChange={(e) => setStrategy(e.target.value as Route['selectionStrategy'])}
                     className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base sketch-shadow-sm focus:outline-none font-mono"
                     style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
                   >
-                    <option value="priority">Priority (Ordered fallback on failure)</option>
-                    <option value="round-robin">Round-robin load balancing</option>
-                    <option value="weighted">Weighted distribution</option>
-                    <option value="least-used">Least-used (prefer idle accounts)</option>
+                    {ROUTE_STRATEGIES.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
