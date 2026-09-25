@@ -310,7 +310,7 @@ pub async fn count_tokens(
     .await
     .map_err(|error| {
         if let Some(failure) = error.adapter_failure {
-            failure_to_error(&failure, target)
+            failure_to_error(&failure, &target)
         } else if error.timeout {
             ProxyError::upstream("upstream token-count request timed out")
         } else {
@@ -328,7 +328,7 @@ pub async fn count_tokens(
         let native = adapter.classify_error(status, &text, &headers);
         let failure = apply_provider_failure_rules(&target.provider, status, &text, native);
         return Err(preserve_anthropic_error(
-            failure_to_error(&failure, target),
+            failure_to_error(&failure, &target),
             FrontendFormat::Anthropic,
             adapter.as_ref(),
             &failure,
