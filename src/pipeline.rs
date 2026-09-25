@@ -5016,6 +5016,108 @@ mod route_policy_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn signed_content_marker_reaches_opaque_capture() {
+        let dir = std::env::temp_dir().join(format!(
+            "kinetix-pipeline-opaque-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("t.db").display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let store = OpaqueStateStore::new(
+            pool,
+            Arc::new(crate::crypto::Crypto::new(&[11u8; 32])),
+        );
+        let scope = OpaqueClientScope::internal();
+        let target = OpaqueStateTarget {
+            kind: crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
+            provider_id: "provider_test".into(),
+            family: "gemini".into(),
+            producer: "plugin:plugin.test:gemini-thought-signature:v1".into(),
+            model_id: "gemini-3.1-flash-lite".into(),
+        };
+        let ctx = OpaqueCaptureContext {
+            scope: scope.clone(),
+            session: None,
+            target: target.clone(),
+        };
+
+        let mut thinking_state = ToolStreamState::new("req_thinking");
+        let thinking_events = thinking_state.normalize(vec![
+            StreamEvent::ThinkingDelta {
+                text: "reasoning...".into(),
+                signature: None,
+            },
+            StreamEvent::ThinkingDelta {
+                text: String::new(),
+                signature: Some("SIG_THINK".into()),
+            },
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: Some("call_think".into()),
+                name: "bash".into(),
+                signature: None,
+            },
+        ]);
+        assert!(matches!(
+            &thinking_events[2],
+            StreamEvent::ToolCallStart {
+                signature: Some(signature),
+                ..
+            } if signature == "SIG_THINK"
+        ));
+        capture_opaque_state(&thinking_events, &ctx, &store);
+        assert_eq!(
+            store
+                .resolve_tool_signature(
+                    &scope,
+                    Some(&target),
+                    None,
+                    "call_think",
+                    "bash",
+                )
+                .await,
+            OpaqueLookupResult::Compatible("SIG_THINK".into())
+        );
+
+        let mut text_state = ToolStreamState::new("req_text");
+        let text_events = text_state.normalize(vec![
+            StreamEvent::TextDelta("visible response".into()),
+            StreamEvent::ThinkingDelta {
+                text: String::new(),
+                signature: Some("SIG_TEXT".into()),
+            },
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: Some("call_text".into()),
+                name: "read".into(),
+                signature: None,
+            },
+        ]);
+        assert!(matches!(
+            &text_events[2],
+            StreamEvent::ToolCallStart {
+                signature: Some(signature),
+                ..
+            } if signature == "SIG_TEXT"
+        ));
+        capture_opaque_state(&text_events, &ctx, &store);
+        assert_eq!(
+            store
+                .resolve_tool_signature(
+                    &scope,
+                    Some(&target),
+                    None,
+                    "call_text",
+                    "read",
+                )
+                .await,
+            OpaqueLookupResult::Compatible("SIG_TEXT".into())
+        );
+    }
+
     #[test]
     fn pending_signature_not_copied_to_parallel_calls() {
         let mut state = ToolStreamState::new("req_test");
