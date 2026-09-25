@@ -292,7 +292,9 @@ struct ModelCapabilitiesV2 {
     tools: Option<SupportCapabilityV1>,
     vision: Option<VisionCapabilityV1>,
     structured_output: Option<SupportCapabilityV1>,
+    #[allow(dead_code)]
     prices: Option<serde_json::Value>,
+    #[allow(dead_code)]
     modalities: Option<serde_json::Value>,
     identity: Option<ModelIdentityV2>,
     opaque_state: Option<OpaqueStateCapabilityV1>,
@@ -480,7 +482,10 @@ impl ModelIdentityV2 {
             return false;
         }
 
-        self.variant.as_ref().is_none_or(ProviderVariantV1::is_valid)
+        self.variant
+            .as_ref()
+            .map(ProviderVariantV1::is_valid)
+            .unwrap_or(true)
     }
 }
 
@@ -1255,6 +1260,126 @@ mod reasoning_discovery_tests {
             Some("thinkingConfig.thinkingLevel")
         );
         assert_eq!(map.levels.get("medium"), Some(&serde_json::json!("medium")));
+    }
+
+    #[test]
+    fn schema_v2_exposes_identity_variant_reasoning_and_opaque_state() {
+        let metadata = serde_json::json!({
+            "schema_version": 2,
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["high"],
+                "default": "high",
+                "can_disable": false
+            },
+            "tools": {"supported": true},
+            "identity": {
+                "canonical_model_id": "google/gemini-3.8-flash",
+                "variant": {
+                    "kind": "reasoning_tier",
+                    "id": "high",
+                    "reasoning_level": "high",
+                    "fixed": true
+                }
+            },
+            "opaque_state": {
+                "kind": "gemini_thought_signature",
+                "family": "gemini",
+                "encoding_version": 1,
+                "placeholder_strategy": "gemini3_skip_validator"
+            }
+        });
+
+        let flags = plugin_capability_flags(&metadata).unwrap();
+        assert_eq!(flags.reasoning, Some(true));
+        assert_eq!(flags.tool_calling, Some(true));
+        let reasoning = normalize_plugin_reasoning_capability(&metadata).unwrap();
+        assert_eq!(reasoning.levels, vec!["high"]);
+        assert_eq!(reasoning.default.as_deref(), Some("high"));
+        assert_eq!(
+            plugin_identity_hint(&metadata).as_deref(),
+            Some("google/gemini-3.8-flash")
+        );
+        assert_eq!(
+            plugin_provider_variant(&metadata).unwrap()["id"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            plugin_opaque_state_capability(&metadata).unwrap()["family"],
+            serde_json::json!("gemini")
+        );
+    }
+
+    #[test]
+    fn schema_v1_generic_dispatch_matches_existing_helpers() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["low", "high"],
+                "default": "low",
+                "can_disable": false
+            },
+            "tools": {"supported": true}
+        });
+        assert_eq!(
+            plugin_capability_flags(&metadata),
+            plugin_capability_flags_v1(&metadata)
+        );
+        assert_eq!(
+            plugin_reasoning_support(&metadata),
+            plugin_reasoning_support_v1(&metadata)
+        );
+        assert_eq!(
+            normalize_plugin_reasoning_capability(&metadata),
+            normalize_plugin_reasoning_capability_v1(&metadata)
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_schema_v2_metadata_fails_closed() {
+        for metadata in [
+            serde_json::json!({
+                "schema_version": 2,
+                "identity": {"canonical_model_id": "missing-provider-separator"}
+            }),
+            serde_json::json!({
+                "schema_version": 2,
+                "identity": {
+                    "canonical_model_id": "google/gemini-3.8-flash",
+                    "variant": {
+                        "kind": "provider_alias",
+                        "id": "alias",
+                        "reasoning_level": "high",
+                        "fixed": false
+                    }
+                }
+            }),
+            serde_json::json!({
+                "schema_version": 2,
+                "opaque_state": {
+                    "kind": "gemini_thought_signature",
+                    "family": "bad family",
+                    "encoding_version": 1
+                }
+            }),
+            serde_json::json!({
+                "schema_version": 2,
+                "opaque_state": {
+                    "kind": "gemini_thought_signature",
+                    "family": "gemini",
+                    "encoding_version": 0
+                }
+            }),
+            serde_json::json!({"schema_version": 2, "unknown": true}),
+            serde_json::json!({"schema_version": 99}),
+        ] {
+            assert!(plugin_capability_flags(&metadata).is_none());
+            assert!(plugin_identity(&metadata).is_none());
+            assert!(plugin_opaque_state_capability(&metadata).is_none());
+        }
     }
 
     #[test]
