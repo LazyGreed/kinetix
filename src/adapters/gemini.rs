@@ -818,8 +818,10 @@ impl Adapter for GeminiAdapter {
     /// of a replayed `functionCall` (and therefore documents the bypass);
     /// Gemini 2.5 and older treat the signature as optional, so injecting the
     /// sentinel there would be inventing protocol state the upstream never
-    /// asked for. The gate is deliberately a model-id check for now — there is
-    /// no operator-configurable capability that expresses "Gemini 3 signature
+    /// asked for. A later major family is *not* assumed to inherit the Gemini 3
+    /// contract either, since nothing documents the bypass for it yet. The gate
+    /// is deliberately a model-id check for now — there is no
+    /// operator-configurable capability that expresses "Gemini 3 signature
     /// semantics" yet, and hardcoding a broader vendor preset in the pipeline
     /// core is forbidden.
     ///
@@ -827,24 +829,31 @@ impl Adapter for GeminiAdapter {
     /// (signature validation on replayed function calls, and the sentinel for
     /// history transferred from another model, both apply to Gemini 3).
     fn opaque_state_placeholder(&self, model: &crate::db::ModelRow) -> Option<&'static str> {
-        is_gemini_three_or_newer(&model.upstream_id).then_some(GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
+        is_gemini_three(&model.upstream_id).then_some(GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
     }
 }
 
-/// Whether `upstream_id` names a Gemini 3 (or later) model.
+/// Whether `upstream_id` names a Gemini 3 model.
 ///
 /// The id is matched as `...gemini-<major>...`, so both bare ids
 /// (`gemini-3-pro-preview`) and path-qualified ids (`models/gemini-3-flash`)
 /// are recognised. An id that does not carry a Gemini version number is not
-/// treated as Gemini 3. See
+/// treated as Gemini 3.
+///
+/// The match is `major == 3`, not `major >= 3`: Google documents the
+/// thought-signature validation rule (and the `skip_thought_signature_validator`
+/// bypass for it) for Gemini 3 only. There is no evidence that a later major
+/// family keeps that contract, so a `gemini-4-*` id must fall back to the
+/// ordinary strip/reject portability path rather than be handed a
+/// validator-bypass sentinel. See
 /// <https://ai.google.dev/gemini-api/docs/thought-signatures> for the Gemini 3
 /// signature semantics this gate reflects.
-fn is_gemini_three_or_newer(upstream_id: &str) -> bool {
+fn is_gemini_three(upstream_id: &str) -> bool {
     let Some((_, rest)) = upstream_id.rsplit_once("gemini-") else {
         return false;
     };
     let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    major.parse::<u32>().is_ok_and(|version| version >= 3)
+    major.parse::<u32>().is_ok_and(|version| version == 3)
 }
 
 /// Convert a Gemini chunk/response into internal stream events.
@@ -1225,11 +1234,38 @@ mod schema_tests {
     }
 
     #[test]
+    fn later_gemini_majors_do_not_inherit_the_gemini_3_placeholder() {
+        // The validator bypass is documented for Gemini 3 only: Google's
+        // thought-signatures doc names the Gemini 3 preview models
+        // (gemini-3-pro-preview, gemini-3-flash-preview) as the family that
+        // enforces replay validation and documents
+        // `skip_thought_signature_validator` as the escape hatch
+        // (<https://ai.google.dev/gemini-api/docs/thought-signatures>).
+        // Nothing states a later major keeps that contract, so Kinetix must
+        // not hand a future family a validator-bypass token it cannot justify;
+        // a `gemini-4-*` target falls back to the ordinary strip/reject
+        // portability path.
+        for upstream_id in [
+            "gemini-4-pro",
+            "gemini-4-flash",
+            "models/gemini-4.0-pro",
+            "gemini-5-pro",
+        ] {
+            assert_eq!(
+                GeminiAdapter::new().opaque_state_placeholder(&model_row(upstream_id)),
+                None,
+                "{upstream_id} must not receive the Gemini 3 placeholder"
+            );
+        }
+    }
+
+    #[test]
     fn gemini_three_detection_handles_path_qualified_ids() {
-        assert!(is_gemini_three_or_newer("gemini-3-pro-preview"));
-        assert!(is_gemini_three_or_newer("models/gemini-3-flash"));
-        assert!(!is_gemini_three_or_newer("models/gemini-2.5-pro"));
-        assert!(!is_gemini_three_or_newer("gemini"));
+        assert!(is_gemini_three("gemini-3-pro-preview"));
+        assert!(is_gemini_three("models/gemini-3-flash"));
+        assert!(!is_gemini_three("models/gemini-2.5-pro"));
+        assert!(!is_gemini_three("gemini-4-pro"));
+        assert!(!is_gemini_three("gemini"));
     }
 
     #[test]

@@ -65,12 +65,13 @@ fn expected_signature(model: &str) -> &'static str {
 /// Whether this model enforces a thought signature on a replayed
 /// `functionCall`. Only Gemini 3 does; Gemini 2.5 and older accept an unsigned
 /// historical call, and never document the Gemini 3 validator-bypass sentinel.
+/// Later majors are not assumed to inherit the Gemini 3 contract.
 fn signature_required(model: &str) -> bool {
     let Some((_, rest)) = model.rsplit_once("gemini-") else {
         return false;
     };
     let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    major.parse::<u32>().is_ok_and(|version| version >= 3)
+    major.parse::<u32>().is_ok_and(|version| version == 3)
 }
 
 /// How the mock classified a continuation request. `Invalid` is exactly what

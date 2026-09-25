@@ -340,11 +340,14 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   Flash→Pro change): the adapter's placeholder is a protocol-valid
   substitute, so the request proceeds with a warning rather than being refused.
   The placeholder is **gated to the family that documents it**: the Gemini
-  adapter returns the sentinel only for Gemini 3 (and later) model ids, because
-  only that family validates the signature of a replayed function call. Gemini
-  2.5 and older treat the signature as optional and never documented the
+  adapter returns the sentinel only for Gemini 3 model ids, because only that
+  family is documented to validate the signature of a replayed function call.
+  Gemini 2.5 and older treat the signature as optional and never documented the
   sentinel, so a continuation onto such a model is stripped and continues
-  unsigned rather than receiving the Gemini 3 validator-bypass token.
+  unsigned rather than receiving the Gemini 3 validator-bypass token. A later
+  major family (for example `gemini-4-*`) is not assumed to inherit the Gemini 3
+  contract either, and falls back to the same strip/reject portability path
+  until provider documentation or capability metadata says otherwise.
   The placeholder
   is painted only onto calls the store knew about but the target cannot carry —
   an id that was never captured is still left untouched, so missing state is
