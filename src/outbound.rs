@@ -258,9 +258,7 @@ fn should_retry_transient_gateway(
         && retries_done < MAX_TRANSIENT_GATEWAY_RETRIES
         && matches!(
             status,
-            StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
+            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
         )
 }
 
@@ -481,9 +479,7 @@ mod tests {
     }
 
     async fn transient_gateway_retry_case(status: u16, explicit_empty_length: bool) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for attempt in 0..2 {
@@ -496,12 +492,9 @@ mod tests {
                     } else {
                         ""
                     };
-                    format!(
-                        "HTTP/1.1 {status} transient\r\n{length}Connection: close\r\n\r\n"
-                    )
+                    format!("HTTP/1.1 {status} transient\r\n{length}Connection: close\r\n\r\n")
                 } else {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_string()
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                 };
                 socket.write_all(response.as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
