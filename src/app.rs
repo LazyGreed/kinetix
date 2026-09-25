@@ -81,6 +81,20 @@ pub struct AppState {
     hook_tx: tokio::sync::mpsc::Sender<HookJob>,
 }
 
+enum RefreshLookup<T, E> {
+    Found(T),
+    Missing,
+    Transient(E),
+}
+
+fn classify_refresh_lookup<T, E>(result: Result<Option<T>, E>) -> RefreshLookup<T, E> {
+    match result {
+        Ok(Some(value)) => RefreshLookup::Found(value),
+        Ok(None) => RefreshLookup::Missing,
+        Err(error) => RefreshLookup::Transient(error),
+    }
+}
+
 #[derive(Clone)]
 pub struct StickyEntry {
     /// The selected route target key (route id + account id + model id).
@@ -357,14 +371,16 @@ impl AppState {
     }
 
     async fn refresh_due_credential(&self, key: crate::credential_refresh::CredentialKey) {
-        let account = match crate::db::get_account(&self.pool, &key.account_id).await {
-            Ok(Some(account)) => account,
-            Ok(None) => {
+        let account = match classify_refresh_lookup(
+            crate::db::get_account(&self.pool, &key.account_id).await,
+        ) {
+            RefreshLookup::Found(account) => account,
+            RefreshLookup::Missing => {
                 self.credential_refresh
                     .forget(&key.provider_id, &key.account_id);
                 return;
             }
-            Err(error) => {
+            RefreshLookup::Transient(error) => {
                 tracing::debug!(
                     provider = %key.provider_id,
                     account = %key.account_id,
@@ -380,14 +396,16 @@ impl AppState {
             return;
         }
 
-        let provider = match crate::db::get_provider(&self.pool, &key.provider_id).await {
-            Ok(Some(provider)) => provider,
-            Ok(None) => {
+        let provider = match classify_refresh_lookup(
+            crate::db::get_provider(&self.pool, &key.provider_id).await,
+        ) {
+            RefreshLookup::Found(provider) => provider,
+            RefreshLookup::Missing => {
                 self.credential_refresh
                     .forget(&key.provider_id, &key.account_id);
                 return;
             }
-            Err(error) => {
+            RefreshLookup::Transient(error) => {
                 tracing::debug!(
                     provider = %key.provider_id,
                     account = %key.account_id,
@@ -510,6 +528,18 @@ impl AppState {
 #[cfg(test)]
 mod hook_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn refresh_lookup_distinguishes_missing_from_transient_failure() {
+        assert!(matches!(
+            classify_refresh_lookup::<i32, &str>(Ok(None)),
+            RefreshLookup::Missing
+        ));
+        assert!(matches!(
+            classify_refresh_lookup::<i32, &str>(Err("sqlite busy")),
+            RefreshLookup::Transient("sqlite busy")
+        ));
+    }
 
     #[tokio::test]
     async fn blocked_hook_job_does_not_block_next_job() {
