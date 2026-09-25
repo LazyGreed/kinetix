@@ -244,8 +244,10 @@ struct ModelCapabilitiesV1 {
     structured_output: Option<SupportCapabilityV1>,
     /// Canonical plugin-supplied pricing. Kept in the existing v1 JSON
     /// envelope so old WIT components remain ABI-compatible.
+    #[allow(dead_code)]
     prices: Option<serde_json::Value>,
     /// Optional directional modality metadata from plugin discovery.
+    #[allow(dead_code)]
     modalities: Option<serde_json::Value>,
 }
 
