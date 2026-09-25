@@ -294,10 +294,12 @@ ever receiving plaintext secret bytes.
 Credential lifecycle policy remains host-owned. Kinetix records `refresh_after` when supplied;
 otherwise it derives a provider-neutral lead from `expires_at`. A host-owned refresh coordinator
 schedules renewal off the request path, applies bounded retry backoff, and shares one account-scoped
-singleflight gate with reactive auth-error renewal. The plugin still owns the provider-specific
-`rotate` exchange and returns the next lease. A transient proactive refresh failure does not cool
-down or disable an otherwise still-valid account; a non-retryable invalid credential stops automatic
-refresh and requires re-authorization.
+singleflight gate across request-path `resolve`, scheduled refresh, and reactive auth-error renewal.
+This is required because API v1 credential plugins are allowed to refresh inside `resolve`.
+Structured credential errors remain intact across both `resolve` and `rotate`, so terminal
+`credential_expired` evidence can stop scheduling and require re-authorization instead of being
+downgraded to a retryable host error. A transient proactive refresh failure does not cool down or
+disable an otherwise still-valid account.
 
 ### 6.2 ModelSource
 
