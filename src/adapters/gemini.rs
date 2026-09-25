@@ -848,7 +848,7 @@ impl Adapter for GeminiAdapter {
 /// validator-bypass sentinel. See
 /// <https://ai.google.dev/gemini-api/docs/thought-signatures> for the Gemini 3
 /// signature semantics this gate reflects.
-fn is_gemini_three(upstream_id: &str) -> bool {
+pub(crate) fn is_gemini_three(upstream_id: &str) -> bool {
     let Some((_, rest)) = upstream_id.rsplit_once("gemini-") else {
         return false;
     };

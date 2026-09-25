@@ -81,6 +81,18 @@ export interface DiscoveredModel {
   } | null;
   canonical_model_id?: string | null;
   canonical_match?: string | null;
+  provider_variant?: {
+    kind: 'reasoning_tier' | 'provider_alias' | 'thinking_variant';
+    id: string;
+    reasoning_level?: string | null;
+    fixed: boolean;
+  } | null;
+  opaque_state?: {
+    kind: 'gemini_thought_signature';
+    family: string;
+    encoding_version: number;
+    placeholder_strategy?: 'gemini3_skip_validator' | null;
+  } | null;
   model_type?: string | null;
   execution_supported?: boolean;
   catalog?: {

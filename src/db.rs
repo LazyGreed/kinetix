@@ -780,8 +780,9 @@ pub struct ModelRow {
     pub extra_request: String,
     pub discovery: String,
     pub created_at: String,
-    /// §6.3 provenance tag for opaque provider-state produced by a plugin
-    /// adapter (empty when produced natively).
+    /// Host-owned provenance tag for opaque provider-state produced by a plugin
+    /// adapter (empty when produced natively). Compatibility is versioned by the
+    /// validated discovery descriptor, not by the plugin package version.
     #[serde(default)]
     pub opaque_state_plugin: String,
 }
@@ -892,6 +893,15 @@ pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
 pub async fn set_model_discovery(pool: &Pool, id: &str, discovery: &Value) -> Result<()> {
     sqlx::query("UPDATE models SET discovery=? WHERE id=?")
         .bind(discovery.to_string())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_model_opaque_state_plugin(pool: &Pool, id: &str, plugin_id: &str) -> Result<()> {
+    sqlx::query("UPDATE models SET opaque_state_plugin=? WHERE id=?")
+        .bind(plugin_id)
         .bind(id)
         .execute(pool)
         .await?;

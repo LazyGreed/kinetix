@@ -284,6 +284,69 @@ struct ModelCapabilitiesV1 {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ModelCapabilitiesV2 {
+    schema_version: u32,
+    transport: Option<TransportCapabilityV1>,
+    text: Option<SupportCapabilityV1>,
+    reasoning: Option<PluginReasoningCapabilityV1>,
+    tools: Option<SupportCapabilityV1>,
+    vision: Option<VisionCapabilityV1>,
+    structured_output: Option<SupportCapabilityV1>,
+    #[allow(dead_code)]
+    prices: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    modalities: Option<serde_json::Value>,
+    identity: Option<ModelIdentityV2>,
+    opaque_state: Option<OpaqueStateCapabilityV1>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ModelIdentityV2 {
+    pub canonical_model_id: String,
+    pub variant: Option<ProviderVariantV1>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderVariantV1 {
+    pub kind: ProviderVariantKind,
+    pub id: String,
+    pub reasoning_level: Option<PluginReasoningLevelV1>,
+    pub fixed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderVariantKind {
+    ReasoningTier,
+    ProviderAlias,
+    ThinkingVariant,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpaqueStateCapabilityV1 {
+    pub kind: OpaqueStateCapabilityKind,
+    pub family: String,
+    pub encoding_version: u32,
+    pub placeholder_strategy: Option<OpaqueStatePlaceholderStrategy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpaqueStateCapabilityKind {
+    GeminiThoughtSignature,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpaqueStatePlaceholderStrategy {
+    Gemini3SkipValidator,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransportCapabilityV1 {
     format: String,
 }
@@ -307,8 +370,8 @@ enum PluginReasoningModeV1 {
     Level,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
-enum PluginReasoningLevelV1 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PluginReasoningLevelV1 {
     #[serde(rename = "minimal")]
     Minimal,
     #[serde(rename = "low")]
@@ -401,21 +464,144 @@ fn parse_model_capabilities_v1(metadata: &serde_json::Value) -> Option<ModelCapa
     metadata.is_valid().then_some(metadata)
 }
 
-pub fn plugin_capability_flags_v1(metadata: &serde_json::Value) -> Option<ModelCapabilityFlags> {
-    let metadata = parse_model_capabilities_v1(metadata)?;
-    Some(ModelCapabilityFlags {
-        text: metadata.text.as_ref().map(|text| text.supported),
-        reasoning: metadata
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+impl ModelIdentityV2 {
+    fn is_valid(&self) -> bool {
+        let canonical = self.canonical_model_id.trim();
+        if canonical.is_empty()
+            || !canonical.contains('/')
+            || canonical.chars().any(char::is_control)
+        {
+            return false;
+        }
+
+        self.variant
+            .as_ref()
+            .map(ProviderVariantV1::is_valid)
+            .unwrap_or(true)
+    }
+}
+
+impl ProviderVariantV1 {
+    fn is_valid(&self) -> bool {
+        if self.id.trim().is_empty() || self.id.chars().any(char::is_control) {
+            return false;
+        }
+        if self.reasoning_level.is_some() && self.kind != ProviderVariantKind::ReasoningTier {
+            return false;
+        }
+        true
+    }
+}
+
+impl OpaqueStateCapabilityV1 {
+    fn is_valid(&self) -> bool {
+        if !valid_identifier(&self.family) || self.encoding_version == 0 {
+            return false;
+        }
+
+        match self.placeholder_strategy {
+            Some(OpaqueStatePlaceholderStrategy::Gemini3SkipValidator) => {
+                self.kind == OpaqueStateCapabilityKind::GeminiThoughtSignature
+            }
+            None => true,
+        }
+    }
+}
+
+impl ModelCapabilitiesV2 {
+    fn is_valid(&self) -> bool {
+        if self.schema_version != 2 {
+            return false;
+        }
+        if self
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.format.trim().is_empty())
+        {
+            return false;
+        }
+        if !self
             .reasoning
             .as_ref()
-            .map(|reasoning| reasoning.supported),
-        vision: metadata.vision.as_ref().map(|vision| vision.input),
-        tool_calling: metadata.tools.as_ref().map(|tools| tools.supported),
-        structured_output: metadata
-            .structured_output
+            .map(PluginReasoningCapabilityV1::is_valid)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        if !self
+            .identity
             .as_ref()
-            .map(|structured| structured.supported),
-    })
+            .map(ModelIdentityV2::is_valid)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        self.opaque_state
+            .as_ref()
+            .map(OpaqueStateCapabilityV1::is_valid)
+            .unwrap_or(true)
+    }
+}
+
+fn parse_model_capabilities_v2(metadata: &serde_json::Value) -> Option<ModelCapabilitiesV2> {
+    let metadata: ModelCapabilitiesV2 = serde_json::from_value(metadata.clone()).ok()?;
+    metadata.is_valid().then_some(metadata)
+}
+
+fn plugin_schema_version(metadata: &serde_json::Value) -> Option<u64> {
+    metadata.get("schema_version")?.as_u64()
+}
+
+fn capability_flags(
+    text: Option<&SupportCapabilityV1>,
+    reasoning: Option<&PluginReasoningCapabilityV1>,
+    vision: Option<&VisionCapabilityV1>,
+    tools: Option<&SupportCapabilityV1>,
+    structured_output: Option<&SupportCapabilityV1>,
+) -> ModelCapabilityFlags {
+    ModelCapabilityFlags {
+        text: text.map(|value| value.supported),
+        reasoning: reasoning.map(|value| value.supported),
+        vision: vision.map(|value| value.input),
+        tool_calling: tools.map(|value| value.supported),
+        structured_output: structured_output.map(|value| value.supported),
+    }
+}
+
+pub fn plugin_capability_flags_v1(metadata: &serde_json::Value) -> Option<ModelCapabilityFlags> {
+    let metadata = parse_model_capabilities_v1(metadata)?;
+    Some(capability_flags(
+        metadata.text.as_ref(),
+        metadata.reasoning.as_ref(),
+        metadata.vision.as_ref(),
+        metadata.tools.as_ref(),
+        metadata.structured_output.as_ref(),
+    ))
+}
+
+pub fn plugin_capability_flags(metadata: &serde_json::Value) -> Option<ModelCapabilityFlags> {
+    match plugin_schema_version(metadata)? {
+        1 => plugin_capability_flags_v1(metadata),
+        2 => {
+            let metadata = parse_model_capabilities_v2(metadata)?;
+            Some(capability_flags(
+                metadata.text.as_ref(),
+                metadata.reasoning.as_ref(),
+                metadata.vision.as_ref(),
+                metadata.tools.as_ref(),
+                metadata.structured_output.as_ref(),
+            ))
+        }
+        _ => None,
+    }
 }
 
 pub fn plugin_reasoning_support_v1(metadata: &serde_json::Value) -> Option<bool> {
@@ -424,11 +610,20 @@ pub fn plugin_reasoning_support_v1(metadata: &serde_json::Value) -> Option<bool>
         .map(|reasoning| reasoning.supported)
 }
 
-pub fn normalize_plugin_reasoning_capability_v1(
-    metadata: &serde_json::Value,
+pub fn plugin_reasoning_support(metadata: &serde_json::Value) -> Option<bool> {
+    match plugin_schema_version(metadata)? {
+        1 => plugin_reasoning_support_v1(metadata),
+        2 => parse_model_capabilities_v2(metadata)?
+            .reasoning
+            .map(|reasoning| reasoning.supported),
+        _ => None,
+    }
+}
+
+fn normalize_plugin_reasoning_fields(
+    transport: Option<&TransportCapabilityV1>,
+    reasoning: PluginReasoningCapabilityV1,
 ) -> Option<ReasoningCapability> {
-    let metadata = parse_model_capabilities_v1(metadata)?;
-    let reasoning = metadata.reasoning?;
     if !reasoning.supported {
         return None;
     }
@@ -445,11 +640,7 @@ pub fn normalize_plugin_reasoning_capability_v1(
         .map(|level| level.as_str().to_string())
         .collect();
     let default = reasoning.default.map(|level| level.as_str().to_string());
-    let upstream_format = match metadata
-        .transport
-        .as_ref()
-        .map(|transport| transport.format.as_str())
-    {
+    let upstream_format = match transport.map(|transport| transport.format.as_str()) {
         Some("openai") => "openai_effort",
         Some("openai-responses") => "responses_effort",
         Some("gemini") => "gemini_thinking_level",
@@ -470,9 +661,57 @@ pub fn normalize_plugin_reasoning_capability_v1(
     })
 }
 
+pub fn normalize_plugin_reasoning_capability_v1(
+    metadata: &serde_json::Value,
+) -> Option<ReasoningCapability> {
+    let metadata = parse_model_capabilities_v1(metadata)?;
+    normalize_plugin_reasoning_fields(metadata.transport.as_ref(), metadata.reasoning?)
+}
+
+pub fn normalize_plugin_reasoning_capability(
+    metadata: &serde_json::Value,
+) -> Option<ReasoningCapability> {
+    match plugin_schema_version(metadata)? {
+        1 => normalize_plugin_reasoning_capability_v1(metadata),
+        2 => {
+            let metadata = parse_model_capabilities_v2(metadata)?;
+            normalize_plugin_reasoning_fields(metadata.transport.as_ref(), metadata.reasoning?)
+        }
+        _ => None,
+    }
+}
+
+pub fn plugin_identity(metadata: &serde_json::Value) -> Option<serde_json::Value> {
+    let metadata = parse_model_capabilities_v2(metadata)?;
+    serde_json::to_value(metadata.identity?).ok()
+}
+
+pub fn plugin_identity_hint(metadata: &serde_json::Value) -> Option<String> {
+    parse_model_capabilities_v2(metadata)?
+        .identity
+        .map(|identity| identity.canonical_model_id)
+}
+
+pub fn plugin_provider_variant(metadata: &serde_json::Value) -> Option<serde_json::Value> {
+    let metadata = parse_model_capabilities_v2(metadata)?;
+    serde_json::to_value(metadata.identity?.variant?).ok()
+}
+
+pub fn plugin_opaque_state_capability(metadata: &serde_json::Value) -> Option<serde_json::Value> {
+    let metadata = parse_model_capabilities_v2(metadata)?;
+    serde_json::to_value(metadata.opaque_state?).ok()
+}
+
+pub(crate) fn parse_plugin_opaque_state_capability(
+    metadata: &serde_json::Value,
+) -> Option<OpaqueStateCapabilityV1> {
+    let descriptor: OpaqueStateCapabilityV1 = serde_json::from_value(metadata.clone()).ok()?;
+    descriptor.is_valid().then_some(descriptor)
+}
+
 /// Normalize provider-native/legacy discovery metadata into Kinetix's canonical
-/// reasoning capability. Versioned plugin capabilities_json uses the strict v1
-/// parser above. Unknown provider levels are discarded rather than invented.
+/// reasoning capability. Versioned plugin capabilities_json uses the strict
+/// version-dispatched parser above. Unknown provider levels are discarded rather than invented.
 pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<ReasoningCapability> {
     // Provider metadata may already expose a normalized-looking shape under
     // reasoning or reasoning_capability.
@@ -1019,6 +1258,126 @@ mod reasoning_discovery_tests {
             Some("thinkingConfig.thinkingLevel")
         );
         assert_eq!(map.levels.get("medium"), Some(&serde_json::json!("medium")));
+    }
+
+    #[test]
+    fn schema_v2_exposes_identity_variant_reasoning_and_opaque_state() {
+        let metadata = serde_json::json!({
+            "schema_version": 2,
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["high"],
+                "default": "high",
+                "can_disable": false
+            },
+            "tools": {"supported": true},
+            "identity": {
+                "canonical_model_id": "google/gemini-3.8-flash",
+                "variant": {
+                    "kind": "reasoning_tier",
+                    "id": "high",
+                    "reasoning_level": "high",
+                    "fixed": true
+                }
+            },
+            "opaque_state": {
+                "kind": "gemini_thought_signature",
+                "family": "gemini",
+                "encoding_version": 1,
+                "placeholder_strategy": "gemini3_skip_validator"
+            }
+        });
+
+        let flags = plugin_capability_flags(&metadata).unwrap();
+        assert_eq!(flags.reasoning, Some(true));
+        assert_eq!(flags.tool_calling, Some(true));
+        let reasoning = normalize_plugin_reasoning_capability(&metadata).unwrap();
+        assert_eq!(reasoning.levels, vec!["high"]);
+        assert_eq!(reasoning.default.as_deref(), Some("high"));
+        assert_eq!(
+            plugin_identity_hint(&metadata).as_deref(),
+            Some("google/gemini-3.8-flash")
+        );
+        assert_eq!(
+            plugin_provider_variant(&metadata).unwrap()["id"],
+            serde_json::json!("high")
+        );
+        assert_eq!(
+            plugin_opaque_state_capability(&metadata).unwrap()["family"],
+            serde_json::json!("gemini")
+        );
+    }
+
+    #[test]
+    fn schema_v1_generic_dispatch_matches_existing_helpers() {
+        let metadata = serde_json::json!({
+            "schema_version": 1,
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["low", "high"],
+                "default": "low",
+                "can_disable": false
+            },
+            "tools": {"supported": true}
+        });
+        assert_eq!(
+            plugin_capability_flags(&metadata),
+            plugin_capability_flags_v1(&metadata)
+        );
+        assert_eq!(
+            plugin_reasoning_support(&metadata),
+            plugin_reasoning_support_v1(&metadata)
+        );
+        assert_eq!(
+            normalize_plugin_reasoning_capability(&metadata),
+            normalize_plugin_reasoning_capability_v1(&metadata)
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_schema_v2_metadata_fails_closed() {
+        for metadata in [
+            serde_json::json!({
+                "schema_version": 2,
+                "identity": {"canonical_model_id": "missing-provider-separator"}
+            }),
+            serde_json::json!({
+                "schema_version": 2,
+                "identity": {
+                    "canonical_model_id": "google/gemini-3.8-flash",
+                    "variant": {
+                        "kind": "provider_alias",
+                        "id": "alias",
+                        "reasoning_level": "high",
+                        "fixed": false
+                    }
+                }
+            }),
+            serde_json::json!({
+                "schema_version": 2,
+                "opaque_state": {
+                    "kind": "gemini_thought_signature",
+                    "family": "bad family",
+                    "encoding_version": 1
+                }
+            }),
+            serde_json::json!({
+                "schema_version": 2,
+                "opaque_state": {
+                    "kind": "gemini_thought_signature",
+                    "family": "gemini",
+                    "encoding_version": 0
+                }
+            }),
+            serde_json::json!({"schema_version": 2, "unknown": true}),
+            serde_json::json!({"schema_version": 99}),
+        ] {
+            assert!(plugin_capability_flags(&metadata).is_none());
+            assert!(plugin_identity(&metadata).is_none());
+            assert!(plugin_opaque_state_capability(&metadata).is_none());
+        }
     }
 
     #[test]

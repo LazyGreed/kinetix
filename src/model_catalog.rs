@@ -1171,6 +1171,21 @@ pub fn resolve(
     resolve_with_bundled(base_url, model_id, None, models_dev, BUNDLED_CATALOG_JSON)
 }
 
+pub fn resolve_with_hint(
+    base_url: &str,
+    model_id: &str,
+    explicit_hint: Option<&str>,
+    models_dev: Option<&ModelsDevCatalog>,
+) -> CatalogResolution {
+    resolve_with_bundled(
+        base_url,
+        model_id,
+        explicit_hint,
+        models_dev,
+        BUNDLED_CATALOG_JSON,
+    )
+}
+
 fn resolve_with_bundled(
     base_url: &str,
     model_id: &str,
@@ -1824,6 +1839,45 @@ mod tests {
         assert_eq!(
             canonical.capabilities_json["structured_output"]["supported"],
             true
+        );
+    }
+
+    #[test]
+    fn explicit_plugin_hint_resolves_only_existing_canonical_model() {
+        let catalog = models_dev_fixture();
+        let resolved = resolve_with_hint(
+            "https://daily-cloudcode-pa.googleapis.com",
+            "gemini-3.8-flash-high",
+            Some("google/gemini-3.8-flash"),
+            Some(&catalog),
+        );
+        assert_eq!(
+            resolved.identity.canonical_model_id.as_deref(),
+            Some("google/gemini-3.8-flash")
+        );
+        assert_eq!(
+            resolved.identity.match_kind,
+            Some(CanonicalMatchKind::ExplicitHint)
+        );
+        assert!(resolved.canonical.is_some());
+    }
+
+    #[test]
+    fn unknown_plugin_hint_is_ignored_before_normal_resolution() {
+        let catalog = models_dev_fixture();
+        let resolved = resolve_with_hint(
+            "https://unknown.example/v1",
+            "deepseek-v4.1-flash",
+            Some("invented/not-real"),
+            Some(&catalog),
+        );
+        assert_eq!(
+            resolved.identity.canonical_model_id.as_deref(),
+            Some("deepseek/deepseek-v4.1-flash")
+        );
+        assert_ne!(
+            resolved.identity.match_kind,
+            Some(CanonicalMatchKind::ExplicitHint)
         );
     }
 

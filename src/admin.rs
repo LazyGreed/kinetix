@@ -12,9 +12,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::adapters::{
-    normalize_plugin_reasoning_capability_v1, normalize_reasoning_capability,
-    plugin_capability_flags_v1, plugin_reasoning_support_v1, reasoning_metadata_declared,
-    thinking_map_for_reasoning_with_wire, ModelCapabilityFlags, UpstreamContext,
+    normalize_plugin_reasoning_capability, normalize_plugin_reasoning_capability_v1,
+    normalize_reasoning_capability, parse_plugin_opaque_state_capability, plugin_capability_flags,
+    plugin_capability_flags_v1, plugin_identity, plugin_identity_hint,
+    plugin_opaque_state_capability, plugin_provider_variant, plugin_reasoning_support,
+    reasoning_metadata_declared, thinking_map_for_reasoning_with_wire, ModelCapabilityFlags,
+    UpstreamContext,
 };
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
@@ -1193,6 +1196,8 @@ struct DiscoveredObservation {
     canonical_identity: Option<Value>,
     canonical_model_id: Option<String>,
     canonical_match: Option<String>,
+    provider_variant: Option<Value>,
+    opaque_state: Option<Value>,
     model_type: Option<String>,
     execution_supported: bool,
     catalog: Option<Value>,
@@ -1422,6 +1427,14 @@ fn discovered_observation_with_catalog(
         capability.mode.is_some() || !capability.levels.is_empty() || capability.default.is_some()
     }
 
+    let plugin_identity_metadata = fallback_metadata.as_ref().and_then(plugin_identity);
+    let provider_variant = fallback_metadata.as_ref().and_then(plugin_provider_variant);
+    let opaque_state = fallback_metadata
+        .as_ref()
+        .and_then(plugin_opaque_state_capability);
+    let suppress_canonical_prices =
+        wire == WireFormat::Plugin && plugin_identity_metadata.is_some();
+
     let catalog_layers = catalog
         .as_ref()
         .map(crate::model_catalog::CatalogResolution::layers)
@@ -1494,22 +1507,26 @@ fn discovered_observation_with_catalog(
         }
 
         if let Some(layer_prices) = layer.prices {
-            if layer_prices.input_per_1m.is_some() {
-                catalog_input_price_source = Some(source.clone());
+            let canonical_subscription_price = suppress_canonical_prices
+                && layer.kind == crate::model_catalog::CatalogLayerKind::Canonical;
+            if !canonical_subscription_price {
+                if layer_prices.input_per_1m.is_some() {
+                    catalog_input_price_source = Some(source.clone());
+                }
+                if layer_prices.output_per_1m.is_some() {
+                    catalog_output_price_source = Some(source.clone());
+                }
+                if layer_prices.cached_per_1m.is_some() {
+                    catalog_cached_price_source = Some(source.clone());
+                }
+                if layer_prices.cache_write_per_1m.is_some() {
+                    catalog_cache_write_price_source = Some(source.clone());
+                }
+                if layer_prices.thinking_per_1m.is_some() {
+                    catalog_thinking_price_source = Some(source.clone());
+                }
+                overlay_prices(&mut catalog_prices, layer_prices);
             }
-            if layer_prices.output_per_1m.is_some() {
-                catalog_output_price_source = Some(source.clone());
-            }
-            if layer_prices.cached_per_1m.is_some() {
-                catalog_cached_price_source = Some(source.clone());
-            }
-            if layer_prices.cache_write_per_1m.is_some() {
-                catalog_cache_write_price_source = Some(source.clone());
-            }
-            if layer_prices.thinking_per_1m.is_some() {
-                catalog_thinking_price_source = Some(source.clone());
-            }
-            overlay_prices(&mut catalog_prices, layer_prices);
         }
 
         if let Some(mut reasoning) =
@@ -1529,7 +1546,7 @@ fn discovered_observation_with_catalog(
 
     let plugin_flags = fallback_metadata
         .as_ref()
-        .and_then(plugin_capability_flags_v1)
+        .and_then(plugin_capability_flags)
         .unwrap_or_default();
     let provider_flags = provider_metadata
         .as_ref()
@@ -1600,10 +1617,10 @@ fn discovered_observation_with_catalog(
 
     let plugin_reasoning = fallback_metadata
         .as_ref()
-        .and_then(normalize_plugin_reasoning_capability_v1);
+        .and_then(normalize_plugin_reasoning_capability);
     let plugin_support = fallback_metadata
         .as_ref()
-        .and_then(plugin_reasoning_support_v1);
+        .and_then(plugin_reasoning_support);
     let catalog_support = catalog_flags.reasoning;
 
     let provider_reasoning_is_authoritative =
@@ -1747,6 +1764,8 @@ fn discovered_observation_with_catalog(
         canonical_identity,
         canonical_model_id,
         canonical_match,
+        provider_variant,
+        opaque_state,
         model_type: catalog_model_type,
         execution_supported,
         catalog: catalog_json,
@@ -1898,8 +1917,13 @@ pub async fn discover_models(
                     .capabilities_json
                     .as_deref()
                     .and_then(|value| serde_json::from_str::<Value>(value).ok());
-                let catalog =
-                    crate::model_catalog::resolve(&provider.base_url, &m.id, models_dev.as_ref());
+                let canonical_hint = fallback_metadata.as_ref().and_then(plugin_identity_hint);
+                let catalog = crate::model_catalog::resolve_with_hint(
+                    &provider.base_url,
+                    &m.id,
+                    canonical_hint.as_deref(),
+                    models_dev.as_ref(),
+                );
                 discovered_observation_with_catalog(
                     crate::adapters::DiscoveredModel {
                         id: m.id,
@@ -1919,9 +1943,11 @@ pub async fn discover_models(
     };
 
     // Mark which are already imported and record the observation (FR-10.5).
-    // Discovery never overwrites admin-edited fields — only the `discovery`
-    // column is written — and a model that has disappeared upstream is flagged,
-    // not deleted.
+    // Discovery never overwrites admin-edited fields. Plugin opaque-state
+    // provenance is host-owned and may be refreshed alongside discovery.
+    let discovery_plugin_id = provider
+        .model_source_plugin_ref()
+        .map(|reference| reference.plugin_id);
     let existing = db::models_for_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?;
@@ -1954,6 +1980,8 @@ pub async fn discover_models(
                     "canonical_identity": &observation.canonical_identity,
                     "canonical_model_id": &observation.canonical_model_id,
                     "canonical_match": &observation.canonical_match,
+                    "provider_variant": &observation.provider_variant,
+                    "opaque_state": &observation.opaque_state,
                     "model_type": &observation.model_type,
                     "execution_supported": observation.execution_supported,
                     "catalog": &observation.catalog,
@@ -1961,6 +1989,14 @@ pub async fn discover_models(
                 }),
             )
             .await;
+            if let Some(plugin_id) = discovery_plugin_id.as_deref() {
+                let provenance = if observation.opaque_state.is_some() {
+                    plugin_id
+                } else {
+                    ""
+                };
+                let _ = db::set_model_opaque_state_plugin(&state.pool, &row.id, provenance).await;
+            }
         }
         out.push(json!({
             "id": m.id,
@@ -1979,6 +2015,8 @@ pub async fn discover_models(
             "canonical_identity": &observation.canonical_identity,
             "canonical_model_id": &observation.canonical_model_id,
             "canonical_match": &observation.canonical_match,
+            "provider_variant": &observation.provider_variant,
+            "opaque_state": &observation.opaque_state,
             "model_type": &observation.model_type,
             "execution_supported": observation.execution_supported,
             "catalog": &observation.catalog,
@@ -2560,7 +2598,7 @@ pub async fn create_model(
     Path(provider_id): Path<String>,
     Json(body): Json<ModelBody>,
 ) -> ApiResult {
-    let _ = db::get_provider(&state.pool, &provider_id)
+    let provider = db::get_provider(&state.pool, &provider_id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
@@ -2589,6 +2627,21 @@ pub async fn create_model(
     )
     .await
     .map_err(ApiError::internal)?;
+    let imported_from_discovery = body
+        .discovery
+        .get("imported_from_discovery")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let valid_opaque_state = body
+        .discovery
+        .get("opaque_state")
+        .and_then(parse_plugin_opaque_state_capability)
+        .is_some();
+    if imported_from_discovery && valid_opaque_state {
+        if let Some(reference) = provider.model_source_plugin_ref() {
+            let _ = db::set_model_opaque_state_plugin(&state.pool, &id, &reference.plugin_id).await;
+        }
+    }
     if prices.is_configured() {
         let _ = db::insert_price_version(&state.pool, &id, &prices).await;
     }
@@ -7577,7 +7630,7 @@ mod reasoning_discovery_control_plane_tests {
     fn unsupported_plugin_capability_schema_is_ignored() {
         for metadata in [
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "reasoning": {
                     "supported": true,
                     "mode": "toggle",
@@ -8490,6 +8543,65 @@ mod reasoning_discovery_control_plane_tests {
         let (raw, truncated) = bounded_raw_metadata(Some(&oversized));
         assert!(raw.is_none());
         assert!(truncated);
+    }
+
+    #[test]
+    fn plugin_v2_discovery_keeps_variant_opaque_state_and_plugin_managed_reasoning() {
+        let observation = discovered_observation_with_catalog(
+            crate::adapters::DiscoveredModel {
+                id: "gemini-3.8-flash-high".into(),
+                display_name: Some("Gemini 3.8 Flash High".into()),
+                context_window: None,
+                max_output_tokens: None,
+            },
+            None,
+            Some(json!({
+                "schema_version": 2,
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["high"],
+                    "default": "high",
+                    "can_disable": false
+                },
+                "identity": {
+                    "canonical_model_id": "google/gemini-3.8-flash",
+                    "variant": {
+                        "kind": "reasoning_tier",
+                        "id": "high",
+                        "reasoning_level": "high",
+                        "fixed": true
+                    }
+                },
+                "opaque_state": {
+                    "kind": "gemini_thought_signature",
+                    "family": "gemini",
+                    "encoding_version": 1,
+                    "placeholder_strategy": "gemini3_skip_validator"
+                }
+            })),
+            WireFormat::Plugin,
+            None,
+        );
+
+        assert_eq!(observation.reasoning_support, Some(true));
+        assert_eq!(
+            observation.reasoning.as_ref().unwrap().levels,
+            vec!["high".to_string()]
+        );
+        assert!(observation.thinking_map.is_none());
+        assert_eq!(
+            observation.provider_variant.as_ref().unwrap()["id"],
+            json!("high")
+        );
+        assert_eq!(
+            observation.opaque_state.as_ref().unwrap()["family"],
+            json!("gemini")
+        );
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("plugin_capabilities_json")
+        );
     }
 
     #[test]

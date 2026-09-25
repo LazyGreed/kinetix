@@ -17,7 +17,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::adapters::{Adapter, DiscoveredModel, UpstreamContext};
+use crate::adapters::{
+    parse_plugin_opaque_state_capability, Adapter, DiscoveredModel, OpaqueStateCapabilityKind,
+    OpaqueStateCapabilityV1, OpaqueStatePlaceholderStrategy, UpstreamContext,
+};
 use crate::plugins::manager::PluginManager;
 use crate::plugins::runtime::PluginFault;
 use crate::types::{
@@ -158,6 +161,74 @@ impl PluginAdapter {
             quota_reset_at: None,
         }
     }
+
+    fn opaque_state_descriptor_for(
+        plugin_id: &str,
+        model: &crate::db::ModelRow,
+    ) -> Option<OpaqueStateCapabilityV1> {
+        if model.opaque_state_plugin != plugin_id {
+            return None;
+        }
+        let discovery: Value = serde_json::from_str(&model.discovery).ok()?;
+        let descriptor = parse_plugin_opaque_state_capability(discovery.get("opaque_state")?)?;
+        if descriptor.encoding_version != 1
+            || !matches!(descriptor.family.as_str(), "gemini" | "claude")
+        {
+            return None;
+        }
+        Some(descriptor)
+    }
+
+    fn target_is_gemini_three(model: &crate::db::ModelRow) -> bool {
+        if crate::adapters::gemini::is_gemini_three(&model.upstream_id) {
+            return true;
+        }
+        serde_json::from_str::<Value>(&model.discovery)
+            .ok()
+            .and_then(|discovery| {
+                discovery
+                    .get("canonical_model_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|canonical| crate::adapters::gemini::is_gemini_three(&canonical))
+    }
+
+    fn opaque_state_target_for(
+        plugin_id: &str,
+        model: &crate::db::ModelRow,
+    ) -> Option<crate::opaque_state::OpaqueStateTarget> {
+        let descriptor = Self::opaque_state_descriptor_for(plugin_id, model)?;
+        if descriptor.kind != OpaqueStateCapabilityKind::GeminiThoughtSignature {
+            return None;
+        }
+        Some(crate::opaque_state::OpaqueStateTarget {
+            kind: crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
+            provider_id: model.provider_id.clone(),
+            family: descriptor.family,
+            producer: format!(
+                "plugin:{plugin_id}:gemini-thought-signature:v{}",
+                descriptor.encoding_version
+            ),
+            model_id: model.upstream_id.clone(),
+        })
+    }
+
+    fn opaque_state_placeholder_for(
+        plugin_id: &str,
+        model: &crate::db::ModelRow,
+    ) -> Option<&'static str> {
+        let descriptor = Self::opaque_state_descriptor_for(plugin_id, model)?;
+        if descriptor.kind != OpaqueStateCapabilityKind::GeminiThoughtSignature
+            || descriptor.family != "gemini"
+            || descriptor.placeholder_strategy
+                != Some(OpaqueStatePlaceholderStrategy::Gemini3SkipValidator)
+            || !Self::target_is_gemini_three(model)
+        {
+            return None;
+        }
+        Some(crate::adapters::gemini::GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
+    }
 }
 
 #[async_trait]
@@ -168,6 +239,17 @@ impl Adapter for PluginAdapter {
 
     fn handles_thinking_translation(&self) -> bool {
         self.thinking_translation
+    }
+
+    fn opaque_state_target(
+        &self,
+        model: &crate::db::ModelRow,
+    ) -> Option<crate::opaque_state::OpaqueStateTarget> {
+        Self::opaque_state_target_for(&self.plugin_id, model)
+    }
+
+    fn opaque_state_placeholder(&self, model: &crate::db::ModelRow) -> Option<&'static str> {
+        Self::opaque_state_placeholder_for(&self.plugin_id, model)
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
@@ -611,6 +693,136 @@ mod tests {
         assert_eq!(v["frequency_penalty"], 0.4);
         assert_eq!(v["include_usage"], true);
         assert_eq!(v["extra"]["provider_hint"], "value");
+    }
+
+    fn model_with_opaque_state(
+        plugin_id: &str,
+        upstream_id: &str,
+        family: &str,
+        placeholder: bool,
+    ) -> crate::db::ModelRow {
+        crate::db::ModelRow {
+            id: "model_test".into(),
+            provider_id: "provider_test".into(),
+            upstream_id: upstream_id.into(),
+            display_name: upstream_id.into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: serde_json::json!({
+                "canonical_model_id": if family == "gemini" {
+                    serde_json::Value::String("google/gemini-3.8-flash".into())
+                } else {
+                    serde_json::Value::Null
+                },
+                "opaque_state": {
+                    "kind": "gemini_thought_signature",
+                    "family": family,
+                    "encoding_version": 1,
+                    "placeholder_strategy": if placeholder {
+                        serde_json::Value::String("gemini3_skip_validator".into())
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+            })
+            .to_string(),
+            created_at: "now".into(),
+            opaque_state_plugin: plugin_id.into(),
+        }
+    }
+
+    #[test]
+    fn plugin_opaque_state_descriptor_requires_matching_provenance() {
+        let row = model_with_opaque_state("plugin.test", "gemini-3.8-flash-high", "gemini", true);
+        let descriptor =
+            PluginAdapter::opaque_state_descriptor_for("plugin.test", &row).expect("descriptor");
+        assert_eq!(descriptor.family, "gemini");
+        assert_eq!(descriptor.encoding_version, 1);
+
+        let mut no_provenance = row.clone();
+        no_provenance.opaque_state_plugin.clear();
+        assert!(
+            PluginAdapter::opaque_state_descriptor_for("plugin.test", &no_provenance).is_none()
+        );
+        assert!(PluginAdapter::opaque_state_descriptor_for("plugin.other", &row).is_none());
+
+        let mut malformed = row;
+        malformed.discovery = serde_json::json!({
+            "opaque_state": {
+                "kind": "gemini_thought_signature",
+                "family": "gemini",
+                "encoding_version": 0
+            }
+        })
+        .to_string();
+        assert!(PluginAdapter::opaque_state_descriptor_for("plugin.test", &malformed).is_none());
+    }
+
+    #[test]
+    fn plugin_opaque_state_target_uses_exact_model_and_typed_producer() {
+        let row = model_with_opaque_state("plugin.test", "gemini-3.8-flash-high", "gemini", true);
+        let target =
+            PluginAdapter::opaque_state_target_for("plugin.test", &row).expect("opaque target");
+        assert_eq!(
+            target.kind,
+            crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature
+        );
+        assert_eq!(target.provider_id, "provider_test");
+        assert_eq!(target.family, "gemini");
+        assert_eq!(
+            target.producer,
+            "plugin:plugin.test:gemini-thought-signature:v1"
+        );
+        assert_eq!(target.model_id, "gemini-3.8-flash-high");
+
+        assert_eq!(
+            PluginAdapter::opaque_state_placeholder_for("plugin.test", &row),
+            Some(crate::adapters::gemini::GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
+        );
+
+        let claude =
+            model_with_opaque_state("plugin.test", "claude-opus-4-6-thinking", "claude", false);
+        let target =
+            PluginAdapter::opaque_state_target_for("plugin.test", &claude).expect("claude target");
+        assert_eq!(target.family, "claude");
+        assert_eq!(target.model_id, "claude-opus-4-6-thinking");
+        assert_eq!(
+            PluginAdapter::opaque_state_placeholder_for("plugin.test", &claude),
+            None
+        );
+    }
+
+    #[test]
+    fn plugin_gemini_three_gate_accepts_exact_ids_and_resolved_aliases_only() {
+        let exact = model_with_opaque_state("plugin.test", "gemini-3.8-flash-high", "gemini", true);
+        assert!(PluginAdapter::target_is_gemini_three(&exact));
+
+        let alias = model_with_opaque_state("plugin.test", "gemini-pro-agent", "gemini", true);
+        assert!(PluginAdapter::target_is_gemini_three(&alias));
+
+        let older = model_with_opaque_state("plugin.test", "gemini-2.5-flash", "gemini", true);
+        let mut older = older;
+        older.discovery = serde_json::json!({
+            "canonical_model_id": "google/gemini-2.5-flash",
+            "opaque_state": {
+                "kind": "gemini_thought_signature",
+                "family": "gemini",
+                "encoding_version": 1,
+                "placeholder_strategy": "gemini3_skip_validator"
+            }
+        })
+        .to_string();
+        assert!(!PluginAdapter::target_is_gemini_three(&older));
+
+        let claude =
+            model_with_opaque_state("plugin.test", "claude-opus-4-6-thinking", "claude", false);
+        assert!(!PluginAdapter::target_is_gemini_three(&claude));
     }
 
     #[test]
