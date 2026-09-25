@@ -246,7 +246,6 @@ impl AppState {
         provider: &crate::db::ProviderRow,
         account: &crate::db::AccountRow,
     ) -> anyhow::Result<crate::credentials::ResolvedCredential> {
-        use crate::credentials::CredentialStrategy;
         if let Some(r) = provider.credential_plugin_ref() {
             let Some(strategy) = self.plugin_credentials.get(&r.plugin_id) else {
                 anyhow::bail!(
