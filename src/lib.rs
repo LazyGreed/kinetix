@@ -1,3 +1,10 @@
+#![allow(
+    clippy::large_enum_variant,
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 //! Kinetix: a multi-protocol LLM proxy.
 //!
 //! OpenAI Chat Completions and Anthropic Messages in (streaming first),
