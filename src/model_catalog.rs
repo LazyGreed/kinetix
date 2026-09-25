@@ -1171,6 +1171,21 @@ pub fn resolve(
     resolve_with_bundled(base_url, model_id, None, models_dev, BUNDLED_CATALOG_JSON)
 }
 
+pub fn resolve_with_hint(
+    base_url: &str,
+    model_id: &str,
+    explicit_hint: Option<&str>,
+    models_dev: Option<&ModelsDevCatalog>,
+) -> CatalogResolution {
+    resolve_with_bundled(
+        base_url,
+        model_id,
+        explicit_hint,
+        models_dev,
+        BUNDLED_CATALOG_JSON,
+    )
+}
+
 fn resolve_with_bundled(
     base_url: &str,
     model_id: &str,
