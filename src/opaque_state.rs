@@ -419,6 +419,11 @@ impl OpaqueStateStore {
         let scope_hash = scope.hash();
         let call_hash = tool_call_hash(scope, tool_call_id);
 
+        // A live RAM entry answers directly. An *expired* RAM entry is evicted
+        // but must NOT short-circuit to `Missing`: `MEMORY_TTL` (1h) is only the
+        // hot-cache lifetime, while SQLite intentionally retains the row for
+        // `PERSISTENT_TTL` (24h) — a still-valid persistent row must still be
+        // found by falling through to the SQLite path below (§13).
         if let Some(target) = capability {
             let key = self.cache_key(target, &scope_hash, &call_hash);
             if let Some(entry) = self.cache.get(&key) {
@@ -428,9 +433,9 @@ impl OpaqueStateStore {
                     self.counters
                         .lookup_expired
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return OpaqueLookupResult::Missing;
+                } else {
+                    return self.evaluate_cached(&entry, session, tool_name);
                 }
-                return self.evaluate_cached(&entry, session, tool_name);
             }
         }
 
@@ -728,6 +733,24 @@ impl OpaqueStateStore {
         self.cache.get(&key).map(|entry| entry.signature.clone())
     }
 
+    /// Test-only: age a single RAM entry past `MEMORY_TTL` without touching
+    /// SQLite, so the entry is still present but expired — the exact shape of
+    /// a long-running process where the 1h RAM TTL has lapsed but the 24h
+    /// SQLite TTL has not. Used to prove RAM expiry falls through to the
+    /// SQLite fallback instead of short-circuiting to `Missing`.
+    #[cfg(test)]
+    pub fn expire_memory_entry_for_test(
+        &self,
+        scope: &OpaqueClientScope,
+        target: &OpaqueStateTarget,
+        tool_call_id: &str,
+    ) {
+        let key = self.cache_key(target, &scope.hash(), &tool_call_hash(scope, tool_call_id));
+        if let Some(mut entry) = self.cache.get_mut(&key) {
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+    }
+
     /// Test-only: mark every stored row expired and drop the RAM cache so the
     /// next lookup exercises the expiry path deterministically.
     #[cfg(test)]
@@ -956,6 +979,44 @@ mod tests {
         assert_eq!(result, OpaqueLookupResult::Compatible("SIG_A".into()));
         // The fallback lookup must repopulate RAM.
         assert_eq!(store.memory_entry_count_for_test(), 1);
+    }
+
+    /// Regression: RAM's `MEMORY_TTL` (1h) is shorter than SQLite's
+    /// `PERSISTENT_TTL` (24h) by design — SQLite intentionally outlives the
+    /// hot cache. Before the fix, an expired RAM entry made
+    /// `resolve_tool_signature` return `Missing` immediately instead of
+    /// falling through to the still-live SQLite row, so a continuation after
+    /// ~1h on a long-running process failed even though the signature was
+    /// still durably stored (restarting the process, which drops RAM
+    /// entirely, would perversely have made it work again).
+    #[tokio::test]
+    async fn expired_ram_entry_falls_through_to_a_still_valid_sqlite_row() {
+        let store = test_store().await;
+        let scope = OpaqueClientScope::for_key("key_a");
+        let target = gemini_target();
+        capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
+        store.flush().await;
+        assert_eq!(store.memory_entry_count_for_test(), 1);
+
+        // Age the RAM entry past its TTL without touching SQLite: the
+        // persisted row is untouched and still has 23 of its 24 hours left.
+        store.expire_memory_entry_for_test(&scope, &target, "call_1");
+
+        let result = store
+            .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
+            .await;
+        assert_eq!(
+            result,
+            OpaqueLookupResult::Compatible("SIG_A".into()),
+            "an expired RAM entry must fall through to the still-live SQLite row, not report Missing"
+        );
+        // The fallback lookup must have evicted the stale entry and
+        // repopulated RAM with a fresh one.
+        assert_eq!(store.memory_entry_count_for_test(), 1);
+        assert_eq!(
+            store.cached_signature_for_test(&scope, &target, "call_1"),
+            Some("SIG_A".into())
+        );
     }
 
     #[tokio::test]

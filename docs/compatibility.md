@@ -300,7 +300,11 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   persistence (the RAM entry is already present), and a saturated durability
   queue drops the write with a counter rather than blocking the response. A
   graceful shutdown flushes the queue after request draining, so a signature the
-  client was already told was accepted survives a restart.
+  client was already told was accepted survives a restart. The RAM cache's TTL
+  (1h) is deliberately shorter than SQLite's (24h); when a RAM entry has expired
+  it is evicted and the lookup falls through to SQLite instead of reporting
+  `Missing`, so a continuation on a long-running process keeps working for the
+  full 24h SQLite retention window rather than only the 1h RAM window.
 - **Replay.** On the next request, tool-call parts whose signature slot is empty
   are looked up. A compatible value is restored onto the exact historical part
   before dispatch. An explicit client/canonical signature is never overwritten,
