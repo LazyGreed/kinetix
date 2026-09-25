@@ -29,6 +29,30 @@ const parseThinkingInput = (raw: string): unknown => {
   }
 };
 
+const pluginManagedReasoning = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    reasoning_capability?: {
+      levels?: string[];
+      default?: string | null;
+    } | null;
+    provider_variant?: {
+      kind?: string;
+      id?: string;
+      reasoning_level?: string | null;
+      fixed?: boolean;
+    } | null;
+    capability_sources?: {
+      reasoning?: string | null;
+    } | null;
+  } | undefined;
+  const source = discovery?.capability_sources?.reasoning;
+  if (!source?.includes('plugin_capabilities_json')) return null;
+  return {
+    capability: discovery?.reasoning_capability || null,
+    variant: discovery?.provider_variant || null,
+  };
+};
+
 interface ProvidersViewProps {
   providers: Provider[];
   models: ModelConfig[];
@@ -259,6 +283,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         canonical_identity: m.canonical_identity || null,
         canonical_model_id: m.canonical_model_id || null,
         canonical_match: m.canonical_match || null,
+        provider_variant: m.provider_variant || null,
+        opaque_state: m.opaque_state || null,
         model_type: m.model_type || null,
         execution_supported: m.execution_supported ?? true,
         catalog: m.catalog || null,
@@ -899,7 +925,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         ) : null}
                         {m.reasoning_capability ? (
                           <span className="text-[var(--pen-blue)]">
-                            reasoning: {m.reasoning_capability.levels.join('/')}
+                            reasoning:{' '}
+                            {m.capability_sources?.reasoning?.includes('plugin_capabilities_json')
+                              ? 'plugin-managed · '
+                              : ''}
+                            {m.provider_variant?.kind === 'reasoning_tier' && m.provider_variant.fixed
+                              ? (m.provider_variant.reasoning_level || m.provider_variant.id)
+                              : m.reasoning_capability.levels.join('/')}
                           </span>
                         ) : null}
                         {m.capabilities?.vision ? (
@@ -1070,15 +1102,34 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               ⚙️ Parameter & Thinking Controls
                             </strong>
                             <div>Temperature Policy: <strong>Clamp (0.0 - 2.0)</strong></div>
-                            <div>
-                              Thinking Levels:{' '}
-                              <strong className="text-[var(--pen-blue)]">
-                                {Object.keys(m.thinkingMap.levels).sort().join(', ') || 'none'}
-                              </strong>
-                            </div>
-                            <div className="truncate">
-                              Budget Field: <code>{m.thinkingMap.budgetField || '—'}</code>
-                            </div>
+                            {pluginManagedReasoning(m) ? (
+                              <>
+                                <div>
+                                  Reasoning: <strong className="text-[var(--pen-blue)]">Plugin-managed</strong>
+                                  {pluginManagedReasoning(m)?.variant?.fixed
+                                    ? ` · ${pluginManagedReasoning(m)?.variant?.reasoning_level || pluginManagedReasoning(m)?.variant?.id || ''}`
+                                    : ''}
+                                </div>
+                                <div>
+                                  Supported:{' '}
+                                  <strong className="text-[var(--pen-blue)]">
+                                    {pluginManagedReasoning(m)?.capability?.levels?.join(' / ') || 'provider-defined'}
+                                  </strong>
+                                </div>
+                              </>
+                            ) : (
+                              <>
+                                <div>
+                                  Thinking Levels:{' '}
+                                  <strong className="text-[var(--pen-blue)]">
+                                    {Object.keys(m.thinkingMap.levels).sort().join(', ') || 'none'}
+                                  </strong>
+                                </div>
+                                <div className="truncate">
+                                  Budget Field: <code>{m.thinkingMap.budgetField || '—'}</code>
+                                </div>
+                              </>
+                            )}
                           </div>
                         </div>
                       </div>
