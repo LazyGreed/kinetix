@@ -1010,6 +1010,15 @@ pub async fn update_provider(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    if body
+        .api_key
+        .as_deref()
+        .is_some_and(|api_key| !api_key.trim().is_empty())
+    {
+        if let Some(error) = manual_account_enrollment_error(&existing.credential_mode) {
+            return Err(ApiError::bad(error));
+        }
+    }
     let rate_limit_rules = body.rate_limit_rules.clone().unwrap_or_else(|| {
         serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
     });
@@ -4102,7 +4111,9 @@ pub async fn export_config(
             .await
             .map_err(ApiError::internal)?
         {
-            accounts.push(a);
+            if a.label != "__kinetix_noauth__" {
+                accounts.push(a);
+            }
         }
         for m in db::models_for_provider(&state.pool, &p.id)
             .await
@@ -4151,6 +4162,12 @@ pub async fn export_config(
                 "follow_redirects": p.follow_redirects != 0,
                 "credential_hosts": p.credential_hosts,
                 "allow_insecure_tls": p.allow_insecure_tls != 0,
+                "wire_plugin": p.wire_plugin,
+                "credential_plugin": p.credential_plugin,
+                "model_source_plugin": p.model_source_plugin,
+                "credential_mode": p.credential_mode,
+                "source_plugin_id": p.source_plugin_id,
+                "source_integration_id": p.source_integration_id,
                 "enabled": p.enabled != 0,
             })
         })
@@ -4301,6 +4318,14 @@ pub async fn import_config(
                 "provider '{name}': invalid wire_format '{}'",
                 p["wire_format"].as_str().unwrap_or("")
             ));
+        }
+        if let Some(mode) = p.get("credential_mode").filter(|mode| !mode.is_null()) {
+            match mode.as_str().and_then(crate::plugins::CredentialMode::parse) {
+                Some(_) => {}
+                None => problems.push(format!(
+                    "provider '{name}': credential_mode must be 'manual', 'auth_flow', or 'none'"
+                )),
+            }
         }
         let existing = db::list_providers(&state.pool)
             .await
@@ -4769,6 +4794,56 @@ pub(crate) async fn register_enabled_plugin_capabilities(state: &AppState, id: &
     auto_provision_plugin_providers(state, id).await;
 }
 
+async fn reconcile_provider_account_mode(
+    state: &AppState,
+    provider_id: &str,
+    credential_mode: crate::plugins::CredentialMode,
+) -> Result<(), ApiError> {
+    let legacy_public_mask = crate::crypto::mask_secret("public");
+    match credential_mode {
+        crate::plugins::CredentialMode::None => {
+            // Credential-free providers must have exactly one internal empty
+            // account so routing can execute without exposing a fake user key.
+            sqlx::query("DELETE FROM accounts WHERE provider_id=?")
+                .bind(provider_id)
+                .execute(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
+
+            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
+            db::insert_account(
+                &state.pool,
+                provider_id,
+                "__kinetix_noauth__",
+                &empty_secret,
+                "",
+                1,
+                1,
+                None,
+                "none",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        }
+        crate::plugins::CredentialMode::Manual | crate::plugins::CredentialMode::AuthFlow => {
+            // Credential-bearing modes must never route through synthetic
+            // no-auth state left by a previous credential-free configuration.
+            sqlx::query(
+                "DELETE FROM accounts
+                 WHERE provider_id=?
+                   AND (label='__kinetix_noauth__' OR (label='public' AND key_mask=?))",
+            )
+            .bind(provider_id)
+            .bind(&legacy_public_mask)
+            .execute(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn reconcile_provider_credential_semantics(
     state: &AppState,
     provider_id: &str,
@@ -4786,61 +4861,7 @@ async fn reconcile_provider_credential_semantics(
     .await
     .map_err(ApiError::internal)?;
 
-    let legacy_public_mask = crate::crypto::mask_secret("public");
-    match credential_mode {
-        crate::plugins::CredentialMode::None => {
-            let accounts = db::accounts_for_provider(&state.pool, provider_id)
-                .await
-                .map_err(ApiError::internal)?;
-            if accounts
-                .iter()
-                .any(|account| account.label == "__kinetix_noauth__")
-            {
-                return Ok(());
-            }
-
-            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
-            if let Some(legacy) = accounts
-                .iter()
-                .find(|account| account.label == "public" && account.key_mask == legacy_public_mask)
-            {
-                sqlx::query(
-                    "UPDATE accounts SET label='__kinetix_noauth__', secret_enc=?, key_mask='' WHERE id=?",
-                )
-                .bind(empty_secret)
-                .bind(&legacy.id)
-                .execute(&state.pool)
-                .await
-                .map_err(ApiError::internal)?;
-            } else if accounts.is_empty() {
-                db::insert_account(
-                    &state.pool,
-                    provider_id,
-                    "__kinetix_noauth__",
-                    &empty_secret,
-                    "",
-                    1,
-                    1,
-                    None,
-                    "none",
-                )
-                .await
-                .map_err(ApiError::internal)?;
-            }
-        }
-        crate::plugins::CredentialMode::Manual | crate::plugins::CredentialMode::AuthFlow => {
-            sqlx::query(
-                "DELETE FROM accounts WHERE provider_id=? AND label='public' AND key_mask=?",
-            )
-            .bind(provider_id)
-            .bind(&legacy_public_mask)
-            .execute(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-        }
-    }
-
-    Ok(())
+    reconcile_provider_account_mode(state, provider_id, credential_mode).await
 }
 
 pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) {
