@@ -6049,10 +6049,12 @@ mod credential_enrollment_tests {
             },
         ];
 
-        let resolved =
-            resolve_auth_integration(&integrations, "second", "shared-login").unwrap();
+        let resolved = resolve_auth_integration(&integrations, "second", "shared-login").unwrap();
         assert_eq!(resolved.id, "second");
-        assert_eq!(resolved.credential_strategy.as_deref(), Some("second-strategy"));
+        assert_eq!(
+            resolved.credential_strategy.as_deref(),
+            Some("second-strategy")
+        );
     }
 
     #[test]
@@ -6060,19 +6062,15 @@ mod credential_enrollment_tests {
         let provider = provider("auth_flow");
         let expected = "plugin:plugin.test/strategy";
 
-        assert!(validate_auth_flow_binding_edit(
-            &provider,
-            expected,
-            "plugin:plugin.test/other"
-        )
-        .is_err());
+        assert!(
+            validate_auth_flow_binding_edit(&provider, expected, "plugin:plugin.test/other")
+                .is_err()
+        );
         assert!(validate_auth_flow_binding_edit(&provider, expected, expected).is_ok());
-        assert!(validate_auth_flow_binding_edit(
-            &provider,
-            expected,
-            &provider.credential_plugin
-        )
-        .is_ok());
+        assert!(
+            validate_auth_flow_binding_edit(&provider, expected, &provider.credential_plugin)
+                .is_ok()
+        );
     }
 }
 
