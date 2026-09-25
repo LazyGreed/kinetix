@@ -264,20 +264,20 @@ def run_http_case(case_id):
     path_cases = {
         "chat.native.openai.sync": ("chat", "syn-openai", False),
         "chat.native.openai.stream": ("chat", "syn-openai", True),
-        "chat.translate.gemini.sync": ("chat", "syn-gemini", False),
-        "chat.translate.gemini.stream": ("chat", "syn-gemini", True),
+        "chat.translate.gemini.sync": ("chat", "syn-gemini-3", False),
+        "chat.translate.gemini.stream": ("chat", "syn-gemini-3", True),
         "chat.translate.anthropic.sync": ("chat", "syn-anthropic", False),
         "chat.translate.anthropic.stream": ("chat", "syn-anthropic", True),
         "messages.native.anthropic.sync": ("messages", "syn-anthropic", False),
         "messages.native.anthropic.stream": ("messages", "syn-anthropic", True),
-        "messages.translate.gemini.sync": ("messages", "syn-gemini", False),
-        "messages.translate.gemini.stream": ("messages", "syn-gemini", True),
+        "messages.translate.gemini.sync": ("messages", "syn-gemini-3", False),
+        "messages.translate.gemini.stream": ("messages", "syn-gemini-3", True),
         "messages.translate.openai.sync": ("messages", "syn-openai", False),
         "messages.translate.openai.stream": ("messages", "syn-openai", True),
         "responses.translate.openai.sync": ("responses", "syn-openai", False),
         "responses.translate.openai.stream": ("responses", "syn-openai", True),
-        "responses.translate.gemini.sync": ("responses", "syn-gemini", False),
-        "responses.translate.gemini.stream": ("responses", "syn-gemini", True),
+        "responses.translate.gemini.sync": ("responses", "syn-gemini-3", False),
+        "responses.translate.gemini.stream": ("responses", "syn-gemini-3", True),
         "responses.translate.anthropic.sync": ("responses", "syn-anthropic", False),
         "responses.translate.anthropic.stream": ("responses", "syn-anthropic", True),
     }
@@ -292,7 +292,7 @@ def run_http_case(case_id):
             ("data-url", PNG),
             ("url", "https://example.invalid/fixture.png"),
         ]:
-            payload = chat_payload("syn-gemini", "fixture:vision")
+            payload = chat_payload("syn-gemini-3", "fixture:vision")
             payload.pop("reasoning_effort")
             payload["messages"][0]["content"] = [
                 {"type": "text", "text": f"fixture:vision {label}"},
@@ -309,7 +309,7 @@ def run_http_case(case_id):
             ("required", "required"),
             ("specific", {"type": "function", "function": {"name": "get_weather"}}),
         ]:
-            payload = chat_payload("syn-gemini", f"fixture:tool-choice-{label}")
+            payload = chat_payload("syn-gemini-3", f"fixture:tool-choice-{label}")
             payload["tool_choice"] = choice
             status, _, body = request("/v1/chat/completions", payload)
             need(status == 200, f"{label}: {body}")
@@ -320,7 +320,7 @@ def run_http_case(case_id):
             ("string", "fixture:system-variant"),
             ("blocks", [{"type": "text", "text": "fixture:system-variant"}]),
         ]:
-            payload = messages_payload("syn-gemini", "fixture:system-variant", stream=False)
+            payload = messages_payload("syn-gemini-3", "fixture:system-variant", stream=False)
             payload["system"] = system
             payload["messages"] = [{"role": "user", "content": "hello"}]
             payload.pop("thinking")
@@ -334,7 +334,7 @@ def run_http_case(case_id):
             ("url", {"type": "url", "url": "https://example.invalid/fixture.png"}),
         ]
         for label, source in variants:
-            payload = messages_payload("syn-gemini", "fixture:vision", stream=False)
+            payload = messages_payload("syn-gemini-3", "fixture:vision", stream=False)
             payload["messages"][0]["content"] = [
                 {"type": "text", "text": label},
                 {"type": "image", "source": source},
@@ -351,7 +351,7 @@ def run_http_case(case_id):
             ("required", {"type": "any"}),
             ("specific", {"type": "tool", "name": "get_weather"}),
         ]:
-            payload = messages_payload("syn-gemini", f"fixture:tool-choice-{label}", stream=False)
+            payload = messages_payload("syn-gemini-3", f"fixture:tool-choice-{label}", stream=False)
             payload["tool_choice"] = choice
             status, _, body = request("/v1/messages", payload)
             need(status == 200, f"{label}: {body}")
@@ -365,7 +365,7 @@ def run_http_case(case_id):
             ]}]),
         ]
         for label, input_value in variants:
-            payload = {"model": "syn-gemini", "input": input_value}
+            payload = {"model": "syn-gemini-3", "input": input_value}
             status, _, body = request("/v1/responses", payload)
             need(status == 200, f"{label}: {body}")
         return
@@ -393,7 +393,7 @@ def run_http_case(case_id):
             ("required", "required"),
             ("specific", {"type": "function", "name": "get_weather"}),
         ]:
-            payload = responses_payload("syn-gemini", f"fixture:tool-choice-{label}", stream=False)
+            payload = responses_payload("syn-gemini-3", f"fixture:tool-choice-{label}", stream=False)
             payload["tool_choice"] = choice
             status, _, body = request("/v1/responses", payload)
             need(status == 200, f"{label}: {body}")
@@ -416,7 +416,7 @@ def run_http_case(case_id):
 
     if case_id == "responses.supported_options":
         payload = {
-            "model": "syn-gemini",
+            "model": "syn-gemini-3",
             "input": "hello",
             "store": False,
             "background": False,
@@ -430,7 +430,7 @@ def run_http_case(case_id):
         return
 
     if case_id == "chat.translate.gemini.parallel_tools":
-        payload = chat_payload("syn-gemini", "fixture:chat-fields fixture:vision fixture:thinking fixture:multi-tools")
+        payload = chat_payload("syn-gemini-3", "fixture:chat-fields fixture:vision fixture:thinking fixture:multi-tools")
         status, _, body = request("/v1/chat/completions", payload)
         events = sse(body)
         need(status == 200, body)
@@ -440,7 +440,7 @@ def run_http_case(case_id):
         return
 
     if case_id == "messages.translate.gemini.parallel_tools":
-        payload = messages_payload("syn-gemini", "fixture:messages-fields fixture:vision fixture:thinking fixture:multi-tools")
+        payload = messages_payload("syn-gemini-3", "fixture:messages-fields fixture:vision fixture:thinking fixture:multi-tools")
         status, _, body = request("/v1/messages", payload)
         need(status == 200, body)
         events = sse(body)
@@ -465,11 +465,212 @@ def run_http_case(case_id):
         return
 
     if case_id == "chat.translate.gemini.nested_schema":
-        payload = chat_payload("syn-gemini", "fixture:nested-schema", nested=True)
+        payload = chat_payload("syn-gemini-3", "fixture:nested-schema", nested=True)
         payload.pop("reasoning_effort")
         payload["messages"][0]["content"] = [{"type": "text", "text": "fixture:nested-schema"}]
         status, _, body = request("/v1/chat/completions", payload)
         need(status == 200, body)
+        return
+
+    if case_id == "chat.translate.gemini.tool_signature_continuation":
+        # Gemini hands back an opaque `thoughtSignature` beside a function call.
+        # The OpenAI/Pi client protocol cannot represent it, so the client never
+        # sees or returns it; Kinetix must persist it server-side under the
+        # client-visible tool-call id and restore it on the next turn. The
+        # synthetic upstream fails closed (400) if the restored function call
+        # lacks the exact signature, which is the exact failure this fix
+        # addresses.
+        marker = "fixture:gemini-signature-continuation"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+
+        def continuation_turn(stream):
+            first = {
+                "model": "syn-gemini-3",
+                "stream": stream,
+                "messages": [{"role": "user", "content": marker}],
+                "tools": [tool],
+            }
+            status, _, body = request("/v1/chat/completions", first)
+            need(status == 200, f"stream={stream} turn 1: {status}: {body}")
+            if stream:
+                call_ids = chat_tool_identity(sse(body))[1]
+                need(len(call_ids) == 1, f"stream={stream} turn 1 ids: {call_ids}")
+                call_id = next(iter(call_ids))
+            else:
+                message = json.loads(body)["choices"][0]["message"]
+                calls = message.get("tool_calls") or []
+                need(len(calls) == 1, f"stream={stream} turn 1 calls: {calls}")
+                call_id = calls[0]["id"]
+            need(bool(call_id), f"stream={stream} turn 1 tool call had no client-visible id")
+
+            second = {
+                "model": "syn-gemini-3",
+                "stream": stream,
+                "messages": [
+                    {"role": "user", "content": marker},
+                    {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                    }]},
+                    {"role": "tool", "tool_call_id": call_id, "content": "18C"},
+                ],
+                "tools": [tool],
+            }
+            status, _, body = request("/v1/chat/completions", second)
+            need(status == 200, f"stream={stream} turn 2 (signature not restored?): {status}: {body}")
+
+            # Negative control: a tool-call id that was never captured must not
+            # be given an invented signature. The strict upstream rejects the
+            # unsigned continuation, proving the positive turn above really did
+            # replay stored state rather than passing vacuously.
+            unknown = json.loads(json.dumps(second))
+            unknown["messages"][1]["tool_calls"][0]["id"] = "call_never_captured"
+            unknown["messages"][2]["tool_call_id"] = "call_never_captured"
+            status, _, _ = request("/v1/chat/completions", unknown)
+            need(status != 200, f"stream={stream} unknown id was accepted without stored state")
+
+        continuation_turn(False)
+        continuation_turn(True)
+        return
+
+    if case_id in (
+        "chat.translate.gemini.cross_model_placeholder",
+        "chat.translate.gemini.cross_model_placeholder_direct",
+    ):
+        # A trace that originated on one Gemini model and is continued on
+        # another. The stored signature is real but belongs to a different
+        # model: replaying it is wrong, and stripping it makes the provider
+        # reject the unsigned historical call. Gemini documents a placeholder
+        # for exactly this transfer, and the strict upstream accepts only that
+        # placeholder on the second model. The first case continues through the
+        # `syn-gemini-3-pro` Route (strip_with_warning); the second targets the
+        # bare upstream model id directly, so no Route policy applies. Both must
+        # translate with the placeholder rather than refusing.
+        marker = "fixture:gemini-cross-model-placeholder"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+        # `syn-gemini-3-pro` resolves to the Route of that name; the
+        # `provider/model` form forces a direct target with no Route policy.
+        turn2_model = (
+            "Synth Gemini/syn-gemini-3-pro"
+            if case_id.endswith("_direct")
+            else "syn-gemini-3-pro"
+        )
+
+        first = {
+            "model": "syn-gemini-3",
+            "stream": False,
+            "messages": [{"role": "user", "content": marker}],
+            "tools": [tool],
+        }
+        status, _, body = request("/v1/chat/completions", first)
+        need(status == 200, f"cross-model turn 1: {status}: {body}")
+        calls = json.loads(body)["choices"][0]["message"].get("tool_calls") or []
+        need(len(calls) == 1, f"cross-model turn 1 calls: {calls}")
+        call_id = calls[0]["id"]
+        need(bool(call_id), "cross-model turn 1 tool call had no client-visible id")
+
+        second = {
+            "model": turn2_model,
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": marker},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                }]},
+                {"role": "tool", "tool_call_id": call_id, "content": "18C"},
+            ],
+            "tools": [tool],
+        }
+        status, headers, body = request("/v1/chat/completions", second)
+        need(
+            status == 200,
+            f"{case_id} turn 2 (placeholder not substituted?): {status}: {body}",
+        )
+        need(
+            bool(headers.get("x-kinetix-warning")),
+            "a substituted cross-model placeholder must be reported to the client",
+        )
+
+        # Negative control: an id that was never captured has no state at all,
+        # so no placeholder is painted and the strict upstream rejects it. This
+        # proves the positive turn really used stored state rather than passing
+        # because the model accepts anything.
+        unknown = json.loads(json.dumps(second))
+        unknown["messages"][1]["tool_calls"][0]["id"] = "call_never_captured"
+        unknown["messages"][2]["tool_call_id"] = "call_never_captured"
+        status, _, _ = request("/v1/chat/completions", unknown)
+        need(status != 200, "an uncaptured id must not be given an invented placeholder")
+        return
+
+    if case_id == "chat.translate.gemini.legacy_model_strip_without_placeholder":
+        # Gemini 3 -> Gemini 2.5. The stored signature is still not portable,
+        # but Gemini 2.5 predates signature validation and never documented the
+        # Gemini 3 validator-bypass sentinel, so Kinetix must strip the state.
+        # The strict upstream rejects any thoughtSignature on this model, so an
+        # injected sentinel fails the case; the warning header proves the
+        # stored (non-portable) state was actually found and handled.
+        marker = "fixture:gemini-legacy-model-continuation"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+        first = {
+            "model": "syn-gemini-3",
+            "stream": False,
+            "messages": [{"role": "user", "content": marker}],
+            "tools": [tool],
+        }
+        status, _, body = request("/v1/chat/completions", first)
+        need(status == 200, f"legacy-model turn 1: {status}: {body}")
+        calls = json.loads(body)["choices"][0]["message"].get("tool_calls") or []
+        need(len(calls) == 1, f"legacy-model turn 1 calls: {calls}")
+        call_id = calls[0]["id"]
+        need(bool(call_id), "legacy-model turn 1 tool call had no client-visible id")
+
+        second = {
+            "model": "syn-gemini-legacy",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": marker},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                }]},
+                {"role": "tool", "tool_call_id": call_id, "content": "18C"},
+            ],
+            "tools": [tool],
+        }
+        status, headers, body = request("/v1/chat/completions", second)
+        need(
+            status == 200,
+            f"{case_id} turn 2 (Gemini 3 placeholder injected into 2.5?): {status}: {body}",
+        )
+        need(
+            bool(headers.get("x-kinetix-warning")),
+            "stripping non-portable state must be reported to the client",
+        )
         return
 
     if case_id == "chat.fallback.tool_continuation":
@@ -542,7 +743,7 @@ def run_http_case(case_id):
         return
 
     if case_id == "chat.translate.gemini.nested_content.reject":
-        base = {"model": "syn-gemini", "messages": [{"role": "user", "content": "hello"}]}
+        base = {"model": "syn-gemini-3", "messages": [{"role": "user", "content": "hello"}]}
         variants = [
             ("file content", {"messages": [{"role": "user", "content": [{"type": "file", "file": {"file_id": "file_1"}}]}]}),
             ("audio", {"messages": [{"role": "assistant", "content": "x", "audio": {"id": "audio_1"}}]}),
@@ -554,7 +755,7 @@ def run_http_case(case_id):
         return
 
     if case_id == "messages.translate.multimodal_tool_result.reject":
-        base = {"model": "syn-gemini", "max_tokens": 64, "messages": []}
+        base = {"model": "syn-gemini-3", "max_tokens": 64, "messages": []}
         variants = [
             ("multimodal tool_result", {"messages": [{"role": "user", "content": [{
                 "type": "tool_result",
@@ -628,12 +829,12 @@ def run_http_case(case_id):
             native.update(patch)
             status, _, body = request("/v1/chat/completions", native)
             need(status == 200, f"{label}: same-format passthrough failed: {status}: {body}")
-        translated = {"model": "syn-gemini", "messages": [{"role": "user", "content": "translated"}]}
+        translated = {"model": "syn-gemini-3", "messages": [{"role": "user", "content": "translated"}]}
         expect_rejected("/v1/chat/completions", translated, variants)
         return
 
     if case_id == "responses.unsupported_fields.reject":
-        base = {"model": "syn-gemini", "input": "hello"}
+        base = {"model": "syn-gemini-3", "input": "hello"}
         variants = [
             ("store", {"store": True}),
             ("background", {"background": True}),
@@ -660,7 +861,7 @@ def run_http_case(case_id):
     if case_id.startswith("messages.count_tokens."):
         models = {
             "messages.count_tokens.native_exact": ("syn-anthropic", "exact"),
-            "messages.count_tokens.translated_estimated": ("syn-gemini", "estimated"),
+            "messages.count_tokens.translated_estimated": ("syn-gemini-3", "estimated"),
             "messages.count_tokens.openai_estimated": ("syn-openai", "estimated"),
             "messages.count_tokens.heterogeneous_estimated": ("syn-count-heterogeneous", "estimated"),
         }
@@ -708,7 +909,7 @@ def run_http_case(case_id):
             f"expected {sorted(expected_classes)}, got {sorted(restricted_ids)}",
         )
         need(
-            "syn-gemini" not in restricted_ids,
+            "syn-gemini-3" not in restricted_ids,
             f"restricted key exposed disallowed provider model: {sorted(restricted_ids)}",
         )
 

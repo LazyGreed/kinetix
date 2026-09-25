@@ -24,9 +24,17 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
     - `gemini.rs`: Google Gemini REST API wire format (`generateContent` & `streamGenerateContent`).
   - Ingests streaming chunks from upstreams and normalizes them into downstream SSE events and token accounting metrics.
   - Gemini tool declarations use `parametersJsonSchema` with an explicit supported-key allowlist; documented-supported constraints are preserved, while unverified or unknown validation keywords fail closed before dispatch instead of being silently weakened.
+  - An adapter indicates that it produces opaque provider state (e.g. Gemini `thoughtSignature`) by returning `Some(OpaqueStateTarget)` from the `Adapter::opaque_state_target` trait method; the default is `None`, and plugin adapters are never assumed compatible with another adapter's opaque-state protocol. An adapter with a provider-documented stand-in for state it cannot carry returns it from `Adapter::opaque_state_placeholder` (default `None`).
+- **Opaque Provider State (`src/opaque_state.rs`)**:
+  - Host-owned subsystem that persists provider continuation state the client protocol cannot represent (currently Gemini `thoughtSignature`) and replays it on later turns.
+  - Captures signatures keyed by the post-normalization client-visible tool-call id, the client scope (virtual key id or `internal`), the provider, and the **exact originating model** plus family/producer; state from one virtual key is never served to another, and (for `generateContent`) state is never restored onto a different model. Lookup validates tool-name and explicit-session identity **before** classifying a row as non-portable, so a cross-model switch can never turn a reused id or a conflicting session into a placeholder. This is an implementation detail of `OpaqueStateStore::resolve_tool_signature` (`src/opaque_state.rs`), not a provider-behavior claim: when a row for the exact target model exists in Kinetix's own store, that row's identity is checked first, so a different model's row that merely shares the same tool-call id can never shadow it into a false `Incompatible`/placeholder outcome; rows from other models are only consulted when no exact-model row exists.
+  - Encrypts values at rest with a cipher derived specifically for this subsystem (`kinetix-opaque-provider-state`, distinct from the credential and plugin-KV ciphers); only SHA-256 hashes of scope, tool-call id, session id, and tool name are persisted.
+  - Uses a bounded RAM cache written synchronously for the data plane; encryption, the SQLite UPSERT, and periodic pruning run on a bounded background durability worker (`DurabilityJob` channel + `flush()` barrier), so a slow or locked database never stalls a streaming tool call. A saturated queue or a storage failure is counted, never fatal to a live response. The RAM cache TTL (1h) is deliberately shorter than the SQLite TTL (24h) so SQLite outlives the hot cache; an expired RAM entry is evicted and the lookup falls through to SQLite rather than short-circuiting to `Missing`, so a continuation on a long-running process still restores within the full 24h persistence window.
+  - Consumed by `src/pipeline.rs` around the existing portability decision: compatible state is restored only after a `strip_with_warning`/`reject` boundary is settled, and any known-but-incompatible stored state enters that decision even when neither the provider nor the wire format crossed over.
+  - Cross-model continuation: an adapter that has a documented placeholder for non-portable continuation state returns it from `Adapter::opaque_state_placeholder` (default `None`; Gemini returns the provider's `skip_thought_signature_validator` sentinel, which Google documents for function-call history transferred from another model). The adapter **gates the placeholder to the family that documents it**: the Gemini adapter returns the sentinel only for Gemini 3 model ids (`major == 3`, not `major >= 3`), because only that family is documented to validate the signature of a replayed function call, while Gemini 2.5 and older treat the signature as optional and must not receive the Gemini 3 validator-bypass token, and a later major family is not assumed to inherit the contract. The pipeline substitutes that placeholder onto the specific stored-but-incompatible historical call instead of stripping it — on a `strip_with_warning` Route and on a direct same-family switch with no Route policy. Never-captured ids are left untouched, a `reject` Route still refuses first, and a direct target whose adapter declares no placeholder still refuses known non-portable state. The sentinel lives on the adapter, never in the pipeline core. This behavior is regressed by `tests/opaque_state_gemini.rs` against a strict mock that rejects a foreign signature or an unsigned call.
 - **Control Plane & Storage (`src/db.rs`, `migrations/`, `src/admin.rs`)**:
   - SQLite database running with WAL mode (`PRAGMA journal_mode=WAL`) managed via SQLx migrations.
-  - Persists providers, accounts, models, routes, virtual keys, request logs, token usage, cost accounting, and plugin state.
+  - Persists providers, accounts, models, routes, virtual keys, request logs, token usage, cost accounting, plugin state, and opaque provider state (`opaque_provider_state`, migrated by `20260926120000_opaque_provider_state.sql` and re-keyed for model scoping by `20260927090000_opaque_provider_state_model_scope.sql`).
   - Admin REST API (`/api/*`) for administration, metrics, exports (`src/export.rs`), and diagnostic traces.
 - **Embedded Admin Dashboard (`dashboard/`, `src/assets.rs`)**:
   - React 19 + TypeScript + Vite + Tailwind CSS v4 single-page application.
@@ -46,7 +54,8 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
 - **Canonical Representation Boundary**: Frontends decode wire requests into internal canonical types. Outbound adapters encode canonical types into upstream wire payloads. Frontends and adapters never couple directly.
 - **Outbound Upstream Boundary**: Network requests to upstreams are strictly isolated within adapters. Credentials are leased dynamically and injected at dispatch time; upstream credentials and URLs are scrubbed before logging or downstream propagation.
 - **Host / Guest WASM Plugin Boundary**: Plugins run sandboxed in Wasmtime. They interact with the host solely via the WIT contract (`wit/kinetix-plugin.wit`) and are restricted by configured `HostPolicy`.
-- **Data Plane vs Control Plane Boundary**: Core request routing and streaming (data plane) remain resilient even if control plane/database operations experience transient latency. Usage logs are queued asynchronously (`src/logqueue.rs`).
+- **Data Plane vs Control Plane Boundary**: Core request routing and streaming (data plane) remain resilient even if control plane/database operations experience transient latency. Usage logs are queued asynchronously (`src/logqueue.rs`), and opaque-state capture never fails a live response (RAM write is synchronous; SQLite durability runs on a bounded async worker and storage errors/queue drops are counted and swallowed).
+- **Opaque Provider-State Boundary**: Adapters only parse/encode provider continuation state; they never persist it. Persistence, scope isolation, and replay live in `src/opaque_state.rs` and are orchestrated by `src/pipeline.rs`. Opaque signatures never appear in client responses, logs, traces, the dashboard, or metrics.
 
 ## dependency direction
 
@@ -54,6 +63,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - Entry point: `src/main.rs` -> `src/cli.rs` -> `src/server.rs` -> `src/app.rs`.
   - HTTP routing: `src/server.rs` mounts `src/frontends/`, `src/admin.rs`, and embedded `src/assets.rs`.
   - Request execution: `src/pipeline.rs` orchestrates `src/router.rs`, `src/registry.rs`, `src/pool.rs`, `src/adapters/`, `src/db.rs`, and `src/plugins/`.
+  - Opaque state: `src/pipeline.rs` orchestrates `src/opaque_state.rs` (RAM cache + bounded async durability worker over SQLite) and `src/crypto.rs` (derived cipher); `src/adapters/` only opts in via `Adapter::opaque_state_target` and never calls the store.
   - Leaf modules: `src/types.rs`, `src/crypto.rs`, `src/paths.rs`, `src/sse.rs`, `src/cost.rs`, `src/limits.rs` provide pure types and utilities with zero inward dependencies on pipeline or server.
   - Plugin host: `src/plugins/` depends on Wasmtime and the host WIT definition. Guest SDK/plugins are maintained independently in `PrightCord/kinetix-plugins`.
 
@@ -112,6 +122,9 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   # Plugin host subsystem tests
   cargo test --test plugins
   KINETIX_PLUGIN_E2E_PACKAGE=/path/to/plugin.kxp cargo test --test plugin_e2e
+
+  # Gemini opaque-state capture/replay through a translated frontend
+  cargo test --test opaque_state_gemini
 
   # End-to-end smoke test against synthetic upstream
   scripts/smoke.sh 127.0.0.1:8180
@@ -222,6 +235,7 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - Keepalive pulses (`: keepalive\n\n`) must be emitted at regular intervals to prevent reverse proxy/Cloudflare idle timeouts (~100s).
 - **Authentication**: Virtual keys and admin tokens must be verified using constant-time comparison via `subtle::ConstantTimeEq` to prevent timing attacks.
 - **Credential security**: Store upstream credentials encrypted at rest using AES-GCM-256 (`src/crypto.rs`). Never log raw API keys.
+- **Opaque provider state**: Store provider continuation state (e.g. Gemini `thoughtSignature`) encrypted with its own derived cipher (`kinetix-opaque-provider-state`, never the credential or plugin-KV cipher). Persist only SHA-256 hashes of scope/tool-call/session/tool-name identifiers, never the raw values, and never expose signatures in logs, traces, dashboard, metrics, or errors.
 
 ---
 
@@ -239,6 +253,10 @@ Kinetix is a streaming-first LLM reverse proxy and routing engine written in Rus
   - `scripts/smoke.sh`: Tests routing, wire translation, virtual keys, models discovery, and admin APIs.
   - `scripts/compat-matrix.sh`: Runs the #75/#83 coding-agent profiles plus `scripts/protocol-v1-matrix.py`, which consumes `tests/fixtures/protocol-v1-compatibility.json` for native/translated/fallback compatibility coverage and checks the generated field matrix.
   - `scripts/release-client-acceptance.sh`: Manual release-only Pi/Claude Code/Codex and optional real-`.kxp` acceptance. It may consume provider quota and must never be added to normal CI.
+  - `scripts/synthetic_upstream.py` must fail closed when a fixture expects Kinetix to have translated a field: e.g. the `gemini-signature-continuation` fixture returns the provider's real "missing thought_signature" 400 unless the replayed function call carries the exact stored signature, and rejects a never-captured tool-call id. A 200 is thus evidence of replay rather than a vacuous pass.
+- **Opaque provider state**:
+  - `tests/opaque_state_gemini.rs`: Drives two-turn OpenAI->Gemini tool conversations against a strict mock upstream, covering streaming and non-streaming replay, SQLite-only durability across a simulated restart, cross-scope isolation, and tool-call-id/name reuse rejection before dispatch. It also regresses the portability boundary without session provenance: stored Gemini state reaching an OpenAI-wire target must be rejected by a `reject` Route, stripped with a warning by a `strip_with_warning` Route, and refused outright on a direct target. Gemini 3 Flash<->Pro cross-model continuations are covered against a model-strict mock that accepts only the documented `skip_thought_signature_validator` placeholder on the second model and rejects a foreign signature or an unsigned call; this covers both a `strip_with_warning` Route and a direct same-family switch with no Route. A Gemini 3 -> 2.5 continuation is regressed separately: the mock rejects any `thoughtSignature` on the pre-Gemini-3 model, so the case passes only when Kinetix strips the incompatible state rather than injecting the Gemini 3 validator-bypass sentinel. Identity is validated before the cross-model placeholder is considered: a reused tool-call id with a different name is rejected HTTP 400 pre-dispatch, and a conflicting explicit session reaches the provider unsigned rather than being translated.
+- `src/server.rs` `#[cfg(test)]`: `graceful_shutdown_flushes_queued_opaque_state` proves the shutdown path flushes queued opaque-state durability writes before `run()` returns, so a signature accepted just before shutdown survives a restart.
 - **WASM plugin runtime**:
   - `tests/plugins.rs`: Tests plugin store, capabilities, lifecycle, and host policy.
   - `tests/plugin_e2e.rs`: Tests end-to-end installation, instantiation, and invocation of an external compiled `.kxp` supplied with `KINETIX_PLUGIN_E2E_PACKAGE`.

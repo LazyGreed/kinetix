@@ -97,13 +97,33 @@ models_path = "/models"
   quota_type = "none"
 
   [[providers.models]]
-  upstream_id = "syn-gemini"
+  upstream_id = "syn-gemini-3"
   display_name = "Synthetic Gemini"
   enabled = true
   context_window = 200000
   max_output_tokens = 8192
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+
+  [[providers.models]]
+  upstream_id = "syn-gemini-3-pro"
+  display_name = "Synthetic Gemini Pro"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "vision", "reasoning", "tool_calling"]
+  thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+
+  # Pre-Gemini-3 model: it predates thought-signature validation on replayed
+  # function calls, so the Gemini 3 validator-bypass placeholder must not be
+  # injected into a history continued here.
+  [[providers.models]]
+  upstream_id = "syn-gemini-2.5-pro"
+  display_name = "Synthetic Gemini 2.5 Pro"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text", "vision", "reasoning", "tool_calling"]
 
 
 [[providers]]
@@ -260,8 +280,37 @@ max_attempts = 2
   weight = 1
 
   [[routes.targets]]
-  model = "Synth Gemini/syn-gemini"
+  model = "Synth Gemini/syn-gemini-3"
   priority = 2
+  weight = 1
+
+
+# Cross-model Gemini continuation: a signature captured on syn-gemini-3 must not
+# be replayed onto syn-gemini-3-pro; the documented placeholder is used instead.
+[[routes]]
+name = "syn-gemini-3-pro"
+strategy = "priority"
+max_attempts = 1
+portability_policy = "strip_with_warning"
+
+  [[routes.targets]]
+  model = "Synth Gemini/syn-gemini-3-pro"
+  priority = 1
+  weight = 1
+
+
+# A history continued on a pre-Gemini-3 model must be stripped, not translated
+# with the Gemini 3 placeholder: the model accepts an unsigned call and never
+# documented the sentinel.
+[[routes]]
+name = "syn-gemini-legacy"
+strategy = "priority"
+max_attempts = 1
+portability_policy = "strip_with_warning"
+
+  [[routes.targets]]
+  model = "Synth Gemini/syn-gemini-2.5-pro"
+  priority = 1
   weight = 1
 
 

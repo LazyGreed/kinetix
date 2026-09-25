@@ -10,6 +10,7 @@ overhead, not inference. No external dependencies; stdlib only.
 """
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -62,6 +63,35 @@ def _fixture(req, name):
     return f"fixture:{name}" in json.dumps(req, sort_keys=True)
 
 
+def _path_model(path):
+    """The upstream model id from a Gemini `.../models/<id>:method` path.
+
+    The Gemini wire format carries the model in the URL, not the body, so a
+    model-aware fixture must read it from here.
+    """
+    match = re.search(r"/models/([^:?/]+)", path)
+    return match.group(1) if match else ""
+
+
+def _function_call_parts(value):
+    """Return every `functionCall` part (the enclosing part, so the sibling
+    `thoughtSignature` is visible) in a Gemini body."""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key == "functionCall" and isinstance(child, dict):
+                    found.append(node)
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return found
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -83,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "data": [
                         {"id": "syn-openai", "context_window": 200000, "max_output_tokens": 8192},
-                        {"id": "syn-gemini", "context_window": 200000, "max_output_tokens": 8192},
+                        {"id": "syn-gemini-3", "context_window": 200000, "max_output_tokens": 8192},
                     ]
                 }
             ).encode()
@@ -177,6 +207,64 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 self._json(400, {"error": {"message": "opaque reasoning state crossed portability boundary"}})
                 return
+            if _fixture(req, "gemini-cross-model-placeholder") and _contains_key(req, {"functionResponse"}):
+                # Cross-model continuation: the trace originated on `syn-gemini-3`
+                # (real signature OPAQUE_SIG_FLASH) but is being continued on
+                # `syn-gemini-3-pro`, which cannot carry that signature. Gemini
+                # documents the placeholder `skip_thought_signature_validator`
+                # for exactly this transfer, and rejects both an unsigned call
+                # and a foreign model's real signature.
+                calls = _function_call_parts(req)
+                if not calls:
+                    self._json(400, {"error": {"message": "continuation lost the originating function call"}})
+                    return
+                wire_model = _path_model(self.path) or model
+                # A model accepts its own real signature, or the documented
+                # placeholder for a trace transferred from another model. It
+                # rejects an unsigned call and another model's real signature.
+                own = "OPAQUE_SIG_PRO" if "pro" in wire_model else "OPAQUE_SIG_FLASH"
+                allowed = {own, "skip_thought_signature_validator"}
+                if any(part.get("thoughtSignature") not in allowed for part in calls):
+                    self._json(400, {"error": {"message": (
+                        "Function call is missing a thought_signature in functionCall parts. "
+                        "This is required for tools to work correctly."
+                    )}})
+                    return
+            if _fixture(req, "gemini-legacy-model-continuation") and _contains_key(req, {"functionResponse"}):
+                # Gemini 2.5 predates the Gemini 3 signature validation: an
+                # unsigned historical function call is accepted there, but the
+                # Gemini 3 validator-bypass sentinel is not documented and must
+                # not be injected. Reject any thoughtSignature so the test can
+                # only pass by actually stripping the incompatible state.
+                calls = _function_call_parts(req)
+                if not calls:
+                    self._json(400, {"error": {"message": "continuation lost the originating function call"}})
+                    return
+                if any(part.get("thoughtSignature") is not None for part in calls):
+                    self._json(400, {"error": {"message": (
+                        "unexpected thoughtSignature on a Gemini 2.5 function call: "
+                        "the Gemini 3 validator-bypass placeholder must not be injected"
+                    )}})
+                    return
+            if _fixture(req, "gemini-signature-continuation") and _contains_key(req, {"functionResponse"}):
+                # Strict Gemini behavior: once a signed function call has been
+                # continued, every function-call part in the history must carry
+                # its exact thoughtSignature. This mirrors the real provider's
+                # "Function call is missing a thought_signature" rejection and is
+                # what Kinetix's server-side replay must satisfy. The
+                # originating function call must also still be present at all.
+                calls = _function_call_parts(req)
+                if not calls:
+                    self._json(400, {"error": {"message": "continuation lost the originating function call"}})
+                    return
+                if any(
+                    part.get("thoughtSignature") != "OPAQUE_SIG_CONTINUATION" for part in calls
+                ):
+                    self._json(400, {"error": {"message": (
+                        "Function call is missing a thought_signature in functionCall parts. "
+                        "This is required for tools to work correctly."
+                    )}})
+                    return
             self._gemini(model, want_tools, req)
         else:
             self._openai(model, stream, want_tools, tool_fragments, req)
@@ -590,9 +678,33 @@ class Handler(BaseHTTPRequestHandler):
         try:
             time.sleep(TTFT_MS / 1000.0)
             if want_tools:
-                calls = [
-                    {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}
-                ]
+                if req is not None and (
+                    _fixture(req, "gemini-cross-model-placeholder")
+                    or _fixture(req, "gemini-legacy-model-continuation")
+                ):
+                    # The originating model's real signature; the other model must
+                    # never receive it (it gets the documented placeholder).
+                    origin_sig = (
+                        "OPAQUE_SIG_PRO"
+                        if "pro" in _path_model(self.path)
+                        else "OPAQUE_SIG_FLASH"
+                    )
+                    calls = [{
+                        "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                        "thoughtSignature": origin_sig,
+                    }]
+                elif req is not None and _fixture(req, "gemini-signature-continuation"):
+                    # Deliberately omit functionCall.id so Kinetix must generate
+                    # the client-visible id; the test then continues with the id
+                    # Kinetix actually exposed.
+                    calls = [{
+                        "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                        "thoughtSignature": "OPAQUE_SIG_CONTINUATION",
+                    }]
+                else:
+                    calls = [
+                        {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}
+                    ]
                 if req is not None and _fixture(req, "multi-tools"):
                     calls.append(
                         {"functionCall": {"name": "read_file", "args": {"path": "src/main.rs"}}}

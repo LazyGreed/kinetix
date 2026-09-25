@@ -21,7 +21,7 @@ def one(url, key, path, out, idx, tool_fragments=0):
         body = {"model": model, "stream": True, "max_tokens": 64,
                 "messages": [{"role": "user", "content": "hi"}]}
     elif path == "translation":
-        model = "syn-gemini"
+        model = "syn-gemini-3"
         body = {"model": model, "stream": True, "max_tokens": 64,
                 "messages": [{"role": "user", "content": "hi"}]}
     elif path == "tools":

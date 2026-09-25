@@ -12,6 +12,7 @@ use crate::app::AppState;
 use crate::config::Config;
 use crate::crypto::Crypto;
 use crate::logqueue::UsageLogQueue;
+use crate::opaque_state::OpaqueStateStore;
 use crate::plugins::{HostPolicy, PluginManager};
 use crate::registry::Registry;
 use crate::{alerts, bootstrap, db, export, router};
@@ -147,6 +148,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         app,
         Duration::from_secs(config.shutdown_grace_secs),
         shutdown_signal(),
+        state.opaque_state.clone(),
     )
     .await?;
 
@@ -159,6 +161,7 @@ async fn serve_with_shutdown<F>(
     app: axum::Router,
     grace: Duration,
     shutdown: F,
+    opaque_state: Arc<OpaqueStateStore>,
 ) -> Result<()>
 where
     F: std::future::Future<Output = ()>,
@@ -177,6 +180,7 @@ where
     tokio::select! {
         result = &mut server_task => {
             result.context("server task failed")?.context("server error")?;
+            opaque_state.flush().await;
             return Ok(());
         }
         _ = shutdown => {}
@@ -207,6 +211,11 @@ where
             );
         }
     }
+
+    // A tool call already returned to a client may still have a queued
+    // opaque-state durability write. Flush it before `run()` returns so a
+    // restart does not lose a signature the client was told was accepted.
+    opaque_state.flush().await;
 
     Ok(())
 }
@@ -555,6 +564,21 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
 
+    /// A real temp-file-backed opaque-state store, so the shutdown-flush
+    /// regression can prove SQLite durability rather than only RAM.
+    async fn test_store() -> (Arc<OpaqueStateStore>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-server-opaque-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("k.db").display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let crypto = Arc::new(Crypto::new(&[7_u8; 32]));
+        (Arc::new(OpaqueStateStore::new(pool, crypto)), root)
+    }
+
     #[tokio::test]
     async fn shutdown_deadline_bounds_stuck_in_flight_request() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -582,9 +606,16 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let grace = Duration::from_millis(50);
-        let server_task = tokio::spawn(serve_with_shutdown(listener, app, grace, async move {
-            let _ = shutdown_rx.await;
-        }));
+        let (store, root) = test_store().await;
+        let server_task = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            grace,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            store,
+        ));
 
         let request_task = tokio::spawn(async move {
             reqwest::Client::new()
@@ -613,6 +644,7 @@ mod tests {
         );
 
         request_task.abort();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -620,6 +652,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app = Router::new();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (store, root) = test_store().await;
 
         let server_task = tokio::spawn(serve_with_shutdown(
             listener,
@@ -628,6 +661,7 @@ mod tests {
             async move {
                 let _ = shutdown_rx.await;
             },
+            store,
         ));
 
         shutdown_tx.send(()).unwrap();
@@ -637,5 +671,60 @@ mod tests {
             .expect("idle server did not drain promptly")
             .expect("server task panicked")
             .expect("server returned an error");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression: a signature captured just before shutdown is still only a
+    /// queued durability job (RAM is synchronous, SQLite is async). The
+    /// shutdown path must flush it, otherwise a restart loses a continuation
+    /// the client was already told was accepted.
+    #[tokio::test]
+    async fn graceful_shutdown_flushes_queued_opaque_state() {
+        use crate::opaque_state::{
+            OpaqueClientScope, OpaqueLookupResult, OpaqueStateKind, OpaqueStateTarget,
+        };
+
+        let (store, root) = test_store().await;
+        let scope = OpaqueClientScope::for_key("shutdown-key");
+        let target = OpaqueStateTarget {
+            kind: OpaqueStateKind::GeminiThoughtSignature,
+            provider_id: "p".into(),
+            family: "gemini".into(),
+            producer: "native:gemini:v1".into(),
+            model_id: "gemini-3".into(),
+        };
+        store.capture_tool_signature(&scope, &target, None, "call_1", "bash", "SIG");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Router::new();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_task = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            Duration::from_secs(1),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            store.clone(),
+        ));
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), server_task)
+            .await
+            .expect("server did not return after shutdown")
+            .expect("server task panicked")
+            .expect("server returned an error");
+
+        // Only SQLite can answer now: the shutdown flush must have made the
+        // queued write durable.
+        store.clear_memory_cache_for_test();
+        assert_eq!(
+            store
+                .resolve_tool_signature(&scope, Some(&target), None, "call_1", "bash")
+                .await,
+            OpaqueLookupResult::Compatible("SIG".into()),
+            "shutdown must flush queued opaque-state durability writes"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -13,6 +13,11 @@ pub struct Crypto {
     /// master key under a distinct label (§10). Kept separate so plugin KV is
     /// never encrypted under the provider-credential key.
     kv_cipher: Aes256Gcm,
+    /// A separate cipher for opaque provider continuation state (e.g. Gemini
+    /// `thoughtSignature`), derived from the same master key under a distinct
+    /// label. Kept separate so a leaked provider-credential key (or vice
+    /// versa) cannot decrypt opaque continuation tokens.
+    opaque_state_cipher: Aes256Gcm,
 }
 
 impl Crypto {
@@ -24,9 +29,17 @@ impl Crypto {
         hasher.update(master_key);
         let derived = hasher.finalize();
         let kv_key = Key::<Aes256Gcm>::from_slice(&derived);
+        // Derive a distinct 32-byte key for opaque provider continuation
+        // state: SHA-256("kinetix-opaque-provider-state" || master).
+        let mut opaque_hasher = Sha256::new();
+        opaque_hasher.update(b"kinetix-opaque-provider-state");
+        opaque_hasher.update(master_key);
+        let opaque_derived = opaque_hasher.finalize();
+        let opaque_key = Key::<Aes256Gcm>::from_slice(&opaque_derived);
         Crypto {
             cipher: Aes256Gcm::new(key),
             kv_cipher: Aes256Gcm::new(kv_key),
+            opaque_state_cipher: Aes256Gcm::new(opaque_key),
         }
     }
 
@@ -46,6 +59,18 @@ impl Crypto {
 
     pub fn decrypt_kv(&self, encoded: &str) -> Result<String> {
         Self::decrypt_with(&self.kv_cipher, encoded)
+    }
+
+    /// Encrypt opaque provider continuation state (e.g. Gemini
+    /// `thoughtSignature`) under the dedicated derived key label. Never reuse
+    /// the provider-credential or plugin-KV ciphers for this: the signature is
+    /// a provider secret-like token and must be isolated from both.
+    pub fn encrypt_opaque_state(&self, plaintext: &str) -> Result<String> {
+        Self::encrypt_with(&self.opaque_state_cipher, plaintext)
+    }
+
+    pub fn decrypt_opaque_state(&self, encoded: &str) -> Result<String> {
+        Self::decrypt_with(&self.opaque_state_cipher, encoded)
     }
 
     fn encrypt_with(cipher: &Aes256Gcm, plaintext: &str) -> Result<String> {
@@ -178,5 +203,27 @@ mod tests {
         assert_eq!(c.decrypt_kv(&kv).unwrap(), "refresh-token");
         let cred = c.encrypt("sk-secret").unwrap();
         assert!(c.decrypt_kv(&cred).is_err());
+    }
+
+    #[test]
+    fn opaque_state_roundtrip_and_key_isolation() {
+        let c = Crypto::new(&[7u8; 32]);
+        let ct = c.encrypt_opaque_state("OPAQUE_THOUGHT_SIGNATURE").unwrap();
+        assert_ne!(ct, "OPAQUE_THOUGHT_SIGNATURE");
+        assert_eq!(
+            c.decrypt_opaque_state(&ct).unwrap(),
+            "OPAQUE_THOUGHT_SIGNATURE"
+        );
+
+        // The credential cipher must not decrypt opaque-state ciphertext.
+        assert!(c.decrypt(&ct).is_err());
+        // The plugin-KV cipher must not decrypt opaque-state ciphertext either.
+        assert!(c.decrypt_kv(&ct).is_err());
+
+        // Nor may opaque-state decrypt credential/KV ciphertext.
+        let cred = c.encrypt("sk-secret").unwrap();
+        assert!(c.decrypt_opaque_state(&cred).is_err());
+        let kv = c.encrypt_kv("refresh-token").unwrap();
+        assert!(c.decrypt_opaque_state(&kv).is_err());
     }
 }

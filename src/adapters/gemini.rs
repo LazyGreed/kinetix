@@ -13,6 +13,15 @@ use crate::types::{
     SamplingParams, StreamEvent, TokenUsage, ToolChoice, UpstreamFailure,
 };
 
+/// Google's documented sentinel for replaying a historical `functionCall` whose
+/// real `thoughtSignature` is not available to this request (for example a
+/// conversation transferred from a different Gemini model). Gemini accepts it
+/// in place of a real signature and skips signature validation, which keeps the
+/// call in the history instead of failing with HTTP 400. It is *not* real
+/// reasoning state; passing it trades reasoning continuity for a working turn.
+/// See <https://ai.google.dev/gemini-api/docs/thought-signatures>.
+pub const GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
 pub struct GeminiAdapter;
 
 impl GeminiAdapter {
@@ -776,6 +785,75 @@ impl Adapter for GeminiAdapter {
         }
         out
     }
+
+    /// Native Gemini opts into automatic opaque `thoughtSignature`
+    /// persistence/replay (§6).
+    ///
+    /// The producer string is an adapter *encoding* version, bumped only if
+    /// Kinetix's interpretation of the signature payload changes
+    /// incompatibly — never the crate release version.
+    fn opaque_state_target(
+        &self,
+        model: &crate::db::ModelRow,
+    ) -> Option<crate::opaque_state::OpaqueStateTarget> {
+        Some(crate::opaque_state::OpaqueStateTarget {
+            kind: crate::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
+            provider_id: model.provider_id.clone(),
+            family: "gemini".to_string(),
+            producer: "native:gemini:v1".to_string(),
+            // `generateContent` only accepts a thought signature on the model
+            // that produced it, so state is keyed by the exact model id and a
+            // model switch is reported non-portable rather than handed a
+            // maybe-invalid signature.
+            model_id: model.upstream_id.clone(),
+        })
+    }
+
+    /// `generateContent` documents an explicit placeholder for a historical
+    /// `functionCall` whose real signature cannot be reused: the sentinel keeps
+    /// the call in the conversation (with degraded reasoning continuity)
+    /// instead of failing the whole request with HTTP 400.
+    ///
+    /// This is a Gemini 3 mechanism. Only that family validates the signature
+    /// of a replayed `functionCall` (and therefore documents the bypass);
+    /// Gemini 2.5 and older treat the signature as optional, so injecting the
+    /// sentinel there would be inventing protocol state the upstream never
+    /// asked for. A later major family is *not* assumed to inherit the Gemini 3
+    /// contract either, since nothing documents the bypass for it yet. The gate
+    /// is deliberately a model-id check for now — there is no
+    /// operator-configurable capability that expresses "Gemini 3 signature
+    /// semantics" yet, and hardcoding a broader vendor preset in the pipeline
+    /// core is forbidden.
+    ///
+    /// Source: <https://ai.google.dev/gemini-api/docs/thought-signatures>
+    /// (signature validation on replayed function calls, and the sentinel for
+    /// history transferred from another model, both apply to Gemini 3).
+    fn opaque_state_placeholder(&self, model: &crate::db::ModelRow) -> Option<&'static str> {
+        is_gemini_three(&model.upstream_id).then_some(GEMINI_PLACEHOLDER_THOUGHT_SIGNATURE)
+    }
+}
+
+/// Whether `upstream_id` names a Gemini 3 model.
+///
+/// The id is matched as `...gemini-<major>...`, so both bare ids
+/// (`gemini-3-pro-preview`) and path-qualified ids (`models/gemini-3-flash`)
+/// are recognised. An id that does not carry a Gemini version number is not
+/// treated as Gemini 3.
+///
+/// The match is `major == 3`, not `major >= 3`: Google documents the
+/// thought-signature validation rule (and the `skip_thought_signature_validator`
+/// bypass for it) for Gemini 3 only. There is no evidence that a later major
+/// family keeps that contract, so a `gemini-4-*` id must fall back to the
+/// ordinary strip/reject portability path rather than be handed a
+/// validator-bypass sentinel. See
+/// <https://ai.google.dev/gemini-api/docs/thought-signatures> for the Gemini 3
+/// signature semantics this gate reflects.
+fn is_gemini_three(upstream_id: &str) -> bool {
+    let Some((_, rest)) = upstream_id.rsplit_once("gemini-") else {
+        return false;
+    };
+    let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    major.parse::<u32>().is_ok_and(|version| version == 3)
 }
 
 /// Convert a Gemini chunk/response into internal stream events.
@@ -948,6 +1026,27 @@ pub fn message_has_tool_result(m: &Message) -> bool {
 mod schema_tests {
     use super::*;
 
+    /// Minimal `ModelRow` for adapter-level capability decisions.
+    fn model_row(upstream_id: &str) -> crate::db::ModelRow {
+        crate::db::ModelRow {
+            id: "m".into(),
+            provider_id: "ai-studio".into(),
+            upstream_id: upstream_id.into(),
+            display_name: upstream_id.into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
     #[test]
     fn signature_only_thinking_decodes_for_round_trip() {
         let events = events_from_gemini(&json!({
@@ -984,6 +1083,189 @@ mod schema_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["thought"], true);
         assert_eq!(out[0]["thoughtSignature"], "sig-thinking");
+    }
+
+    #[test]
+    fn function_call_with_same_part_signature_decodes_to_tool_call_start() {
+        let events = events_from_gemini(&json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "call_1",
+                            "name": "bash",
+                            "args": {}
+                        },
+                        "thoughtSignature": "SIG_A"
+                    }]
+                }
+            }]
+        }));
+
+        let start = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+            .expect("tool call start event");
+        assert!(matches!(
+            start,
+            StreamEvent::ToolCallStart {
+                id: Some(id),
+                name,
+                signature: Some(signature),
+                ..
+            } if id == "call_1" && name == "bash" && signature == "SIG_A"
+        ));
+    }
+
+    #[test]
+    fn parallel_function_calls_only_first_carries_signature() {
+        // Gemini 3 commonly signs only the first function call in a parallel
+        // function-call step; the other calls must decode with no signature
+        // rather than inheriting the first one's.
+        let events = events_from_gemini(&json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": { "id": "A", "name": "read", "args": {} },
+                            "thoughtSignature": "SIG_A"
+                        },
+                        {
+                            "functionCall": { "id": "B", "name": "bash", "args": {} }
+                        }
+                    ]
+                }
+            }]
+        }));
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert!(matches!(
+            starts[0],
+            StreamEvent::ToolCallStart { id: Some(id), signature: Some(sig), .. }
+            if id == "A" && sig == "SIG_A"
+        ));
+        assert!(matches!(
+            starts[1],
+            StreamEvent::ToolCallStart { id: Some(id), signature: None, .. }
+            if id == "B"
+        ));
+    }
+
+    #[test]
+    fn native_gemini_opts_into_opaque_state_by_family_not_exact_model() {
+        let model = crate::db::ModelRow {
+            id: "m".into(),
+            provider_id: "ai-studio".into(),
+            upstream_id: "gemini-3.8-flash".into(),
+            display_name: "Gemini 3.8 Flash".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        };
+        let adapter = GeminiAdapter::new();
+        let target = adapter.opaque_state_target(&model).expect("gemini opts in");
+        assert_eq!(target.provider_id, "ai-studio");
+        assert_eq!(target.family, "gemini");
+        assert_eq!(target.producer, "native:gemini:v1");
+        assert_eq!(target.model_id, "gemini-3.8-flash");
+
+        // A different exact model id on the same provider keeps the same
+        // family/producer provenance but a distinct model id, so state is
+        // never replayed across models (§6).
+        let mut other_model = model.clone();
+        other_model.upstream_id = "gemini-3.8-pro".into();
+        let other_target = adapter
+            .opaque_state_target(&other_model)
+            .expect("gemini opts in");
+        assert_eq!(other_target.family, target.family);
+        assert_eq!(other_target.producer, target.producer);
+        assert_ne!(other_target.model_id, target.model_id);
+    }
+
+    #[test]
+    fn native_gemini_declares_the_documented_placeholder_signature() {
+        // Cross-model continuation keeps exact signatures model-scoped, so the
+        // target cannot carry the stored value; Gemini documents this sentinel
+        // for exactly that case, and the pipeline paints it instead of sending
+        // an unsigned (rejected) historical function call.
+        assert_eq!(
+            GeminiAdapter::new().opaque_state_placeholder(&model_row("gemini-3.8-pro")),
+            Some("skip_thought_signature_validator")
+        );
+        assert_eq!(
+            GeminiAdapter::new().opaque_state_placeholder(&model_row("gemini-3-flash-preview")),
+            Some("skip_thought_signature_validator")
+        );
+    }
+
+    #[test]
+    fn older_gemini_models_do_not_declare_the_gemini_3_placeholder() {
+        // The sentinel is a Gemini 3 `generateContent` mechanism. Gemini 2.5
+        // and older treat a replayed function-call signature as optional, so
+        // Kinetix must not inject the Gemini 3 validator-bypass token there.
+        for upstream_id in [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            // An id without a Gemini version number is not assumed Gemini 3.
+            "gemini-experimental",
+        ] {
+            assert_eq!(
+                GeminiAdapter::new().opaque_state_placeholder(&model_row(upstream_id)),
+                None,
+                "{upstream_id} must not receive the Gemini 3 placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn later_gemini_majors_do_not_inherit_the_gemini_3_placeholder() {
+        // The validator bypass is documented for Gemini 3 only: Google's
+        // thought-signatures doc names the Gemini 3 preview models
+        // (gemini-3-pro-preview, gemini-3-flash-preview) as the family that
+        // enforces replay validation and documents
+        // `skip_thought_signature_validator` as the escape hatch
+        // (<https://ai.google.dev/gemini-api/docs/thought-signatures>).
+        // Nothing states a later major keeps that contract, so Kinetix must
+        // not hand a future family a validator-bypass token it cannot justify;
+        // a `gemini-4-*` target falls back to the ordinary strip/reject
+        // portability path.
+        for upstream_id in [
+            "gemini-4-pro",
+            "gemini-4-flash",
+            "models/gemini-4.0-pro",
+            "gemini-5-pro",
+        ] {
+            assert_eq!(
+                GeminiAdapter::new().opaque_state_placeholder(&model_row(upstream_id)),
+                None,
+                "{upstream_id} must not receive the Gemini 3 placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_three_detection_handles_path_qualified_ids() {
+        assert!(is_gemini_three("gemini-3-pro-preview"));
+        assert!(is_gemini_three("models/gemini-3-flash"));
+        assert!(!is_gemini_three("models/gemini-2.5-pro"));
+        assert!(!is_gemini_three("gemini-4-pro"));
+        assert!(!is_gemini_three("gemini"));
     }
 
     #[test]

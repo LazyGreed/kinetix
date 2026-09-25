@@ -4059,6 +4059,54 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
         "kinetix_flight_recorder_dropped_total {}\n",
         state.flight.dropped_requests() + state.flight.dropped_events()
     ));
+    // Opaque provider-state persistence (Gemini thoughtSignature replay).
+    // These are counts and bucket sizes only; no signature, tool-call id, or
+    // session identifier is ever exported.
+    {
+        let m = state.opaque_state.metrics();
+        body.push_str("# HELP kinetix_opaque_state_entries Cached opaque provider-state rows (memory + store)\n");
+        body.push_str("# TYPE kinetix_opaque_state_entries gauge\n");
+        body.push_str(&format!("kinetix_opaque_state_entries {}\n", m.entries));
+        body.push_str(
+            "# HELP kinetix_opaque_state_captured_total Opaque provider-state rows captured\n",
+        );
+        body.push_str("# TYPE kinetix_opaque_state_captured_total counter\n");
+        body.push_str(&format!(
+            "kinetix_opaque_state_captured_total {}\n",
+            m.capture_stored
+        ));
+        body.push_str("# HELP kinetix_opaque_state_replaced_total Captured rows that replaced an existing value\n");
+        body.push_str("# TYPE kinetix_opaque_state_replaced_total counter\n");
+        body.push_str(&format!(
+            "kinetix_opaque_state_replaced_total {}\n",
+            m.capture_replaced
+        ));
+        body.push_str("# HELP kinetix_opaque_state_capture_dropped_total Captures whose durability job was dropped because the async queue was full\n");
+        body.push_str("# TYPE kinetix_opaque_state_capture_dropped_total counter\n");
+        body.push_str(&format!(
+            "kinetix_opaque_state_capture_dropped_total {}\n",
+            m.capture_dropped
+        ));
+        body.push_str("# HELP kinetix_opaque_state_capture_storage_errors_total Async durability failures while capturing\n");
+        body.push_str("# TYPE kinetix_opaque_state_capture_storage_errors_total counter\n");
+        body.push_str(&format!(
+            "kinetix_opaque_state_capture_storage_errors_total {}\n",
+            m.capture_storage_error
+        ));
+        for (label, value) in [
+            ("hit", m.lookup_hit),
+            ("miss", m.lookup_miss),
+            ("expired", m.lookup_expired),
+            ("incompatible", m.lookup_incompatible),
+            ("session_mismatch", m.lookup_session_mismatch),
+            ("tool_name_mismatch", m.lookup_tool_name_mismatch),
+            ("decrypt_error", m.lookup_decrypt_error),
+        ] {
+            body.push_str(&format!(
+                "kinetix_opaque_state_lookups_total{{outcome=\"{label}\"}} {value}\n"
+            ));
+        }
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,

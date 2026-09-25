@@ -96,9 +96,32 @@ adapter combination Kinetix supports:
 That is 18 path/mode cells before specialized cases. Sync cases assert aggregated
 usage and tool identity. Streaming cases assert terminal events, usage, and stable
 tool-call identity. Specialized cases cover parallel tools, tool-result continuation,
-vision variants, tool-choice variants, nested schemas/content rejection, opaque
-reasoning portability, token-count modes, model discovery/auth, fallback, and
-same-format provider extensions.
+Gemini tool-call signature replay, vision variants, tool-choice variants, nested
+schemas/content rejection, opaque reasoning portability, token-count modes, model
+discovery/auth, fallback, and same-format provider extensions.
+
+The `chat.translate.gemini.tool_signature_continuation` case drives a full two-turn
+tool conversation through the OpenAI frontend. The synthetic Gemini upstream fails
+closed with the provider's real "Function call is missing a thought_signature" 400
+unless the historical function-call part carries the exact signature Kinetix stored
+on the previous turn, so a 200 is evidence that Kinetix captured, persisted, and
+replayed the signature without the client ever seeing it. The same case includes a
+negative control: a never-seen tool-call id must *not* be given an invented
+signature, and the strict upstream rejects it.
+
+The `chat.translate.gemini.cross_model_placeholder` case continues a trace that
+started on one Gemini model onto a second model. The strict upstream accepts only
+the provider's documented `skip_thought_signature_validator` placeholder on the
+second model and rejects both an unsigned call and the first model's real
+signature, so a 200 is evidence that Kinetix substituted the documented
+placeholder rather than replaying a foreign signature or stripping the call. Its
+negative control proves an uncaptured id is never given an invented placeholder.
+The placeholder is gated to models whose `generateContent` validates replayed
+function-call signatures (the Gemini 3 family): the
+`chat.translate.gemini.legacy_model_strip_without_placeholder` case continues the
+same trace onto a pre-Gemini-3 model, and the strict upstream rejects *any*
+`thoughtSignature` there, so a 200 with a warning proves Kinetix stripped the
+incompatible state instead of injecting the Gemini 3 sentinel.
 
 Positive mixed fixtures send the documented sampling, tool-choice, vision, and
 reasoning fields. `scripts/synthetic_upstream.py` rejects the request if required
@@ -237,9 +260,118 @@ not a Kinetix bug. Raise `max_tokens` or lower the thinking level.
 
 - **Gemini:** `streamGenerateContent?alt=sse`; SSE frames are CRLF-separated and
   are normalized to LF by the byte-robust framer (FR-2.12). `thoughtSignature`
-  values are round-tripped through the internal model's signature slots.
+  values are round-tripped through the internal model's signature slots. Because a
+  translated client (OpenAI Chat Completions, Responses, Anthropic Messages) cannot
+  represent a `thoughtSignature`, Kinetix also persists each function-call signature
+  server-side keyed by the client-visible tool-call id and replays it on the next
+  turn; see [Opaque provider state](#opaque-provider-state) below.
 - **OpenAI-compatible:** same-format passthrough forwards the upstream's frames
   verbatim, preserving unknown/vendor fields (FR-2.10) — e.g. vendor `cost` or
   `reasoning_details` fields Kinetix itself never produces.
 - **Anthropic:** inbound `anthropic-version` and `anthropic-beta` are forwarded
   to Anthropic upstreams; Kinetix does not invent hidden version/beta defaults.
+
+## Opaque provider state
+
+Some providers attach state to a tool call that the client protocol cannot
+represent. Gemini's `thoughtSignature` is the canonical example: the model
+returns it beside a `functionCall`, and requires it back on the *same*
+historical function-call part when the conversation is continued. An OpenAI
+Chat Completions or Anthropic Messages client never sees it and therefore never
+returns it, which is why multi-turn Gemini tool calling through those frontends
+previously failed with `Function call is missing a thought_signature in
+functionCall parts.`
+
+Kinetix keeps this state host-side instead of pushing it through the client:
+
+- **Capture.** As a translated response streams, the Gemini adapter surfaces the
+  signature on the normalized tool-call event. The pipeline captures it keyed by
+  the *post-normalization* client-visible tool-call id (so generated ids work
+  too), the provider, the exact originating model, the protocol family/producer,
+  and the client scope (the virtual key id, or `internal` for keyless requests).
+- **Storage.** Values are encrypted at rest with a cipher derived specifically
+  for this subsystem (distinct from the credential and plugin-KV ciphers), and
+  stored in the `opaque_provider_state` table. Only SHA-256 hashes of the scope,
+  tool-call id, session id, and tool name are persisted; raw identifiers and raw
+  signatures never are. A bounded RAM cache is written synchronously on the
+  request path, while encryption, the SQLite UPSERT, and periodic pruning run on
+  a bounded background worker: a slow or locked database can never stall the
+  streaming tool-call event, the immediately following request never races
+  persistence (the RAM entry is already present), and a saturated durability
+  queue drops the write with a counter rather than blocking the response. A
+  graceful shutdown flushes the queue after request draining, so a signature the
+  client was already told was accepted survives a restart. The RAM cache's TTL
+  (1h) is deliberately shorter than SQLite's (24h); when a RAM entry has expired
+  it is evicted and the lookup falls through to SQLite instead of reporting
+  `Missing`, so a continuation on a long-running process keeps working for the
+  full 24h SQLite retention window rather than only the 1h RAM window.
+- **Replay.** On the next request, tool-call parts whose signature slot is empty
+  are looked up. A compatible value is restored onto the exact historical part
+  before dispatch. An explicit client/canonical signature is never overwritten,
+  and a missing/unknown id is never given an invented signature.
+- **Scope and compatibility.** Replay is scoped to the originating virtual key.
+  A stored value is only reused when the target's provider id, protocol family,
+  producer, and **exact originating model** all match; the account may change
+  (same-provider account failover stays compatible). The originating model is
+  deliberately part of the identity: Google's `generateContent` contract only
+  guarantees a signature is accepted by the model that produced it. A cross-model
+  continuation is reported non-portable and translated with the documented
+  placeholder (see below) rather than reusing the original signature. Reusing a
+  tool-call id with a *different* tool name is rejected with HTTP 400 before any
+  upstream request is sent, and a conflicting explicit session is refused. When
+  a row exists for the exact target model, identity is validated against *that
+  row* first, so another model's row that merely shares the tool-call id can
+  never shadow it into a false non-portable classification; only when no
+  exact-model row exists is the identity check widened to the remaining
+  (cross-model) rows to decide portability. Those identity checks always run
+  before a row is classified as non-portable, so a cross-model switch can never
+  launder a reused tool-call id or a stranger's session into a placeholder.
+- **Portability.** Stored state that the selected target cannot carry feeds the
+  Route's existing `reject` / `strip_with_warning` portability policy exactly
+  like inline client state — including when neither the provider nor the wire
+  format crossed over (for example an OpenAI client whose earlier Gemini turn
+  stored a signature is later routed to an OpenAI target). Compatible stored
+  state is restored only after the portability decision, so a
+  `strip_with_warning` boundary never deletes state that the chosen target can
+  use, and a direct cross-format target with no Route refuses known non-portable
+  state instead of silently dropping it.
+- **Cross-model continuation.** Exact-model scoping stops a real signature from
+  being replayed onto a model that did not produce it, but leaving the
+  historical `functionCall` unsigned would still fail the next `generateContent`
+  call. When the target adapter declares a documented placeholder for
+  non-portable state (the Gemini adapter returns the provider's
+  `skip_thought_signature_validator` sentinel), a `strip_with_warning` Route
+  substitutes that placeholder onto the specific incompatible historical call
+  instead of stripping it, and reports the substitution in the
+  `X-Kinetix-Warning` header. The same documented translation applies to a
+  direct same-family switch with no Route policy (for example a deliberate
+  Flash→Pro change): the adapter's placeholder is a protocol-valid
+  substitute, so the request proceeds with a warning rather than being refused.
+  The placeholder is **gated to the family that documents it**: the Gemini
+  adapter returns the sentinel only for Gemini 3 model ids, because only that
+  family is documented to validate the signature of a replayed function call.
+  Gemini 2.5 and older treat the signature as optional and never documented the
+  sentinel, so a continuation onto such a model is stripped and continues
+  unsigned rather than receiving the Gemini 3 validator-bypass token. A later
+  major family (for example `gemini-4-*`) is not assumed to inherit the Gemini 3
+  contract either, and falls back to the same strip/reject portability path
+  until provider documentation or capability metadata says otherwise.
+  The placeholder
+  is painted only onto calls the store knew about but the target cannot carry —
+  an id that was never captured is still left untouched, so missing state is
+  never invented. A `reject` Route still refuses before dispatch, and a direct
+  target whose adapter declares no placeholder still refuses known non-portable
+  state instead of dropping it.
+- **Observability.** `GET /admin/metrics` exports
+  `kinetix_opaque_state_entries`, `kinetix_opaque_state_captured_total`,
+  `kinetix_opaque_state_replaced_total`,
+  `kinetix_opaque_state_capture_dropped_total`,
+  `kinetix_opaque_state_capture_storage_errors_total`, and
+  `kinetix_opaque_state_lookups_total{outcome=...}`. These are counts and bucket
+  sizes only; no signature, tool-call id, or session identifier is exported.
+  Signatures never appear in logs, traces, the dashboard, or client responses.
+
+Only adapters that explicitly opt in participate (native Gemini today). A plugin
+adapter that happens to populate a signature is *not* assumed compatible, because
+it could multiplex unrelated opaque-state protocols; blind replay across
+adapters would be a correctness and security bug.
