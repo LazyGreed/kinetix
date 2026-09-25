@@ -712,8 +712,8 @@ pub(crate) fn parse_plugin_opaque_state_capability(
 }
 
 /// Normalize provider-native/legacy discovery metadata into Kinetix's canonical
-/// reasoning capability. Versioned plugin capabilities_json uses the strict v1
-/// parser above. Unknown provider levels are discarded rather than invented.
+/// reasoning capability. Versioned plugin capabilities_json uses the strict
+/// version-dispatched parser above. Unknown provider levels are discarded rather than invented.
 pub fn normalize_reasoning_capability(metadata: &serde_json::Value) -> Option<ReasoningCapability> {
     // Provider metadata may already expose a normalized-looking shape under
     // reasoning or reasoning_capability.
