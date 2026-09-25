@@ -196,10 +196,9 @@ fn export_file_day(name: &str) -> Option<chrono::NaiveDate> {
     let date = if let Some(rest) = name.strip_prefix("usage-") {
         rest.strip_suffix(".jsonl")
             .or_else(|| rest.strip_suffix(".csv"))?
-    } else if let Some(rest) = name.strip_prefix("summary-") {
-        rest.strip_suffix(".csv")?
     } else {
-        return None;
+        let rest = name.strip_prefix("summary-")?;
+        rest.strip_suffix(".csv")?
     };
 
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
