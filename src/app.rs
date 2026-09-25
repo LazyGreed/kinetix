@@ -260,11 +260,10 @@ impl AppState {
                 );
             };
             let strategy = Arc::clone(strategy.value());
-            return Ok(
-                self.credential_refresh
-                    .resolve(&provider.id, strategy, account)
-                    .await?,
-            );
+            return Ok(self
+                .credential_refresh
+                .resolve(&provider.id, strategy, account)
+                .await?);
         }
         Ok(self.credentials.resolve(account).await?)
     }
