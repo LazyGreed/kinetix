@@ -7630,7 +7630,7 @@ mod reasoning_discovery_control_plane_tests {
     fn unsupported_plugin_capability_schema_is_ignored() {
         for metadata in [
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "reasoning": {
                     "supported": true,
                     "mode": "toggle",
