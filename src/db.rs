@@ -316,16 +316,11 @@ pub struct ProviderRow {
     pub credential_plugin: String,
     #[serde(default)]
     pub model_source_plugin: String,
-    #[serde(default = "default_credential_mode")]
     pub credential_mode: String,
     #[serde(default)]
     pub source_plugin_id: Option<String>,
     #[serde(default)]
     pub source_integration_id: Option<String>,
-}
-
-fn default_credential_mode() -> String {
-    "manual".into()
 }
 
 impl ProviderRow {
