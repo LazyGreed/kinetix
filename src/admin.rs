@@ -13,11 +13,11 @@ use serde_json::{json, Value};
 
 use crate::adapters::{
     normalize_plugin_reasoning_capability, normalize_plugin_reasoning_capability_v1,
-    normalize_reasoning_capability, parse_plugin_opaque_state_capability,
-    plugin_capability_flags, plugin_capability_flags_v1, plugin_identity,
-    plugin_identity_hint, plugin_opaque_state_capability, plugin_provider_variant,
-    plugin_reasoning_support, reasoning_metadata_declared, thinking_map_for_reasoning_with_wire,
-    ModelCapabilityFlags, UpstreamContext,
+    normalize_reasoning_capability, parse_plugin_opaque_state_capability, plugin_capability_flags,
+    plugin_capability_flags_v1, plugin_identity, plugin_identity_hint,
+    plugin_opaque_state_capability, plugin_provider_variant, plugin_reasoning_support,
+    reasoning_metadata_declared, thinking_map_for_reasoning_with_wire, ModelCapabilityFlags,
+    UpstreamContext,
 };
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
@@ -1917,9 +1917,7 @@ pub async fn discover_models(
                     .capabilities_json
                     .as_deref()
                     .and_then(|value| serde_json::from_str::<Value>(value).ok());
-                let canonical_hint = fallback_metadata
-                    .as_ref()
-                    .and_then(plugin_identity_hint);
+                let canonical_hint = fallback_metadata.as_ref().and_then(plugin_identity_hint);
                 let catalog = crate::model_catalog::resolve_with_hint(
                     &provider.base_url,
                     &m.id,
@@ -1997,8 +1995,7 @@ pub async fn discover_models(
                 } else {
                     ""
                 };
-                let _ =
-                    db::set_model_opaque_state_plugin(&state.pool, &row.id, provenance).await;
+                let _ = db::set_model_opaque_state_plugin(&state.pool, &row.id, provenance).await;
             }
         }
         out.push(json!({
@@ -2642,12 +2639,7 @@ pub async fn create_model(
         .is_some();
     if imported_from_discovery && valid_opaque_state {
         if let Some(reference) = provider.model_source_plugin_ref() {
-            let _ = db::set_model_opaque_state_plugin(
-                &state.pool,
-                &id,
-                &reference.plugin_id,
-            )
-            .await;
+            let _ = db::set_model_opaque_state_plugin(&state.pool, &id, &reference.plugin_id).await;
         }
     }
     if prices.is_configured() {
