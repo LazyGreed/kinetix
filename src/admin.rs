@@ -1065,6 +1065,11 @@ struct DiscoveredObservation {
     price_sources: Value,
     raw_metadata: Option<Value>,
     raw_metadata_truncated: bool,
+    canonical_identity: Option<Value>,
+    canonical_model_id: Option<String>,
+    canonical_match: Option<String>,
+    model_type: Option<String>,
+    execution_supported: bool,
     catalog: Option<Value>,
 }
 
@@ -1222,7 +1227,7 @@ fn price_source(
     if provider.is_some() {
         Some("provider_metadata".to_string())
     } else if plugin.is_some() {
-        Some("plugin".to_string())
+        Some("plugin_capabilities_json".to_string())
     } else if catalog.is_some() {
         catalog_source.map(str::to_string)
     } else {
@@ -1285,16 +1290,119 @@ fn discovered_observation_with_catalog(
     provider_metadata: Option<Value>,
     fallback_metadata: Option<Value>,
     wire: WireFormat,
-    catalog: Option<crate::model_catalog::CatalogMatch>,
+    catalog: Option<crate::model_catalog::CatalogResolution>,
 ) -> DiscoveredObservation {
-    let catalog_source = catalog.as_ref().map(|entry| entry.provenance().to_string());
-    let catalog_metadata = catalog.as_ref().map(|entry| &entry.capabilities_json);
+    fn has_reasoning_details(capability: &crate::adapters::ReasoningCapability) -> bool {
+        capability.mode.is_some() || !capability.levels.is_empty() || capability.default.is_some()
+    }
+
+    let catalog_layers = catalog
+        .as_ref()
+        .map(crate::model_catalog::CatalogResolution::layers)
+        .unwrap_or_default();
+
+    let mut catalog_flags = ModelCapabilityFlags::default();
+    let mut catalog_text_source = None;
+    let mut catalog_reasoning_source = None;
+    let mut catalog_vision_source = None;
+    let mut catalog_tools_source = None;
+    let mut catalog_structured_source = None;
+
+    let mut catalog_context_window = None;
+    let mut catalog_context_source = None;
+    let mut catalog_max_output_tokens = None;
+    let mut catalog_max_output_source = None;
+    let mut catalog_modalities = None;
+    let mut catalog_model_type = None;
+    let mut catalog_model_type_source = None;
+
+    let mut catalog_prices = Prices::default();
+    let mut catalog_input_price_source = None;
+    let mut catalog_output_price_source = None;
+    let mut catalog_cached_price_source = None;
+    let mut catalog_cache_write_price_source = None;
+    let mut catalog_thinking_price_source = None;
+
+    let mut catalog_reasoning = None;
+    let mut catalog_detailed_reasoning = None;
+
+    for layer in &catalog_layers {
+        let source = layer.provenance().to_string();
+        let layer_flags = plugin_capability_flags_v1(layer.capabilities_json).unwrap_or_default();
+
+        if layer_flags.text.is_some() {
+            catalog_flags.text = layer_flags.text;
+            catalog_text_source = Some(source.clone());
+        }
+        if layer_flags.reasoning.is_some() {
+            catalog_flags.reasoning = layer_flags.reasoning;
+            catalog_reasoning_source = Some(source.clone());
+        }
+        if layer_flags.vision.is_some() {
+            catalog_flags.vision = layer_flags.vision;
+            catalog_vision_source = Some(source.clone());
+        }
+        if layer_flags.tool_calling.is_some() {
+            catalog_flags.tool_calling = layer_flags.tool_calling;
+            catalog_tools_source = Some(source.clone());
+        }
+        if layer_flags.structured_output.is_some() {
+            catalog_flags.structured_output = layer_flags.structured_output;
+            catalog_structured_source = Some(source.clone());
+        }
+
+        if let Some(value) = layer.context_window {
+            catalog_context_window = Some(value);
+            catalog_context_source = Some(source.clone());
+        }
+        if let Some(value) = layer.max_output_tokens {
+            catalog_max_output_tokens = Some(value);
+            catalog_max_output_source = Some(source.clone());
+        }
+        if let Some(value) = layer.modalities {
+            catalog_modalities = Some(value.clone());
+        }
+        if let Some(value) = layer.model_type {
+            catalog_model_type = Some(value.to_string());
+            catalog_model_type_source = Some(source.clone());
+        }
+
+        if let Some(layer_prices) = layer.prices {
+            if layer_prices.input_per_1m.is_some() {
+                catalog_input_price_source = Some(source.clone());
+            }
+            if layer_prices.output_per_1m.is_some() {
+                catalog_output_price_source = Some(source.clone());
+            }
+            if layer_prices.cached_per_1m.is_some() {
+                catalog_cached_price_source = Some(source.clone());
+            }
+            if layer_prices.cache_write_per_1m.is_some() {
+                catalog_cache_write_price_source = Some(source.clone());
+            }
+            if layer_prices.thinking_per_1m.is_some() {
+                catalog_thinking_price_source = Some(source.clone());
+            }
+            overlay_prices(&mut catalog_prices, layer_prices);
+        }
+
+        if let Some(mut reasoning) =
+            normalize_plugin_reasoning_capability_v1(layer.capabilities_json)
+        {
+            if layer.kind == crate::model_catalog::CatalogLayerKind::Provider
+                && wire == WireFormat::Gemini
+            {
+                reasoning.upstream_format = "gemini_thinking_level".to_string();
+            }
+            catalog_reasoning = Some((reasoning.clone(), source.clone()));
+            if has_reasoning_details(&reasoning) {
+                catalog_detailed_reasoning = Some((reasoning, source));
+            }
+        }
+    }
 
     let plugin_flags = fallback_metadata
         .as_ref()
-        .and_then(plugin_capability_flags_v1)
-        .unwrap_or_default();
-    let catalog_flags = catalog_metadata
         .and_then(plugin_capability_flags_v1)
         .unwrap_or_default();
     let provider_flags = provider_metadata
@@ -1310,10 +1418,6 @@ fn discovered_observation_with_catalog(
         .as_ref()
         .map(discovery_prices)
         .unwrap_or_default();
-    let catalog_prices = catalog
-        .as_ref()
-        .map(|entry| entry.prices.clone())
-        .unwrap_or_default();
     let mut prices = catalog_prices.clone();
     overlay_prices(&mut prices, &plugin_prices);
     overlay_prices(&mut prices, &provider_prices);
@@ -1322,38 +1426,38 @@ fn discovered_observation_with_catalog(
             provider_prices.input_per_1m,
             plugin_prices.input_per_1m,
             catalog_prices.input_per_1m,
-            catalog_source.as_deref(),
+            catalog_input_price_source.as_deref(),
         ),
         "output_per_1m": price_source(
             provider_prices.output_per_1m,
             plugin_prices.output_per_1m,
             catalog_prices.output_per_1m,
-            catalog_source.as_deref(),
+            catalog_output_price_source.as_deref(),
         ),
         "cached_per_1m": price_source(
             provider_prices.cached_per_1m,
             plugin_prices.cached_per_1m,
             catalog_prices.cached_per_1m,
-            catalog_source.as_deref(),
+            catalog_cached_price_source.as_deref(),
         ),
         "cache_write_per_1m": price_source(
             provider_prices.cache_write_per_1m,
             plugin_prices.cache_write_per_1m,
             catalog_prices.cache_write_per_1m,
-            catalog_source.as_deref(),
+            catalog_cache_write_price_source.as_deref(),
         ),
         "thinking_per_1m": price_source(
             provider_prices.thinking_per_1m,
             plugin_prices.thinking_per_1m,
             catalog_prices.thinking_per_1m,
-            catalog_source.as_deref(),
+            catalog_thinking_price_source.as_deref(),
         ),
     });
     let modalities = provider_metadata
         .as_ref()
         .and_then(normalized_modalities)
         .or_else(|| fallback_metadata.as_ref().and_then(normalized_modalities))
-        .or_else(|| catalog.as_ref().and_then(|entry| entry.modalities.clone()));
+        .or(catalog_modalities);
     let (raw_metadata, raw_metadata_truncated) = bounded_raw_metadata(provider_metadata.as_ref());
 
     let provider_declares_reasoning = provider_metadata
@@ -1374,13 +1478,7 @@ fn discovered_observation_with_catalog(
     let plugin_support = fallback_metadata
         .as_ref()
         .and_then(plugin_reasoning_support_v1);
-    let mut catalog_reasoning = catalog_metadata.and_then(normalize_plugin_reasoning_capability_v1);
-    if wire == WireFormat::Gemini {
-        if let Some(reasoning) = catalog_reasoning.as_mut() {
-            reasoning.upstream_format = "gemini_thinking_level".to_string();
-        }
-    }
-    let catalog_support = catalog_metadata.and_then(plugin_reasoning_support_v1);
+    let catalog_support = catalog_flags.reasoning;
 
     let provider_reasoning_is_authoritative =
         provider_declares_reasoning || provider_flags.reasoning.is_some();
@@ -1389,12 +1487,8 @@ fn discovered_observation_with_catalog(
     } else if plugin_support.is_some() {
         (plugin_support, Some("plugin_capabilities_json".to_string()))
     } else {
-        (catalog_support, catalog_source.clone())
+        (catalog_support, catalog_reasoning_source.clone())
     };
-
-    fn has_reasoning_details(capability: &crate::adapters::ReasoningCapability) -> bool {
-        capability.mode.is_some() || !capability.levels.is_empty() || capability.default.is_some()
-    }
 
     let detailed_reasoning = provider_reasoning
         .as_ref()
@@ -1408,13 +1502,7 @@ fn discovered_observation_with_catalog(
                 .cloned()
                 .map(|capability| (capability, "plugin_capabilities_json".to_string()))
         })
-        .or_else(|| {
-            catalog_reasoning
-                .as_ref()
-                .filter(|capability| has_reasoning_details(capability))
-                .cloned()
-                .zip(catalog_source.clone())
-        });
+        .or(catalog_detailed_reasoning);
 
     let supported_only_reasoning = provider_reasoning
         .clone()
@@ -1424,7 +1512,7 @@ fn discovered_observation_with_catalog(
                 .clone()
                 .map(|capability| (capability, "plugin_capabilities_json".to_string()))
         })
-        .or_else(|| catalog_reasoning.clone().zip(catalog_source.clone()));
+        .or(catalog_reasoning);
 
     let provider_blocks_fallback = provider_declares_reasoning
         && provider_reasoning.is_none()
@@ -1448,17 +1536,17 @@ fn discovered_observation_with_catalog(
 
     let context_source = if model.context_window.is_some() {
         Some("upstream_discovery".to_string())
-    } else if let Some(value) = catalog.as_ref().and_then(|entry| entry.context_window) {
+    } else if let Some(value) = catalog_context_window {
         model.context_window = Some(value);
-        catalog_source.clone()
+        catalog_context_source
     } else {
         None
     };
     let max_output_source = if model.max_output_tokens.is_some() {
         Some("upstream_discovery".to_string())
-    } else if let Some(value) = catalog.as_ref().and_then(|entry| entry.max_output_tokens) {
+    } else if let Some(value) = catalog_max_output_tokens {
         model.max_output_tokens = Some(value);
-        catalog_source.clone()
+        catalog_max_output_source
     } else {
         None
     };
@@ -1475,36 +1563,45 @@ fn discovered_observation_with_catalog(
             provider_flags.text,
             plugin_flags.text,
             catalog_flags.text,
-            catalog_source.as_deref(),
+            catalog_text_source.as_deref(),
         ),
         "reasoning": reasoning_source,
         "vision": capability_source(
             provider_flags.vision,
             plugin_flags.vision,
             catalog_flags.vision,
-            catalog_source.as_deref(),
+            catalog_vision_source.as_deref(),
         ),
         "tool_calling": capability_source(
             provider_flags.tool_calling,
             plugin_flags.tool_calling,
             catalog_flags.tool_calling,
-            catalog_source.as_deref(),
+            catalog_tools_source.as_deref(),
         ),
         "structured_output": capability_source(
             provider_flags.structured_output,
             plugin_flags.structured_output,
             catalog_flags.structured_output,
-            catalog_source.as_deref(),
+            catalog_structured_source.as_deref(),
         ),
+        "model_type": catalog_model_type_source,
     });
 
-    let catalog = catalog.as_ref().map(|entry| {
-        json!({
-            "source": entry.provenance(),
-            "reference": entry.reference(),
-            "url": entry.source_url.as_deref(),
-        })
+    let canonical_identity = catalog.as_ref().map(|entry| entry.identity.to_json());
+    let canonical_model_id = catalog
+        .as_ref()
+        .and_then(|entry| entry.identity.canonical_model_id.clone());
+    let canonical_match = catalog.as_ref().and_then(|entry| {
+        entry
+            .identity
+            .match_kind
+            .map(crate::model_catalog::CanonicalMatchKind::label)
+            .map(str::to_string)
     });
+    let catalog_json = catalog
+        .as_ref()
+        .map(crate::model_catalog::CatalogResolution::catalog_json);
+    let execution_supported = execution_supported_for_model_type(catalog_model_type.as_deref());
     let thinking_map = reasoning
         .as_ref()
         .and_then(|capability| thinking_map_for_reasoning_with_wire(capability, wire));
@@ -1521,7 +1618,12 @@ fn discovered_observation_with_catalog(
         price_sources,
         raw_metadata,
         raw_metadata_truncated,
-        catalog,
+        canonical_identity,
+        canonical_model_id,
+        canonical_match,
+        model_type: catalog_model_type,
+        execution_supported,
+        catalog: catalog_json,
     }
 }
 
@@ -1682,7 +1784,7 @@ pub async fn discover_models(
                     provider_metadata,
                     fallback_metadata,
                     reasoning_wire_context(&provider),
-                    catalog,
+                    Some(catalog),
                 )
             })
             .collect()
@@ -1723,6 +1825,11 @@ pub async fn discover_models(
                     "price_sources": &observation.price_sources,
                     "raw_metadata": &observation.raw_metadata,
                     "raw_metadata_truncated": observation.raw_metadata_truncated,
+                    "canonical_identity": &observation.canonical_identity,
+                    "canonical_model_id": &observation.canonical_model_id,
+                    "canonical_match": &observation.canonical_match,
+                    "model_type": &observation.model_type,
+                    "execution_supported": observation.execution_supported,
                     "catalog": &observation.catalog,
                     "disappeared": false,
                 }),
@@ -1743,6 +1850,11 @@ pub async fn discover_models(
             "price_sources": &observation.price_sources,
             "raw_metadata": &observation.raw_metadata,
             "raw_metadata_truncated": observation.raw_metadata_truncated,
+            "canonical_identity": &observation.canonical_identity,
+            "canonical_model_id": &observation.canonical_model_id,
+            "canonical_match": &observation.canonical_match,
+            "model_type": &observation.model_type,
+            "execution_supported": observation.execution_supported,
             "catalog": &observation.catalog,
             "already_imported": existing.iter().any(|e| e.upstream_id == m.id),
         }));
@@ -1882,7 +1994,7 @@ async fn discover_models_native(
                 provider_metadata,
                 None,
                 reasoning_wire_context(provider),
-                catalog,
+                Some(catalog),
             )
         })
         .collect())
@@ -2292,6 +2404,36 @@ fn validate_thinking_map(thinking_map: &ThinkingMap) -> Result<(), ApiError> {
     }
 }
 
+fn execution_supported_for_model_type(model_type: Option<&str>) -> bool {
+    model_type.is_none()
+}
+
+fn validate_discovery_execution(discovery: &Value) -> Result<(), ApiError> {
+    let imported_from_discovery = discovery
+        .get("imported_from_discovery")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let execution_supported = discovery
+        .get("execution_supported")
+        .and_then(Value::as_bool);
+    let model_type = discovery.get("model_type").and_then(Value::as_str);
+
+    if imported_from_discovery && execution_supported != Some(true) {
+        return Err(ApiError::bad(
+            "discovery import requires explicit execution_supported: true",
+        ));
+    }
+
+    if execution_supported == Some(false) || !execution_supported_for_model_type(model_type) {
+        let model_type = model_type.unwrap_or("specialized");
+        return Err(ApiError::bad(format!(
+            "cannot import unsupported discovered model type: {model_type}"
+        )));
+    }
+
+    Ok(())
+}
+
 pub async fn create_model(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -2305,6 +2447,7 @@ pub async fn create_model(
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
+    validate_discovery_execution(&body.discovery)?;
 
     let id = db::insert_model(
         &state.pool,
@@ -6306,6 +6449,33 @@ mod reasoning_discovery_control_plane_tests {
         }
     }
 
+    fn provider_catalog(
+        model_id: &str,
+        context_window: Option<i64>,
+        max_output_tokens: Option<i64>,
+        capabilities_json: Value,
+        modalities: Option<Value>,
+        prices: Prices,
+    ) -> crate::model_catalog::CatalogResolution {
+        let mut catalog = crate::model_catalog::CatalogResolution::unresolved(model_id);
+        catalog.provider = Some(crate::model_catalog::ProviderModelMatch {
+            source: crate::model_catalog::CatalogSource::ModelsDev,
+            provider_id: "example".to_string(),
+            host: "api.example.com".to_string(),
+            model_id: model_id.to_string(),
+            context_window,
+            max_input_tokens: None,
+            max_output_tokens,
+            capabilities_json,
+            modalities,
+            prices,
+            model_type: None,
+            metadata: Value::Null,
+            source_url: Some("https://models.dev/catalog.json?type=all".to_string()),
+        });
+        catalog
+    }
+
     #[test]
     fn provider_metadata_precedes_plugin_fallback_metadata() {
         let observation = discovered_observation(
@@ -6610,24 +6780,20 @@ mod reasoning_discovery_control_plane_tests {
 
     #[test]
     fn pricing_precedence_is_per_field_with_provenance() {
-        let catalog = crate::model_catalog::CatalogMatch {
-            source: crate::model_catalog::CatalogSource::ModelsDev,
-            provider_id: "example".to_string(),
-            host: "api.example.com".to_string(),
-            model_id: "priced-model".to_string(),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities_json: json!({"schema_version": 1}),
-            modalities: None,
-            prices: Prices {
+        let catalog = provider_catalog(
+            "priced-model",
+            None,
+            None,
+            json!({"schema_version": 1}),
+            None,
+            Prices {
                 input_per_1m: Some(0.75),
                 output_per_1m: Some(3.75),
                 cached_per_1m: Some(0.075),
                 cache_write_per_1m: Some(0.1),
                 thinking_per_1m: None,
             },
-            source_url: Some("https://models.dev/api.json".to_string()),
-        };
+        );
         let observation = discovered_observation_with_catalog(
             model("priced-model"),
             Some(json!({
@@ -6660,7 +6826,7 @@ mod reasoning_discovery_control_plane_tests {
         );
         assert_eq!(
             observation.price_sources["output_per_1m"],
-            json!("models.dev")
+            json!("models.dev:provider")
         );
         assert_eq!(
             observation.price_sources["cached_per_1m"],
@@ -6668,29 +6834,25 @@ mod reasoning_discovery_control_plane_tests {
         );
         assert_eq!(
             observation.price_sources["cache_write_per_1m"],
-            json!("plugin")
+            json!("plugin_capabilities_json")
         );
         assert!(observation.price_sources["thinking_per_1m"].is_null());
     }
 
     #[test]
     fn malformed_plugin_prices_are_ignored_without_erasing_catalog_values() {
-        let catalog = crate::model_catalog::CatalogMatch {
-            source: crate::model_catalog::CatalogSource::ModelsDev,
-            provider_id: "example".to_string(),
-            host: "api.example.com".to_string(),
-            model_id: "priced-model".to_string(),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities_json: json!({"schema_version": 1}),
-            modalities: None,
-            prices: Prices {
+        let catalog = provider_catalog(
+            "priced-model",
+            None,
+            None,
+            json!({"schema_version": 1}),
+            None,
+            Prices {
                 input_per_1m: Some(0.75),
                 output_per_1m: Some(3.75),
                 ..Prices::default()
             },
-            source_url: Some("https://models.dev/api.json".to_string()),
-        };
+        );
         let observation = discovered_observation_with_catalog(
             model("priced-model"),
             None,
@@ -6711,11 +6873,11 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(observation.prices.cached_per_1m, None);
         assert_eq!(
             observation.price_sources["input_per_1m"],
-            json!("models.dev")
+            json!("models.dev:provider")
         );
         assert_eq!(
             observation.price_sources["output_per_1m"],
-            json!("models.dev")
+            json!("models.dev:provider")
         );
     }
 
@@ -6910,10 +7072,53 @@ mod reasoning_discovery_control_plane_tests {
     }
 
     #[test]
+    fn canonical_enrichment_does_not_invent_provider_controls_or_pricing() {
+        let catalog = crate::model_catalog::resolve(
+            "https://unknown-gateway.example/v1",
+            "DeepSeek-V4.1-Flash",
+            None,
+        );
+        let observation = discovered_observation_with_catalog(
+            model("DeepSeek-V4.1-Flash"),
+            Some(json!({"id": "DeepSeek-V4.1-Flash"})),
+            None,
+            WireFormat::Openai,
+            Some(catalog),
+        );
+
+        assert_eq!(
+            observation.canonical_model_id.as_deref(),
+            Some("deepseek/deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            observation.canonical_match.as_deref(),
+            Some("case_insensitive_model_id")
+        );
+        assert_eq!(observation.model.context_window, Some(1_000_000));
+        assert_eq!(observation.model.max_output_tokens, Some(384_000));
+        assert_eq!(observation.reasoning_support, Some(true));
+        assert!(observation
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| reasoning.levels.is_empty()));
+        assert!(observation.thinking_map.is_none());
+        assert!(observation.prices.input_per_1m.is_none());
+        assert!(observation.prices.output_per_1m.is_none());
+        assert!(observation.prices.cached_per_1m.is_none());
+        assert!(observation.prices.cache_write_per_1m.is_none());
+        assert!(observation.prices.thinking_per_1m.is_none());
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("bundled_catalog")
+        );
+        assert!(observation.price_sources["input_per_1m"].is_null());
+        assert!(observation.catalog.as_ref().unwrap()["provider"].is_null());
+    }
+
+    #[test]
     fn sparse_bai_model_is_enriched_from_catalog() {
         let catalog =
-            crate::model_catalog::resolve("https://api.b.ai/v1/", "DeepSeek-V4.1-Flash", None)
-                .unwrap();
+            crate::model_catalog::resolve("https://api.b.ai/v1/", "DeepSeek-V4.1-Flash", None);
         let observation = discovered_observation_with_catalog(
             model("DeepSeek-V4.1-Flash"),
             Some(json!({"id": "DeepSeek-V4.1-Flash", "object": "model"})),
@@ -6944,14 +7149,11 @@ mod reasoning_discovery_control_plane_tests {
 
     #[test]
     fn ai_studio_thinking_hint_is_enriched_with_models_dev_levels() {
-        let catalog = crate::model_catalog::CatalogMatch {
-            source: crate::model_catalog::CatalogSource::ModelsDev,
-            provider_id: "google".to_string(),
-            host: "generativelanguage.googleapis.com".to_string(),
-            model_id: "gemini-3.8-flash".to_string(),
-            context_window: Some(1_048_576),
-            max_output_tokens: Some(65_536),
-            capabilities_json: json!({
+        let catalog = provider_catalog(
+            "gemini-3.8-flash",
+            Some(1_048_576),
+            Some(65_536),
+            json!({
                 "schema_version": 1,
                 "reasoning": {
                     "supported": true,
@@ -6964,19 +7166,18 @@ mod reasoning_discovery_control_plane_tests {
                 "vision": {"input": true},
                 "structured_output": {"supported": true}
             }),
-            modalities: Some(json!({
+            Some(json!({
                 "input": ["text", "image"],
                 "output": ["text"]
             })),
-            prices: Prices {
+            Prices {
                 input_per_1m: Some(0.75),
                 output_per_1m: Some(3.75),
                 cached_per_1m: Some(0.075),
                 cache_write_per_1m: None,
                 thinking_per_1m: None,
             },
-            source_url: Some("https://models.dev/api.json".to_string()),
-        };
+        );
         let mut discovered = model("gemini-3.8-flash");
         discovered.context_window = Some(1_048_576);
         discovered.max_output_tokens = Some(65_536);
@@ -7007,7 +7208,7 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(observation.prices.thinking_per_1m, None);
         assert_eq!(
             observation.price_sources["input_per_1m"],
-            json!("models.dev")
+            json!("models.dev:provider")
         );
         assert_eq!(observation.price_sources["thinking_per_1m"], Value::Null);
         assert_eq!(
@@ -7031,20 +7232,17 @@ mod reasoning_discovery_control_plane_tests {
         );
         assert_eq!(
             observation.capability_sources["reasoning"],
-            json!("provider_metadata+models.dev")
+            json!("provider_metadata+models.dev:provider")
         );
     }
 
     #[test]
     fn ai_studio_thinking_false_overrides_catalog() {
-        let catalog = crate::model_catalog::CatalogMatch {
-            source: crate::model_catalog::CatalogSource::ModelsDev,
-            provider_id: "google".to_string(),
-            host: "generativelanguage.googleapis.com".to_string(),
-            model_id: "gemini-3.8-flash".to_string(),
-            context_window: Some(1_048_576),
-            max_output_tokens: Some(65_536),
-            capabilities_json: json!({
+        let catalog = provider_catalog(
+            "gemini-3.8-flash",
+            Some(1_048_576),
+            Some(65_536),
+            json!({
                 "schema_version": 1,
                 "reasoning": {
                     "supported": true,
@@ -7053,10 +7251,9 @@ mod reasoning_discovery_control_plane_tests {
                     "can_disable": false
                 }
             }),
-            modalities: None,
-            prices: Prices::default(),
-            source_url: Some("https://models.dev/api.json".to_string()),
-        };
+            None,
+            Prices::default(),
+        );
         let observation = discovered_observation_with_catalog(
             model("gemini-3.8-flash"),
             Some(json!({
@@ -7080,8 +7277,7 @@ mod reasoning_discovery_control_plane_tests {
     #[test]
     fn provider_reasoning_metadata_overrides_catalog() {
         let catalog =
-            crate::model_catalog::resolve("https://api.b.ai/v1", "DeepSeek-V4.1-Flash", None)
-                .unwrap();
+            crate::model_catalog::resolve("https://api.b.ai/v1", "DeepSeek-V4.1-Flash", None);
         let observation = discovered_observation_with_catalog(
             model("DeepSeek-V4.1-Flash"),
             Some(json!({
@@ -7107,8 +7303,7 @@ mod reasoning_discovery_control_plane_tests {
     #[test]
     fn plugin_field_override_does_not_hide_catalog_reasoning() {
         let catalog =
-            crate::model_catalog::resolve("https://api.b.ai/v1", "DeepSeek-V4.1-Flash", None)
-                .unwrap();
+            crate::model_catalog::resolve("https://api.b.ai/v1", "DeepSeek-V4.1-Flash", None);
         let observation = discovered_observation_with_catalog(
             model("DeepSeek-V4.1-Flash"),
             Some(json!({"id": "DeepSeek-V4.1-Flash"})),
@@ -7130,6 +7325,130 @@ mod reasoning_discovery_control_plane_tests {
             observation.capability_sources["reasoning"],
             json!("bundled_catalog")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_and_specialized_discovery_imports_are_rejected_server_side() {
+        use std::sync::Arc;
+
+        let home = std::env::temp_dir().join(format!(
+            "kinetix-specialized-import-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let db_path = home.join("kinetix.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let config = Arc::new(
+            crate::config::Config::build(crate::config::CliOverrides {
+                home: Some(home.clone()),
+                database_url: Some(database_url.clone()),
+                master_key: Some(hex::encode([9u8; 32])),
+                admin_token: Some("test-admin-password".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let provider_id = db::insert_provider(
+            &pool,
+            &db::NewProvider {
+                name: "specialized",
+                base_url: "https://example.invalid/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1000,
+                capability_mode: "strict",
+                models_path: Some("/models"),
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+            },
+        )
+        .await
+        .unwrap();
+
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry,
+            Arc::new(crate::crypto::Crypto::new(&[9u8; 32])),
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool.clone(), 16),
+            0,
+        );
+
+        let stale_error = create_model(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.clone()),
+            Json(ModelBody {
+                upstream_id: "jev-latest".into(),
+                display_name: Some("JEV".into()),
+                enabled: true,
+                context_window: Some(64_000),
+                max_output_tokens: Some(0),
+                capabilities: json!({"text": true}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true
+                }),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(stale_error.0, StatusCode::BAD_REQUEST);
+        assert!(stale_error.1.contains("execution_supported: true"));
+
+        let specialized_error = create_model(
+            State(state),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id),
+            Json(ModelBody {
+                upstream_id: "jev-latest".into(),
+                display_name: Some("JEV".into()),
+                enabled: true,
+                context_window: Some(64_000),
+                max_output_tokens: Some(0),
+                capabilities: json!({"text": true}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "model_type": "decision",
+                    "execution_supported": true
+                }),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(specialized_error.0, StatusCode::BAD_REQUEST);
+        assert!(specialized_error.1.contains("decision"));
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
@@ -7225,7 +7544,10 @@ mod reasoning_discovery_control_plane_tests {
                 parameters: json!({}),
                 thinking_map: ThinkingMap::default(),
                 extra_request: json!({}),
-                discovery: json!({"imported_from_discovery": true}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true
+                }),
             }),
         )
         .await
