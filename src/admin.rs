@@ -4492,8 +4492,6 @@ pub async fn import_config(
         }
     }
 
-    // Accounts: only created when they carry an encrypted secret blob; an
-    // account without a secret cannot be materialized (FR-3.4 write-only).
     // Accounts: only restored when the provider mode permits credentials and
     // the export carries an encrypted secret blob. Internal no-auth accounts
     // are always synthesized by reconciliation, never imported as user state.
@@ -4865,8 +4863,10 @@ async fn reconcile_provider_account_mode(
                 sqlx::query(
                     "UPDATE accounts
                      SET label='__kinetix_noauth__', secret_enc=?, key_mask='',
-                         status='healthy', priority=1, weight=1, quota_type='none',
-                         soft_quota_usd=NULL
+                         status='healthy', cooldown_until=NULL, quota_reset_at=NULL,
+                         quota_type='none', quota_window_s=NULL, soft_quota_usd=NULL,
+                         priority=1, weight=1, last_error=NULL, last_probe_at=NULL,
+                         circuit_open_until=NULL, consecutive_failures=0
                      WHERE id=?",
                 )
                 .bind(&empty_secret)
@@ -8078,7 +8078,6 @@ mod reasoning_discovery_control_plane_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod credential_enrollment_regression_tests {
