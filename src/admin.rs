@@ -1112,6 +1112,7 @@ pub async fn delete_provider(
 #[derive(Debug, Clone)]
 struct DiscoveredObservation {
     model: crate::adapters::DiscoveredModel,
+    #[cfg_attr(not(test), allow(dead_code))]
     reasoning_support: Option<bool>,
     reasoning: Option<crate::adapters::ReasoningCapability>,
     thinking_map: Option<ThinkingMap>,
@@ -1333,6 +1334,7 @@ fn normalized_modalities(metadata: &Value) -> Option<Value> {
     }
 }
 
+#[cfg(test)]
 fn discovered_observation(
     model: crate::adapters::DiscoveredModel,
     provider_metadata: Option<Value>,
@@ -1957,10 +1959,7 @@ async fn discover_models_native(
     let credential = state
         .credential_for(provider, &account)
         .await
-        .map(|c| {
-            crate::alerts::record_credential_success();
-            c
-        })
+        .inspect(|_| crate::alerts::record_credential_success())
         .map_err(|e| {
             crate::alerts::record_credential_failure();
             ApiError::internal(e)
@@ -2088,10 +2087,7 @@ pub async fn test_provider(
     let credential = state
         .credential_for(&provider, &account)
         .await
-        .map(|c| {
-            crate::alerts::record_credential_success();
-            c
-        })
+        .inspect(|_| crate::alerts::record_credential_success())
         .map_err(|e| {
             crate::alerts::record_credential_failure();
             ApiError::internal(e)
@@ -3759,16 +3755,15 @@ pub async fn require_control_plane(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
-    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
-        if !db_healthy(&state).await {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(
-                    json!({"error": "admin mutation unavailable: control-plane store is degraded"}),
-                ),
-            )
-                .into_response();
-        }
+    if method != axum::http::Method::GET
+        && method != axum::http::Method::HEAD
+        && !db_healthy(&state).await
+    {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "admin mutation unavailable: control-plane store is degraded"})),
+        )
+            .into_response();
     }
     next.run(req).await
 }
@@ -5224,7 +5219,7 @@ pub async fn preview_catalog_plugin(
     Path(id): Path<String>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    let verified = verify_catalog_package(&state, &manager, &id).await?;
+    let verified = verify_catalog_package(&state, manager, &id).await?;
 
     let current = manager.get(&id).await.map_err(ApiError::internal)?;
     let (current_version, current_permissions) = match current {
@@ -5270,7 +5265,7 @@ pub async fn install_catalog_plugin(
     Path(id): Path<String>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    let verified = verify_catalog_package(&state, &manager, &id).await?;
+    let verified = verify_catalog_package(&state, manager, &id).await?;
     let distribution = verified
         .plugin
         .distribution
