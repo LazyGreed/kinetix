@@ -853,11 +853,13 @@ pub async fn run(
         // Portability applies on cross-format translation, on fallback across
         // providers, and on the first attempt when session provenance shows the
         // previous turn came from a different provider.
-        let cross_provider = previous_provider_id.as_deref().or(if attempts_done == 0 {
-            session_origin_provider.as_deref()
-        } else {
-            None
-        })
+        let cross_provider = previous_provider_id
+            .as_deref()
+            .or(if attempts_done == 0 {
+                session_origin_provider.as_deref()
+            } else {
+                None
+            })
             .map(|id| id != target.provider.id)
             .unwrap_or(false);
         let cross_format = !passthrough::is_passthrough(format, target.provider.wire());
