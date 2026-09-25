@@ -5893,7 +5893,35 @@ fn antigravity_loopback_redirect(bind: &str) -> Result<String, ApiError> {
 
 #[cfg(test)]
 mod credential_enrollment_tests {
-    use super::manual_account_enrollment_error;
+    use super::{manual_account_enrollment_error, validate_plugin_auth_enrollment};
+
+    fn provider(mode: &str) -> crate::db::ProviderRow {
+        crate::db::ProviderRow {
+            id: "provider".into(),
+            name: "Provider".into(),
+            base_url: "https://api.example.com".into(),
+            wire_format: "openai".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: "{}".into(),
+            timeout_ms: 1_000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: "{}".into(),
+            enabled: 1,
+            follow_redirects: 0,
+            credential_hosts: String::new(),
+            allow_insecure_tls: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            wire_plugin: String::new(),
+            credential_plugin: "plugin:plugin.test/strategy".into(),
+            model_source_plugin: String::new(),
+            credential_mode: mode.into(),
+            source_plugin_id: Some("plugin.test".into()),
+            source_integration_id: Some("oauth".into()),
+        }
+    }
 
     #[test]
     fn manual_account_creation_is_mode_gated() {
@@ -5905,6 +5933,34 @@ mod credential_enrollment_tests {
         assert_eq!(
             manual_account_enrollment_error("none"),
             Some("provider does not require user credentials")
+        );
+    }
+
+    #[test]
+    fn plugin_auth_start_requires_auth_flow_mode_and_matching_provenance() {
+        let binding = "plugin:plugin.test/strategy";
+
+        let manual = provider("manual");
+        assert!(validate_plugin_auth_enrollment(&manual, "plugin.test", "oauth", binding).is_err());
+
+        let auth_flow = provider("auth_flow");
+        assert!(
+            validate_plugin_auth_enrollment(&auth_flow, "plugin.test", "oauth", binding).is_ok()
+        );
+        assert!(
+            validate_plugin_auth_enrollment(&auth_flow, "other.plugin", "oauth", binding).is_err()
+        );
+        assert!(
+            validate_plugin_auth_enrollment(&auth_flow, "plugin.test", "other", binding).is_err()
+        );
+        assert!(
+            validate_plugin_auth_enrollment(
+                &auth_flow,
+                "plugin.test",
+                "oauth",
+                "plugin:plugin.test/other"
+            )
+            .is_err()
         );
     }
 }
