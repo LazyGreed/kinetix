@@ -1843,6 +1843,45 @@ mod tests {
     }
 
     #[test]
+    fn explicit_plugin_hint_resolves_only_existing_canonical_model() {
+        let catalog = models_dev_fixture();
+        let resolved = resolve_with_hint(
+            "https://daily-cloudcode-pa.googleapis.com",
+            "gemini-3.8-flash-high",
+            Some("google/gemini-3.8-flash"),
+            Some(&catalog),
+        );
+        assert_eq!(
+            resolved.identity.canonical_model_id.as_deref(),
+            Some("google/gemini-3.8-flash")
+        );
+        assert_eq!(
+            resolved.identity.match_kind,
+            Some(CanonicalMatchKind::ExplicitHint)
+        );
+        assert!(resolved.canonical.is_some());
+    }
+
+    #[test]
+    fn unknown_plugin_hint_is_ignored_before_normal_resolution() {
+        let catalog = models_dev_fixture();
+        let resolved = resolve_with_hint(
+            "https://unknown.example/v1",
+            "deepseek-v4.1-flash",
+            Some("invented/not-real"),
+            Some(&catalog),
+        );
+        assert_eq!(
+            resolved.identity.canonical_model_id.as_deref(),
+            Some("deepseek/deepseek-v4.1-flash")
+        );
+        assert_ne!(
+            resolved.identity.match_kind,
+            Some(CanonicalMatchKind::ExplicitHint)
+        );
+    }
+
+    #[test]
     fn models_dev_unavailability_uses_canonical_bundled_fallback() {
         let resolved = resolve_with_bundled(
             "https://unknown.example/v1",
