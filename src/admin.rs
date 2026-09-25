@@ -8554,6 +8554,65 @@ mod reasoning_discovery_control_plane_tests {
     }
 
     #[test]
+    fn plugin_v2_discovery_keeps_variant_opaque_state_and_plugin_managed_reasoning() {
+        let observation = discovered_observation_with_catalog(
+            crate::adapters::DiscoveredModel {
+                id: "gemini-3.8-flash-high".into(),
+                display_name: Some("Gemini 3.8 Flash High".into()),
+                context_window: None,
+                max_output_tokens: None,
+            },
+            None,
+            Some(json!({
+                "schema_version": 2,
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["high"],
+                    "default": "high",
+                    "can_disable": false
+                },
+                "identity": {
+                    "canonical_model_id": "google/gemini-3.8-flash",
+                    "variant": {
+                        "kind": "reasoning_tier",
+                        "id": "high",
+                        "reasoning_level": "high",
+                        "fixed": true
+                    }
+                },
+                "opaque_state": {
+                    "kind": "gemini_thought_signature",
+                    "family": "gemini",
+                    "encoding_version": 1,
+                    "placeholder_strategy": "gemini3_skip_validator"
+                }
+            })),
+            WireFormat::Plugin,
+            None,
+        );
+
+        assert_eq!(observation.reasoning_support, Some(true));
+        assert_eq!(
+            observation.reasoning.as_ref().unwrap().levels,
+            vec!["high".to_string()]
+        );
+        assert!(observation.thinking_map.is_none());
+        assert_eq!(
+            observation.provider_variant.as_ref().unwrap()["id"],
+            json!("high")
+        );
+        assert_eq!(
+            observation.opaque_state.as_ref().unwrap()["family"],
+            json!("gemini")
+        );
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            json!("plugin_capabilities_json")
+        );
+    }
+
+    #[test]
     fn raw_metadata_matches_openai_and_gemini_model_ids() {
         let openai = json!({
             "data": [
