@@ -71,6 +71,16 @@ fn phase_budget(deadline: Instant, provider_timeout: Duration) -> Option<(Instan
     Some((now + budget, budget))
 }
 
+fn cache_status_from_usage(usage: &TokenUsage) -> &'static str {
+    if usage.cached.unwrap_or(0) > 0 {
+        "hit"
+    } else if usage.cache_write.unwrap_or(0) > 0 {
+        "miss"
+    } else {
+        "bypass"
+    }
+}
+
 /// Request-scoped metadata carried into the usage log and Route Trace.
 pub struct RequestMeta {
     pub request_id: String,
@@ -363,6 +373,9 @@ struct Attempt {
     prefetched: Vec<Bytes>,
     /// Parsed complete events for a successful non-SSE JSON response.
     full_events: Option<Vec<StreamEvent>>,
+    /// Cache usage observed before downstream commit. Anthropic normally sends
+    /// this in message_start, allowing X-Kinetix-Cache to reflect real usage.
+    precommit_usage: TokenUsage,
     /// Maximum silence between upstream transport chunks after pre-commit
     /// validation. This is a per-gap timer, never a total stream lifetime.
     idle_timeout: Duration,
@@ -619,7 +632,7 @@ pub async fn run(
             trace.step(
                 "skip",
                 Some(t.account.label.clone()),
-                "provider not permitted by virtual key",
+                format!("model={} provider_not_permitted", t.model.display_name),
             );
             return false;
         }
@@ -627,7 +640,7 @@ pub async fn run(
             trace.step(
                 "skip",
                 Some(t.model.display_name.clone()),
-                "capabilities unsatisfied (strict provider)",
+                format!("model={} capability mismatch", t.model.display_name),
             );
             return false;
         }
@@ -636,7 +649,10 @@ pub async fn run(
                 trace.step(
                     "skip",
                     Some(t.model.display_name.clone()),
-                    format!("input exceeds context window ({ctx})"),
+                    format!(
+                        "model={} context-window mismatch: input exceeds context window ({ctx})",
+                        t.model.display_name
+                    ),
                 );
                 return false;
             }
@@ -778,8 +794,9 @@ pub async fn run(
                     format!("half-open recovery probe ({})", status.as_str()),
                 );
             } else {
-                let why = format!("{}:skipped({})", target.account.label, status.as_str());
-                meta.fallback_path.push(why.clone());
+                let why = account_skip_detail(target, status);
+                meta.fallback_path
+                    .push(format!("{}:{why}", target.account.label));
                 trace.step("skip", Some(target.account.label.clone()), why);
                 state.record_skip();
                 continue;
@@ -801,7 +818,7 @@ pub async fn run(
             trace.step(
                 "skip",
                 Some(target.account.label.clone()),
-                "soft quota reached",
+                format!("model={} soft quota reached", target.model.display_name),
             );
             state.record_skip();
             if !allow_fallback
@@ -1174,6 +1191,7 @@ pub async fn run(
                         stream: prepared.stream,
                         prefetched: prepared.prefetched,
                         full_events: prepared.full_events,
+                        precommit_usage: prepared.precommit_usage,
                         idle_timeout: provider_timeout,
                         adapter: adapter.clone(),
                         passthrough: use_passthrough && prepared.is_sse,
@@ -1743,6 +1761,7 @@ struct PreparedUpstream {
     stream: Option<reqwest::Response>,
     prefetched: Vec<Bytes>,
     full_events: Option<Vec<StreamEvent>>,
+    precommit_usage: TokenUsage,
     is_sse: bool,
 }
 
@@ -1847,16 +1866,24 @@ async fn prepare_success_response(
                 quota_reset_at: None,
             });
         }
+        let mut precommit_usage = TokenUsage::default();
+        for event in &events {
+            if let StreamEvent::Usage(value) = event {
+                precommit_usage.merge(value);
+            }
+        }
         return Ok(PreparedUpstream {
             stream: None,
             prefetched: Vec::new(),
             full_events: Some(events),
+            precommit_usage,
             is_sse: false,
         });
     }
 
     let mut framer = crate::sse::SseFramer::new();
     let mut prefetched = Vec::new();
+    let mut precommit_usage = TokenUsage::default();
     loop {
         match response.chunk().await {
             Ok(Some(bytes)) => {
@@ -1885,11 +1912,17 @@ async fn prepare_success_response(
                         });
                     }
                     let events = adapter.parse_stream_chunk(&payload)?;
+                    for event in &events {
+                        if let StreamEvent::Usage(value) = event {
+                            precommit_usage.merge(value);
+                        }
+                    }
                     if events.iter().any(is_semantic_event) {
                         return Ok(PreparedUpstream {
                             stream: Some(response),
                             prefetched,
                             full_events: None,
+                            precommit_usage,
                             is_sse: true,
                         });
                     }
@@ -1992,16 +2025,7 @@ async fn handle_key_failure(
             d
         }
         FailureKind::ServerError | FailureKind::ConnectionError | FailureKind::Timeout => {
-            let _ = db::set_account_status(
-                &state.pool,
-                account_id,
-                "cooldown",
-                Some(&(chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339()),
-                None,
-                Some(&failure.message),
-            )
-            .await;
-            let d = format!("{label}:transient(cooldown 10s)");
+            let d = format!("{label}:transient(request-local)");
             meta.fallback_path.push(d.clone());
             d
         }
@@ -2013,9 +2037,9 @@ async fn handle_key_failure(
         FailureKind::BadRequest => format!("{label}:bad_request"),
     };
 
-    let n = if failure.kind.affects_account() {
-        // Circuit breaker (FR-4.7) tracks failures attributable to the selected
-        // account/upstream path, never model-local permission/not-found errors.
+    let n = if failure.kind.is_account_scoped() {
+        // Circuit breaker (FR-4.7) only tracks failures with direct evidence
+        // that the selected account/credential itself is unavailable.
         pool::record_failure(
             &state.pool,
             account_id,
@@ -2035,7 +2059,7 @@ async fn handle_key_failure(
             format!("circuit opened for account after {n} consecutive failures"),
         );
     }
-    if failure.kind.affects_account() {
+    if failure.kind.is_account_scoped() {
         // Refresh the registry snapshot so later requests see the new status.
         let _ = state.registry.reload(&state.pool).await;
     }
@@ -2132,6 +2156,36 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             ProxyError::upstream(failure.message.clone())
         }
     }
+}
+
+fn account_skip_detail(target: &ResolvedTarget, status: pool::AccountStatus) -> String {
+    let mut detail = format!(
+        "model={} skipped({}); effective_status={}",
+        target.model.display_name,
+        status.as_str(),
+        status.as_str()
+    );
+    match status {
+        pool::AccountStatus::Cooldown => {
+            if let Some(until) = target.account.cooldown_until.as_deref() {
+                detail.push_str(&format!("; cooldown_until={until}"));
+            }
+        }
+        pool::AccountStatus::Exhausted => {
+            if let Some(reset) = target.account.quota_reset_at.as_deref() {
+                detail.push_str(&format!("; quota_reset_at={reset}"));
+            }
+        }
+        pool::AccountStatus::CircuitOpen => {
+            detail.push_str("; circuit_prevented_execution=true");
+            if let Some(until) = target.account.circuit_open_until.as_deref() {
+                detail.push_str(&format!("; circuit_open_until={until}"));
+            }
+        }
+        pool::AccountStatus::Disabled => {}
+        pool::AccountStatus::Healthy => {}
+    }
+    detail
 }
 
 /// Select healthy accounts for a provider's pool (single-model route).
@@ -2769,7 +2823,7 @@ async fn stream_response(
     state: &AppState,
     snap: Arc<crate::registry::Snapshot>,
     format: FrontendFormat,
-    meta: RequestMeta,
+    mut meta: RequestMeta,
     req: InternalRequest,
     attempt: Attempt,
     started: Instant,
@@ -2787,6 +2841,10 @@ async fn stream_response(
         request_id: request_id.clone(),
         created: chrono::Utc::now().timestamp(),
     };
+
+    // Anthropic message_start usage is normally available during pre-commit
+    // validation, so expose the best cache status known without delaying the stream.
+    meta.cache_status = cache_status_from_usage(&attempt.precommit_usage);
 
     // Response headers injected by Kinetix (FR-12.15). Serving topology is
     // hidden by default; the opaque route id is resolvable by an admin only.
@@ -3956,6 +4014,10 @@ async fn finalize_log(
         "unknown"
     };
 
+    // Persist authoritative cache status from final provider-reported usage.
+    // A cache read wins over a simultaneous cache write because reuse occurred.
+    meta.cache_status = cache_status_from_usage(&usage);
+
     // Persist the successful session target for both affinity and opaque-state
     // provenance. Affinity only changes routing when its route switch is enabled;
     // provenance is read by FR-2.11 to identify first-attempt provider changes.
@@ -4293,6 +4355,49 @@ pub async fn dry_run(
 #[cfg(test)]
 mod route_policy_tests {
     use super::*;
+
+    #[test]
+    fn cache_status_comes_from_provider_usage() {
+        assert_eq!(
+            cache_status_from_usage(&TokenUsage {
+                cached: Some(0),
+                cache_write: Some(8000),
+                ..Default::default()
+            }),
+            "miss"
+        );
+        assert_eq!(
+            cache_status_from_usage(&TokenUsage {
+                cached: Some(8000),
+                cache_write: Some(300),
+                ..Default::default()
+            }),
+            "hit"
+        );
+        assert_eq!(cache_status_from_usage(&TokenUsage::default()), "bypass");
+    }
+
+    #[test]
+    fn transient_failures_are_retryable_but_not_account_scoped() {
+        for kind in [
+            FailureKind::ServerError,
+            FailureKind::ConnectionError,
+            FailureKind::Timeout,
+        ] {
+            assert!(kind.is_retryable());
+            assert!(!kind.is_account_scoped());
+        }
+        for kind in [FailureKind::TargetError, FailureKind::BadRequest] {
+            assert!(!kind.is_account_scoped());
+        }
+        for kind in [
+            FailureKind::RateLimit,
+            FailureKind::QuotaExhausted,
+            FailureKind::AuthError,
+        ] {
+            assert!(kind.is_account_scoped());
+        }
+    }
 
     fn route(triggers: Value) -> db::RouteRow {
         db::RouteRow {
@@ -4797,6 +4902,7 @@ mod route_policy_tests {
                 },
                 "required": ["path"]
             }),
+            defer_loading: None,
         });
 
         assert!(estimated_input_tokens(&with_tool) > base_count);

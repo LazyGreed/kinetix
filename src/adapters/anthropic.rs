@@ -13,6 +13,29 @@ use crate::types::{
 
 pub struct AnthropicAdapter;
 
+fn is_claude_code_oauth(ctx: &UpstreamContext<'_>) -> bool {
+    ctx.credential.starts_with("sk-ant-oat")
+        || ctx.provider.credential_plugin.contains("claude-code")
+}
+
+fn mark_last_cacheable_tool(tools: &mut Value) {
+    let Some(tools) = tools.as_array_mut() else {
+        return;
+    };
+    if let Some(tool) = tools
+        .iter_mut()
+        .rev()
+        .find(|tool| tool.get("defer_loading").and_then(Value::as_bool) != Some(true))
+    {
+        if let Some(tool) = tool.as_object_mut() {
+            tool.insert(
+                "cache_control".to_string(),
+                json!({ "type": "ephemeral", "ttl": "1h" }),
+            );
+        }
+    }
+}
+
 fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
     let parts: Vec<&str> = path.split('.').collect();
     insert_dotted_rec(obj, &parts, value);
@@ -119,11 +142,15 @@ impl AnthropicAdapter {
             .tools
             .iter()
             .map(|t| {
-                json!({
+                let mut tool = json!({
                     "name": t.name,
                     "description": t.description.clone().unwrap_or_default(),
                     "input_schema": if t.parameters.is_null() { json!({"type":"object","properties":{}}) } else { t.parameters.clone() }
-                })
+                });
+                if let Some(defer_loading) = t.defer_loading {
+                    tool["defer_loading"] = json!(defer_loading);
+                }
+                tool
             })
             .collect();
         Some(Value::Array(tools))
@@ -313,9 +340,7 @@ impl Adapter for AnthropicAdapter {
         mut req: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
-        if ctx.credential.starts_with("sk-ant-oat")
-            || ctx.provider.credential_plugin.contains("claude-code")
-        {
+        if is_claude_code_oauth(ctx) {
             req = req.header("user-agent", "claude-cli/1.18.31 (external, cli)");
         }
         Ok(match ctx.provider.auth() {
@@ -361,9 +386,7 @@ impl Adapter for AnthropicAdapter {
             }
         }
 
-        if ctx.credential.starts_with("sk-ant-oat")
-            || ctx.provider.credential_plugin.contains("claude-code")
-        {
+        if is_claude_code_oauth(ctx) {
             const BILLING_HEADER: &str =
                 "x-anthropic-billing-header: cc_version=1.18.31; cc_entrypoint=cli; cch=00000;";
             const SENTINEL: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -380,7 +403,27 @@ impl Adapter for AnthropicAdapter {
         }
 
         if !system.is_empty() {
-            body.insert("system".to_string(), json!(system.join("\n\n")));
+            if is_claude_code_oauth(ctx) {
+                let last = system.len().saturating_sub(1);
+                let blocks = system
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        if index == last {
+                            json!({
+                                "type": "text",
+                                "text": text,
+                                "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                            })
+                        } else {
+                            json!({ "type": "text", "text": text })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                body.insert("system".to_string(), Value::Array(blocks));
+            } else {
+                body.insert("system".to_string(), json!(system.join("\n\n")));
+            }
         }
         body.insert("messages".to_string(), json!(Self::build_messages(req)));
 
@@ -417,7 +460,10 @@ impl Adapter for AnthropicAdapter {
             body.insert("stop_sequences".to_string(), json!(req.params.stop));
         }
 
-        if let Some(tools) = Self::build_tools(req) {
+        if let Some(mut tools) = Self::build_tools(req) {
+            if is_claude_code_oauth(ctx) {
+                mark_last_cacheable_tool(&mut tools);
+            }
             body.insert("tools".to_string(), tools);
         }
         if let Some(tc) = Self::build_tool_choice(req) {
@@ -723,6 +769,27 @@ mod tests {
     }
 
     #[test]
+    fn cache_usage_regression_matches_provider_accounting() {
+        let first = parse_anthropic_usage(&serde_json::json!({
+            "input_tokens": 500,
+            "cache_creation_input_tokens": 8000,
+            "cache_read_input_tokens": 0
+        }));
+        assert_eq!(first.input, Some(8500));
+        assert_eq!(first.cached, Some(0));
+        assert_eq!(first.cache_write, Some(8000));
+
+        let second = parse_anthropic_usage(&serde_json::json!({
+            "input_tokens": 700,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 8000
+        }));
+        assert_eq!(second.input, Some(9000));
+        assert_eq!(second.cached, Some(8000));
+        assert_eq!(second.cache_write, Some(300));
+    }
+
+    #[test]
     fn anthropic_retry_after_ms_takes_precedence() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after-ms", "1500".parse().unwrap());
@@ -748,7 +815,7 @@ mod tests {
         assert!((1..=60).contains(&delay));
     }
     use crate::db::{ModelRow, ProviderRow};
-    use crate::types::Message;
+    use crate::types::{Message, ToolDef};
 
     fn provider() -> ProviderRow {
         ProviderRow {
@@ -818,6 +885,18 @@ mod tests {
         }
     }
 
+    fn rendered_system_text(body: &Value) -> String {
+        match body.get("system") {
+            Some(Value::String(system)) => system.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            _ => panic!("system prompt present"),
+        }
+    }
+
     #[test]
     fn count_tokens_url_uses_messages_subresource() {
         let p = provider();
@@ -835,6 +914,251 @@ mod tests {
                 .as_deref(),
             Some("https://api.anthropic.com/v1/messages/count_tokens")
         );
+    }
+
+    #[test]
+    fn claude_code_translated_request_adds_stable_cache_anchors() {
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let m = model();
+        let mut req = base_request();
+        req.system = vec!["stable project instructions".into()];
+        req.tools = vec![
+            ToolDef {
+                name: "read".into(),
+                description: Some("read a file".into()),
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                defer_loading: None,
+            },
+            ToolDef {
+                name: "write".into(),
+                description: Some("write a file".into()),
+                parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                defer_loading: None,
+            },
+        ];
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        let system = body["system"].as_array().expect("structured system");
+        assert_eq!(
+            system.last().unwrap()["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(
+            tools[1]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+
+        let markers = system
+            .iter()
+            .filter(|block| block.get("cache_control").is_some())
+            .count()
+            + tools
+                .iter()
+                .filter(|tool| tool.get("cache_control").is_some())
+                .count();
+        assert_eq!(markers, 2);
+    }
+
+    #[test]
+    fn claude_code_cache_prefix_is_stable_across_turns() {
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let m = model();
+        let mut first = base_request();
+        first.system = vec!["stable project instructions".into()];
+        first.tools = vec![ToolDef {
+            name: "read".into(),
+            description: Some("read a file".into()),
+            parameters: json!({"type":"object"}),
+            defer_loading: None,
+        }];
+        let mut second = first.clone();
+        second.messages.push(Message {
+            role: Role::User,
+            parts: vec![Part::Text("next turn".into())],
+        });
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+
+        let first_body = AnthropicAdapter::new().build_body(&ctx, &first).unwrap();
+        let second_body = AnthropicAdapter::new().build_body(&ctx, &second).unwrap();
+        assert_eq!(first_body["system"], second_body["system"]);
+        assert_eq!(first_body["tools"], second_body["tools"]);
+        assert_ne!(first_body["messages"], second_body["messages"]);
+    }
+
+    #[test]
+    fn non_claude_translated_request_does_not_generate_cache_controls() {
+        let p = provider();
+        let m = model();
+        let mut req = base_request();
+        req.system = vec!["system".into()];
+        req.tools = vec![ToolDef {
+            name: "read".into(),
+            description: None,
+            parameters: json!({"type":"object"}),
+            defer_loading: None,
+        }];
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        assert!(body["system"].is_string());
+        assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn passthrough_normalization_preserves_client_cache_controls() {
+        let p = provider();
+        let m = model();
+        let req = base_request();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "sk-ant-api03-regular-key".into(),
+        };
+        let mut body = json!({
+            "model": "claude-sonnet-5",
+            "stream": true,
+            "system": [{
+                "type": "text",
+                "text": "stable",
+                "cache_control": {"type":"ephemeral","ttl":"1h"}
+            }],
+            "messages": [{"role":"user","content":"hello"}],
+            "max_tokens": 128
+        });
+        let before = body.clone();
+
+        AnthropicAdapter::new()
+            .normalize_passthrough_body(&ctx, &req, &mut body)
+            .unwrap();
+
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn anthropic_frontend_preserves_defer_loading_in_canonical_tools() {
+        let req = crate::frontends::anthropic::decode_request(json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role":"user","content":"Hello"}],
+            "tools": [{
+                "name": "deferred",
+                "description": "loaded on demand",
+                "input_schema": {"type":"object","properties":{}},
+                "defer_loading": true
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(req.tools[0].defer_loading, Some(true));
+    }
+
+    #[test]
+    fn translated_request_preserves_deferred_tool_and_anchors_previous_tool() {
+        let req = crate::frontends::openai::decode_request(json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role":"user","content":"Hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "cacheable",
+                        "description": "always loaded",
+                        "parameters": {"type":"object","properties":{}}
+                    }
+                },
+                {
+                    "type": "function",
+                    "defer_loading": true,
+                    "function": {
+                        "name": "deferred",
+                        "description": "loaded on demand",
+                        "parameters": {"type":"object","properties":{}}
+                    }
+                }
+            ],
+            "stream": true
+        }))
+        .unwrap();
+        assert_eq!(req.tools[1].defer_loading, Some(true));
+
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+
+        assert_eq!(tools[1]["defer_loading"], true);
+        assert!(tools[1].get("cache_control").is_none());
+        assert_eq!(
+            tools[0]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+    }
+
+    #[test]
+    fn claude_code_cache_prefix_is_stable_but_model_scoped() {
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let sonnet = model();
+        let mut opus = model();
+        opus.upstream_id = "claude-opus-4.6".into();
+        opus.display_name = "Claude Opus 4.6".into();
+        let mut req = base_request();
+        req.system = vec!["stable project instructions".into()];
+        req.tools = vec![ToolDef {
+            name: "read".into(),
+            description: None,
+            parameters: json!({"type":"object"}),
+            defer_loading: None,
+        }];
+
+        let sonnet_ctx = UpstreamContext {
+            provider: &p,
+            model: &sonnet,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+        let opus_ctx = UpstreamContext {
+            provider: &p,
+            model: &opus,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+        let sonnet_body = AnthropicAdapter::new()
+            .build_body(&sonnet_ctx, &req)
+            .unwrap();
+        let opus_body = AnthropicAdapter::new().build_body(&opus_ctx, &req).unwrap();
+
+        assert_eq!(sonnet_body["system"], opus_body["system"]);
+        assert_eq!(sonnet_body["tools"], opus_body["tools"]);
+        assert_ne!(sonnet_body["model"], opus_body["model"]);
     }
 
     #[test]
@@ -970,10 +1294,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.contains("x-anthropic-billing-header: cc_version="));
         assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
     }
@@ -992,10 +1313,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.contains("x-anthropic-billing-header: cc_version="));
         assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
     }
@@ -1014,10 +1332,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.starts_with("x-anthropic-billing-header: cc_version="));
         assert!(system.contains("You are Claude Code, Anthropic's official CLI for Claude."));
         assert!(system.ends_with("You are a helpful coding assistant."));
@@ -1040,10 +1355,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         let count = system.matches("x-anthropic-billing-header:").count();
         assert_eq!(count, 1);
         let sentinel_count = system.matches("You are Claude Code").count();
@@ -1070,10 +1382,7 @@ mod tests {
         };
 
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
-        let system = body
-            .get("system")
-            .and_then(|v| v.as_str())
-            .expect("system prompt present");
+        let system = rendered_system_text(&body);
         assert!(system.contains("Be concise."));
 
         let messages = body

@@ -103,10 +103,11 @@ Plugins implementing the `RoutingFactProvider` capability can export typed facts
   Anthropic: a single terminal `error` event). Nothing is silently spliced.
 - The attempt loop is bounded by `max_attempts` (default 5, capped) and a 30-second
   pre-commit deadline, with bounded backoff between attempts (100 ms → 1 s).
-- Key-level failures update account state: **429 → cooldown** (honoring
-  `Retry-After`, short hint = rate limit, long/absent = quota), **quota →
-  exhausted**, **auth → disabled**, **5xx/connection/timeout → short cooldown**.
-  A per-account circuit breaker opens after repeated failures and probes half-open.
+- Account-scoped failures update account state: **429/rate limit → cooldown**
+  (honoring `Retry-After`), **quota → exhausted**, and **auth → disabled**.
+  Generic **5xx/connection/timeout** failures are request-local: they may trigger
+  bounded retry/Route fallback before commit, but do not cool down the credential
+  or increment its account circuit breaker.
 
 ## Portability policy (FR-2.11)
 
@@ -124,6 +125,15 @@ When a Route has `cache_affinity` or `sticky_routing` and the request carries
 an explicit session header, Kinetix remembers the last successful target for that
 session and prefers it while still eligible. `cache_affinity` is intended for
 prompt-cache locality; `sticky_routing` is the general session-affinity switch.
+It does **not** create or prove an upstream prompt-cache hit.
+
+For Claude Code OAuth translated requests, Kinetix emits deterministic 1-hour
+cache breakpoints on the stable system prefix and final cacheable tool definition.
+Same-format Anthropic requests preserve valid client `cache_control` markers.
+Actual cache behavior is reported from Anthropic
+`cache_read_input_tokens` / `cache_creation_input_tokens`; changing models is
+a different upstream cache identity and a miss is expected.
+
 Session identity is taken **only** from an explicit header — never guessed:
 
 ```

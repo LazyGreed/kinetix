@@ -27,15 +27,22 @@ Your provider uses a plain-HTTP URL. Use HTTPS, or — for local dev only — se
 
 ## Requests return 503 "all targets unavailable"
 
-Every Route target failed. Likely causes:
+This error means routing had no usable candidate before an upstream attempt could
+be made. Likely causes:
 
-- A single-account provider was marked exhausted/cooldown and the Route has no
-  other account/provider to fall back to. Add a second account or a cross-provider
-  target.
-- A free-tier per-minute quota is exhausted — wait for the reset window, or reset
-  the account (`kinetix account reset <id>`).
-- The upstream endpoint is unreachable (check `X-Kinetix-Fallback` and the Route
-  Trace).
+- every candidate account is already in cooldown, exhausted, disabled, or blocked
+  by an open account circuit;
+- predicates, capabilities, context-window limits, provider restrictions, or soft
+  quota checks exclude every target;
+- a free-tier/account quota is exhausted — wait for the reset window, or reset the
+  account (`kinetix account reset <id>`).
+
+A generic upstream 502/503/504, connection failure, or timeout does **not** put an
+otherwise healthy account into cooldown. If an upstream was actually attempted,
+Kinetix preserves that final upstream failure instead of replacing it with
+`all targets unavailable`. Resolve `X-Kinetix-Route-Id` in the admin Route
+Trace to distinguish upstream failure from local cooldown, exhaustion,
+disablement, circuit-open, predicate/capability, context, or soft-quota skips.
 
 ## A disabled model is still served / a config change didn't apply
 

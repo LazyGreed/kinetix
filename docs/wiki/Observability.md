@@ -27,6 +27,19 @@ in-memory snapshot, so the instance is not dropped from a load balancer.
 | `kinetix_cost_usd_total` | Total known spend. |
 | `kinetix_avg_latency_ms` / `kinetix_avg_ttft_ms` | Averages. |
 | `kinetix_cached_tokens_total` / `kinetix_cache_write_tokens_total` | Cache-read / cache-write token totals. |
+
+Cache status is derived from final normalized provider usage, not cache affinity or
+a static request flag:
+
+- `cached_tokens > 0` → `hit`
+- otherwise `cache_write_tokens > 0` → `miss`
+- neither observed → `bypass`
+
+For Anthropic streaming, `message_start` normally reports cache usage before
+Kinetix commits the downstream response, so `X-Kinetix-Cache` uses that
+pre-commit value. Persisted request/usage records are authoritative and are
+recomputed from the final usage even when a protocol cannot expose cache usage
+before response commit.
 | `kinetix_fallback_hops_total` / `kinetix_route_fallbacks_total` / `kinetix_route_skip_total` | Routing. |
 | `kinetix_failures_pre_commit_total` / `kinetix_failures_post_commit_total` | Failures before/after the commit point. |
 | `kinetix_cancellations_total` / `kinetix_cancellation_latency_ms` | Client disconnects + detection latency. |

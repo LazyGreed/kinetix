@@ -707,6 +707,10 @@ fn decode_tools(tools: Option<&Value>) -> Vec<ToolDef> {
                 .and_then(|d| d.as_str())
                 .map(String::from),
             parameters: func.get("parameters").cloned().unwrap_or(json!({})),
+            defer_loading: t
+                .get("defer_loading")
+                .or_else(|| func.get("defer_loading"))
+                .and_then(Value::as_bool),
         });
     }
     out

@@ -981,7 +981,7 @@ mod error_scope_tests {
         for (status, body) in cases {
             let failure = adapter.classify_error(status, body, &reqwest::header::HeaderMap::new());
             assert_eq!(failure.kind, FailureKind::QuotaExhausted);
-            assert!(failure.kind.affects_account());
+            assert!(failure.kind.is_account_scoped());
             assert!(failure.kind.is_retryable());
         }
     }
@@ -996,7 +996,7 @@ mod error_scope_tests {
         );
 
         assert_eq!(failure.kind, FailureKind::BadRequest);
-        assert!(!failure.kind.affects_account());
+        assert!(!failure.kind.is_account_scoped());
         assert!(!failure.kind.is_retryable());
     }
 }

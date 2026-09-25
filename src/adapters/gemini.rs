@@ -1681,6 +1681,7 @@ mod schema_tests {
                         }
                     }
                 }),
+                defer_loading: None,
             }],
             tool_choice: None,
             tool_choice_name: None,
@@ -1747,6 +1748,7 @@ mod schema_tests {
                     },
                     "required": ["query"]
                 }),
+                defer_loading: None,
             }],
             tool_choice: None,
             tool_choice_name: None,

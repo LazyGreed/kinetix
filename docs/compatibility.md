@@ -45,6 +45,16 @@ routed independently. Pi sends `X-Session-Id` when configured with
 `sendSessionAffinityHeaders` and `sessionAffinityFormat: "openrouter"`, or
 `Session-Id` with the `"openai"` format (see `docs/pi-compatibility.md`).
 
+Cache affinity is routing locality only; it is not prompt caching. On the
+Anthropic path, same-format requests preserve client cache controls. Translated
+requests automatically receive generated cache controls only for confirmed
+Claude Code OAuth targets, where Kinetix marks a deterministic stable system/tool
+prefix with `ephemeral` / `1h`. Kinetix does not inject those controls for
+generic Anthropic API-key or Anthropic-compatible providers. Cache reads/writes
+are measured from upstream `cache_read_input_tokens` and
+`cache_creation_input_tokens`. Prompt caches are model-specific, so switching
+Claude models is expected to miss.
+
 ## OpenAI Responses API Clients (Next-Gen Coding Agents)
 
 Kinetix serves an **explicit translated subset** of `POST /v1/responses`. It

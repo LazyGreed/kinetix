@@ -392,9 +392,10 @@ fn rate_limit_before_commit_is_key_level() {
     );
 }
 
-/// FR-9.4: a retryable 5xx before commit is key-level (fallback applies).
+/// FR-9.4: a retryable 5xx before commit may fall back, but it is
+/// request-local and must not mutate account health.
 #[test]
-fn server_error_before_commit_is_key_level() {
+fn server_error_before_commit_is_request_local() {
     let adapter = crate::adapters::openai::OpenAiAdapter;
     let f = adapter.classify_error(
         503,
@@ -402,14 +403,20 @@ fn server_error_before_commit_is_key_level() {
         &reqwest::header::HeaderMap::new(),
     );
     assert_eq!(f.kind, crate::types::FailureKind::ServerError);
-    assert!(f.kind.is_key_level());
+    assert!(f.kind.is_retryable());
+    assert!(!f.kind.is_key_level());
 }
 
-/// FR-9.4: a timeout/connection failure is key-level and retryable.
+/// FR-9.4: timeout/connection failures are retryable but request-local.
 #[test]
-fn connection_failure_is_key_level() {
-    assert!(crate::types::FailureKind::Timeout.is_key_level());
-    assert!(crate::types::FailureKind::ConnectionError.is_key_level());
+fn connection_failure_is_request_local() {
+    for kind in [
+        crate::types::FailureKind::Timeout,
+        crate::types::FailureKind::ConnectionError,
+    ] {
+        assert!(kind.is_retryable());
+        assert!(!kind.is_key_level());
+    }
 }
 
 /// FR-9.4/FR-4.8: a request-level 400 (invalid request) is NOT key-level, so it
