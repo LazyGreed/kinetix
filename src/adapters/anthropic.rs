@@ -1015,6 +1015,58 @@ mod tests {
     }
 
     #[test]
+    fn cache_tool_anchor_skips_deferred_tools() {
+        let mut tools = json!([
+            {"name":"cacheable","input_schema":{"type":"object"}},
+            {"name":"deferred","defer_loading":true,"input_schema":{"type":"object"}}
+        ]);
+        mark_last_cacheable_tool(&mut tools);
+        assert_eq!(
+            tools[0]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        assert!(tools[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn claude_code_cache_prefix_is_stable_but_model_scoped() {
+        let mut p = provider();
+        p.credential_plugin = "claude-code-oauth".into();
+        let sonnet = model();
+        let mut opus = model();
+        opus.upstream_id = "claude-opus-4.6".into();
+        opus.display_name = "Claude Opus 4.6".into();
+        let mut req = base_request();
+        req.system = vec!["stable project instructions".into()];
+        req.tools = vec![ToolDef {
+            name: "read".into(),
+            description: None,
+            parameters: json!({"type":"object"}),
+        }];
+
+        let sonnet_ctx = UpstreamContext {
+            provider: &p,
+            model: &sonnet,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+        let opus_ctx = UpstreamContext {
+            provider: &p,
+            model: &opus,
+            account_id: None,
+            credential: "oauth-token".into(),
+        };
+        let sonnet_body = AnthropicAdapter::new()
+            .build_body(&sonnet_ctx, &req)
+            .unwrap();
+        let opus_body = AnthropicAdapter::new().build_body(&opus_ctx, &req).unwrap();
+
+        assert_eq!(sonnet_body["system"], opus_body["system"]);
+        assert_eq!(sonnet_body["tools"], opus_body["tools"]);
+        assert_ne!(sonnet_body["model"], opus_body["model"]);
+    }
+
+    #[test]
     fn build_body_standard_key_does_not_inject_attribution() {
         let p = provider();
         let m = model();
