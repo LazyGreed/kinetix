@@ -120,6 +120,7 @@ impl CredentialStrategy for TestCredential {
         Ok(ResolvedCredential {
             secret,
             expires_at: None,
+            refresh_after: None,
             rotated: self.rotations.load(Ordering::Relaxed) > 0,
         })
     }

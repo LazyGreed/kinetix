@@ -6822,6 +6822,19 @@ async fn complete_plugin_auth(
         .await
         .map_err(ApiError::internal)?;
 
+    // Seed proactive refresh immediately for a newly authorized account rather
+    // than waiting for its first inference request or a process restart.
+    if let Ok(Some(account)) = db::get_account(&state.pool, &account_id).await {
+        if let Err(error) = state.credential_for(&provider, &account).await {
+            tracing::debug!(
+                provider = %provider.id,
+                account = %account.id,
+                %error,
+                "new OAuth account credential lease could not be scheduled yet"
+            );
+        }
+    }
+
     Ok(PluginAuthCompletion {
         result: "success",
         provider_id: Some(provider.id),

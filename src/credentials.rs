@@ -22,13 +22,16 @@ pub enum CredentialHealth {
     Unusable(String),
 }
 
-/// A credential resolved from a strategy, with optional expiry and rotation
-/// metadata. Static keys return `expires_at: None` and `rotated: false`.
+/// A credential resolved from a strategy, with optional lease scheduling and
+/// rotation metadata. Static keys return no expiry/refresh deadline.
 #[derive(Debug, Clone)]
 pub struct ResolvedCredential {
     pub secret: String,
-    /// RFC3339 instant after which the credential must be refreshed, if known.
+    /// RFC3339 instant after which the credential is no longer valid, if known.
     pub expires_at: Option<String>,
+    /// RFC3339 instant at which core should proactively renew the credential.
+    /// Plugin-provided scheduling wins over core's derived expiry lead.
+    pub refresh_after: Option<String>,
     /// Whether this resolution performed a rotation (informational).
     pub rotated: bool,
 }
@@ -78,6 +81,7 @@ impl ResolvedCredential {
         ResolvedCredential {
             secret,
             expires_at: None,
+            refresh_after: None,
             rotated: false,
         }
     }
@@ -179,6 +183,7 @@ mod tests {
         let resolved = strategy.resolve(&acct).await.unwrap();
         assert_eq!(resolved.secret, "sk-secret");
         assert!(resolved.expires_at.is_none());
+        assert!(resolved.refresh_after.is_none());
         assert_eq!(strategy.health(&acct).await, CredentialHealth::Healthy);
         assert!(strategy.rotate(&acct).await.is_err());
     }

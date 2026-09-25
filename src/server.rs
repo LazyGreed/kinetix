@@ -221,6 +221,24 @@ where
 }
 
 pub fn spawn_background_tasks(state: AppState) {
+    // Proactive credential refresh. Resolve plugin-backed accounts once at
+    // startup to rehydrate lease deadlines, then operate only on coordinator
+    // entries whose refresh_after/derived expiry lead becomes due.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            st.seed_credential_refreshes().await;
+
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await; // seed already performed the immediate pass
+            loop {
+                tick.tick().await;
+                st.refresh_due_credentials().await;
+            }
+        });
+    }
+
     // Frequent registry reload (NFR-2.8: health-state changes visible within 1s;
     // NFR-2.10: reload only swaps an immutable snapshot).
     let st = state.clone();

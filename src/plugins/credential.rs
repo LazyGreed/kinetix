@@ -94,6 +94,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
         Ok(ResolvedCredential {
             secret,
             expires_at: lease.expires_at,
+            refresh_after: lease.refresh_after,
             rotated: false,
         })
     }

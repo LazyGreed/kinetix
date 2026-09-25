@@ -291,6 +291,14 @@ CredentialLease {
 The handle is opaque. When possible, the plugin uses it through the host HTTP capability without
 ever receiving plaintext secret bytes.
 
+Credential lifecycle policy remains host-owned. Kinetix records `refresh_after` when supplied;
+otherwise it derives a provider-neutral lead from `expires_at`. A host-owned refresh coordinator
+schedules renewal off the request path, applies bounded retry backoff, and shares one account-scoped
+singleflight gate with reactive auth-error renewal. The plugin still owns the provider-specific
+`rotate` exchange and returns the next lease. A transient proactive refresh failure does not cool
+down or disable an otherwise still-valid account; a non-retryable invalid credential stops automatic
+refresh and requires re-authorization.
+
 ### 6.2 ModelSource
 
 Two discovery contracts coexist under plugin API v1:
