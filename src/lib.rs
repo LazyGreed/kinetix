@@ -59,4 +59,5 @@ mod torture;
 pub mod trace;
 pub mod types;
 pub mod update;
+pub mod upstream_traffic;
 pub mod validate;

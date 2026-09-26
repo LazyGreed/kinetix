@@ -133,7 +133,7 @@ export interface Route {
   id: string;
   name: string;
   description: string;
-  selectionStrategy: 'priority' | 'round-robin' | 'weighted' | 'least-used';
+  selectionStrategy: 'priority' | 'round-robin' | 'weighted' | 'least-used' | 'adaptive';
   fallbackTriggers: {
     on429: boolean;
     onQuota: boolean;

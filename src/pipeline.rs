@@ -402,6 +402,8 @@ struct Attempt {
     /// Same-format passthrough is only possible when the upstream is actually
     /// SSE. A JSON response is normalized through parse_full_response().
     passthrough: bool,
+    /// Adaptive target-local permit held for the full upstream lifecycle.
+    traffic_permit: Option<crate::upstream_traffic::TrafficPermit>,
 }
 
 /// Run the full pipeline and produce a client response.
@@ -559,7 +561,11 @@ pub async fn run(
                 requested_route: Some(&route.name),
                 ..request_facts
             };
-            let ordered = order_route_targets(state, &route, targets).await;
+            let ordered = if route.strategy == "adaptive" {
+                targets
+            } else {
+                order_route_targets(state, &route, targets).await
+            };
             // Read-only target hook (§6.6): observe each candidate target before
             // eligibility filtering. Fire-and-forget; never blocks routing.
             if let Some(manager) = state.plugin_manager().cloned() {
@@ -679,6 +685,15 @@ pub async fn run(
         true
     });
     let _ = before;
+
+    // Adaptive telemetry is intentionally applied only after hard eligibility
+    // (predicate, provider restriction, capability, and context filtering).
+    // Ineligible candidates must not affect route-wide neutral telemetry.
+    if let Some(route) = &route {
+        if route.strategy == "adaptive" {
+            targets = order_route_targets(state, route, targets).await;
+        }
+    }
 
     // Circuit-open deferral (FR-4.2/FR-4.7): a target whose circuit is open and
     // is not yet due for a probe is moved behind all other candidates, but is
@@ -1091,6 +1106,47 @@ pub async fn run(
             let exp = BACKOFF_BASE_MS.saturating_mul(1u64 << (attempts_done - 1).min(4));
             tokio::time::sleep(Duration::from_millis(exp.min(BACKOFF_CAP_MS))).await;
         }
+
+        // Adaptive upstream concurrency is opt-in with the adaptive route
+        // strategy, so existing route strategies keep their exact semantics.
+        // An affine target gets a short bounded wait before spillover to protect
+        // prompt-cache/session locality from transient saturation.
+        let traffic_permit = if route
+            .as_ref()
+            .is_some_and(|route| route.strategy == "adaptive")
+        {
+            let key = traffic_key(target);
+            let affinity = route.as_ref().is_some_and(|route| {
+                (route.cache_affinity != 0 || route.sticky_routing != 0)
+                    && session_origin_key
+                        .as_ref()
+                        .is_some_and(|sticky| target_key(route, target) == *sticky)
+            });
+            let wait = if affinity {
+                Duration::from_millis(300)
+            } else {
+                Duration::ZERO
+            };
+            match state.upstream_traffic.acquire(key, wait).await {
+                Ok(permit) => Some(permit),
+                Err(snapshot) => {
+                    let detail = format!(
+                        "adaptive-concurrency: saturated (inflight={}, limit={})",
+                        snapshot.inflight, snapshot.estimated_limit
+                    );
+                    trace.step("skip", Some(target.account.label.clone()), detail.clone());
+                    meta.fallback_path
+                        .push(format!("{}:adaptive_saturated", target.account.label));
+                    state.record_skip();
+                    last_error = Some(ProxyError::all_unavailable(detail, None));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let attempt_started = Instant::now();
         attempts_done += 1;
         previous_provider_id = Some(target.provider.id.clone());
         state.live.set_fallback_hops(
@@ -1175,6 +1231,9 @@ pub async fn run(
                     let prepared = match prepared_result {
                         Ok(prepared) => prepared,
                         Err(failure) => {
+                            if let Some(permit) = traffic_permit.as_ref() {
+                                permit.finish(traffic_outcome_for_failure(failure.kind));
+                            }
                             state.flight.record(
                                 &meta.request_id,
                                 started.elapsed().as_millis() as u64,
@@ -1213,6 +1272,16 @@ pub async fn run(
                         }
                     };
 
+                    // A full JSON upstream response has no separable first
+                    // event; using its total body latency would make generation
+                    // length look like congestion. Only streaming responses train
+                    // the TTFT controller.
+                    if prepared.is_sse {
+                        if let Some(permit) = traffic_permit.as_ref() {
+                            permit.mark_first_event(attempt_started.elapsed());
+                        }
+                    }
+
                     meta.fallback_hops = (attempts_done - 1) as i64;
                     meta.retry_count = (attempts_done - 1) as i64;
                     if attempts_done > 1 {
@@ -1247,6 +1316,7 @@ pub async fn run(
                         idle_timeout: provider_timeout,
                         adapter: adapter.clone(),
                         passthrough: use_passthrough && prepared.is_sse,
+                        traffic_permit,
                     };
                     return Ok(stream_response(
                         state, snap, format, meta, target_req, attempt, started, key, trace,
@@ -1291,6 +1361,9 @@ pub async fn run(
                         }
                     }
                 };
+                if let Some(permit) = traffic_permit.as_ref() {
+                    permit.finish(traffic_outcome_for_failure(failure.kind));
+                }
                 state.flight.record(
                     &meta.request_id,
                     started.elapsed().as_millis() as u64,
@@ -1430,6 +1503,9 @@ pub async fn run(
                 continue;
             }
             Err(failure) => {
+                if let Some(permit) = traffic_permit.as_ref() {
+                    permit.finish(traffic_outcome_for_failure(failure.kind));
+                }
                 state.flight.record(
                     &meta.request_id,
                     started.elapsed().as_millis() as u64,
@@ -1510,6 +1586,156 @@ pub async fn run(
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
     format!("{}|{}|{}", route.id, t.account.id, t.model.id)
+}
+
+fn traffic_key(t: &ResolvedTarget) -> crate::upstream_traffic::TargetKey {
+    crate::upstream_traffic::TargetKey::new(
+        t.provider.id.clone(),
+        t.account.id.clone(),
+        t.model.id.clone(),
+    )
+}
+
+fn adaptive_candidate_key(t: &ResolvedTarget) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        t.route_target_id.as_deref().unwrap_or("direct"),
+        t.provider.id,
+        t.account.id,
+        t.model.id
+    )
+}
+
+fn snapshot_traffic_targets(
+    state: &AppState,
+    targets: &[ResolvedTarget],
+) -> std::collections::HashMap<
+    crate::upstream_traffic::TargetKey,
+    crate::upstream_traffic::TrafficSnapshot,
+> {
+    let mut snapshots = std::collections::HashMap::new();
+    for target in targets {
+        let key = traffic_key(target);
+        snapshots
+            .entry(key.clone())
+            .or_insert_with(|| state.upstream_traffic.snapshot(&key));
+    }
+    snapshots
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveSortScore {
+    has_capacity: bool,
+    overload_ewma: f64,
+    error_ewma: f64,
+    ttft_ms: f64,
+    priority: i64,
+    route_target_id: String,
+    account_id: String,
+    model_id: String,
+}
+
+fn median_observed_ttft(
+    targets: &[ResolvedTarget],
+    snapshots: &std::collections::HashMap<
+        crate::upstream_traffic::TargetKey,
+        crate::upstream_traffic::TrafficSnapshot,
+    >,
+) -> Option<f64> {
+    let mut values: Vec<f64> = targets
+        .iter()
+        .filter_map(|target| snapshots.get(&traffic_key(target)))
+        .filter(|snapshot| snapshot.ttft_samples > 0)
+        .filter_map(|snapshot| snapshot.fast_ttft_ms)
+        .filter(|ttft| ttft.is_finite())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some(values[mid - 1] + (values[mid] - values[mid - 1]) / 2.0)
+    } else {
+        Some(values[mid])
+    }
+}
+
+fn build_adaptive_scores(
+    targets: &[ResolvedTarget],
+    snapshots: &std::collections::HashMap<
+        crate::upstream_traffic::TargetKey,
+        crate::upstream_traffic::TrafficSnapshot,
+    >,
+) -> std::collections::HashMap<String, AdaptiveSortScore> {
+    let neutral_ttft = median_observed_ttft(targets, snapshots).unwrap_or(0.0);
+    targets
+        .iter()
+        .map(|target| {
+            let key = traffic_key(target);
+            let snapshot = snapshots
+                .get(&key)
+                .copied()
+                .expect("adaptive target snapshot");
+            let ttft_ms = if snapshot.ttft_samples > 0 {
+                snapshot
+                    .fast_ttft_ms
+                    .filter(|ttft| ttft.is_finite())
+                    .unwrap_or(neutral_ttft)
+            } else {
+                neutral_ttft
+            };
+            let score = AdaptiveSortScore {
+                has_capacity: snapshot.has_capacity,
+                overload_ewma: snapshot.overload_ewma,
+                error_ewma: snapshot.error_ewma,
+                ttft_ms,
+                priority: target.priority,
+                route_target_id: target.route_target_id.clone().unwrap_or_default(),
+                account_id: target.account.id.clone(),
+                model_id: target.model.id.clone(),
+            };
+            (adaptive_candidate_key(target), score)
+        })
+        .collect()
+}
+
+fn compare_adaptive_targets(
+    a: &ResolvedTarget,
+    b: &ResolvedTarget,
+    scores: &std::collections::HashMap<String, AdaptiveSortScore>,
+) -> std::cmp::Ordering {
+    let a_score = scores
+        .get(&adaptive_candidate_key(a))
+        .expect("adaptive candidate score");
+    let b_score = scores
+        .get(&adaptive_candidate_key(b))
+        .expect("adaptive candidate score");
+
+    b_score
+        .has_capacity
+        .cmp(&a_score.has_capacity)
+        .then_with(|| a_score.overload_ewma.total_cmp(&b_score.overload_ewma))
+        .then_with(|| a_score.error_ewma.total_cmp(&b_score.error_ewma))
+        .then_with(|| a_score.ttft_ms.total_cmp(&b_score.ttft_ms))
+        .then_with(|| a_score.priority.cmp(&b_score.priority))
+        .then_with(|| a_score.route_target_id.cmp(&b_score.route_target_id))
+        .then_with(|| a_score.account_id.cmp(&b_score.account_id))
+        .then_with(|| a_score.model_id.cmp(&b_score.model_id))
+}
+
+fn traffic_outcome_for_failure(kind: FailureKind) -> crate::upstream_traffic::TrafficOutcome {
+    use crate::upstream_traffic::TrafficOutcome;
+    match kind {
+        FailureKind::RateLimit => TrafficOutcome::Overload,
+        FailureKind::Timeout => TrafficOutcome::Timeout,
+        FailureKind::ServerError | FailureKind::ConnectionError => TrafficOutcome::Error,
+        FailureKind::QuotaExhausted
+        | FailureKind::AuthError
+        | FailureKind::TargetError
+        | FailureKind::BadRequest => TrafficOutcome::Neutral,
+    }
 }
 
 fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> bool {
@@ -2410,6 +2636,13 @@ fn order_route_account_candidates(targets: Vec<ResolvedTarget>) -> Vec<ResolvedT
         .collect()
 }
 
+fn adaptive_account_dispatchable(target: &ResolvedTarget) -> bool {
+    let status = pool::effective_status(&target.account);
+    matches!(status, pool::AccountStatus::Healthy)
+        || (matches!(status, pool::AccountStatus::CircuitOpen)
+            && pool::should_probe(&target.account))
+}
+
 /// Order logical route targets according to the route strategy (FR-12.5), then
 /// flatten each target's account pool. A provider with N accounts therefore
 /// does not receive N times the configured route weight or round-robin share.
@@ -2418,6 +2651,26 @@ async fn order_route_targets(
     route: &db::RouteRow,
     targets: Vec<ResolvedTarget>,
 ) -> Vec<ResolvedTarget> {
+    // Freeze adaptive telemetry for this ordering pass. acquire() still
+    // performs the authoritative live capacity check immediately before
+    // dispatch, but one sort must never observe a moving comparator.
+    let adaptive_dispatchable = (route.strategy == "adaptive").then(|| {
+        targets
+            .iter()
+            .filter(|target| adaptive_account_dispatchable(target))
+            .map(adaptive_candidate_key)
+            .collect::<std::collections::HashSet<_>>()
+    });
+    let adaptive_scores = adaptive_dispatchable.as_ref().map(|dispatchable_keys| {
+        let dispatchable: Vec<_> = targets
+            .iter()
+            .filter(|target| dispatchable_keys.contains(&adaptive_candidate_key(target)))
+            .cloned()
+            .collect();
+        let snapshots = snapshot_traffic_targets(state, &dispatchable);
+        build_adaptive_scores(&dispatchable, &snapshots)
+    });
+
     let mut groups: Vec<Vec<ResolvedTarget>> = Vec::new();
     let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
@@ -2467,6 +2720,50 @@ async fn order_route_targets(
                 }
                 groups.rotate_left(idx);
             }
+        }
+        "adaptive" => {
+            let dispatchable_keys = adaptive_dispatchable
+                .as_ref()
+                .expect("adaptive dispatchable accounts");
+            let scores = adaptive_scores.as_ref().expect("adaptive route scores");
+            let compare =
+                |a: &ResolvedTarget, b: &ResolvedTarget| compare_adaptive_targets(a, b, scores);
+            let is_dispatchable = |target: &ResolvedTarget| {
+                dispatchable_keys.contains(&adaptive_candidate_key(target))
+            };
+
+            // Only currently dispatchable accounts participate in adaptive
+            // telemetry. Unavailable siblings remain in the fallback list, but
+            // can neither shift the neutral TTFT nor represent their logical
+            // route target.
+            for group in &mut groups {
+                let mut dispatchable = Vec::new();
+                let mut unavailable = Vec::new();
+                for target in std::mem::take(group) {
+                    if is_dispatchable(&target) {
+                        dispatchable.push(target);
+                    } else {
+                        unavailable.push(target);
+                    }
+                }
+                dispatchable.sort_by(&compare);
+                dispatchable.extend(unavailable);
+                *group = dispatchable;
+            }
+            groups.sort_by(|a, b| {
+                let a_rep = a.iter().find(|target| is_dispatchable(target));
+                let b_rep = b.iter().find(|target| is_dispatchable(target));
+                match (a_rep, b_rep) {
+                    (Some(a), Some(b)) => compare(a, b),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a
+                        .first()
+                        .map(|target| target.priority)
+                        .unwrap_or(i64::MAX)
+                        .cmp(&b.first().map(|target| target.priority).unwrap_or(i64::MAX)),
+                }
+            });
         }
         "least-used" => {
             let (_, by_account) = db::lifetime_totals(&state.pool).await.unwrap_or_default();
@@ -4048,6 +4345,16 @@ async fn finalize_log(
     mut trace: RouteTrace,
     committed: bool,
 ) {
+    if let Some(permit) = attempt.traffic_permit.as_ref() {
+        let outcome = match (status, status_code) {
+            ("success", _) => crate::upstream_traffic::TrafficOutcome::Success,
+            ("client_disconnect", _) => crate::upstream_traffic::TrafficOutcome::Cancelled,
+            (_, 504) => crate::upstream_traffic::TrafficOutcome::Timeout,
+            _ => crate::upstream_traffic::TrafficOutcome::Error,
+        };
+        permit.finish(outcome);
+    }
+
     let prices = attempt.target.model.prices();
     let cost = cost::compute_cost(&prices, &usage);
     let cost_known = cost.is_some();
@@ -4298,10 +4605,19 @@ pub async fn dry_run(
             )
         }
         Resolved::Route { route, targets } => {
-            let ordered = order_route_targets(state, &route, targets).await;
+            let ordered = if route.strategy == "adaptive" {
+                targets
+            } else {
+                order_route_targets(state, &route, targets).await
+            };
             (ordered, Some(route))
         }
     };
+
+    let adaptive_route = route
+        .as_ref()
+        .is_some_and(|route| route.strategy == "adaptive");
+    let dry_run_traffic = adaptive_route.then(|| snapshot_traffic_targets(state, &targets));
 
     let request_facts = RequestFacts {
         frontend,
@@ -4314,8 +4630,51 @@ pub async fn dry_run(
         input_tokens: descriptor.input_tokens.unwrap_or(0),
     };
 
+    let adaptive_rank = if adaptive_route {
+        let mut hard_eligible = Vec::new();
+        for t in &targets {
+            let tgt_facts = TargetFacts {
+                model_id: &t.model.id,
+                model_display: &t.model.display_name,
+                provider_id: &t.provider.id,
+                provider_name: &t.provider.name,
+                capabilities: &t.model.caps(),
+                capabilities_raw: &serde_json::from_str::<Value>(&t.model.capabilities)
+                    .unwrap_or(Value::Null),
+                context_window: t.model.context_window,
+                max_output_tokens: t.model.max_output_tokens,
+            };
+            let predicate_ok =
+                predicate::eligibility(&t.predicate, &request_facts, &tgt_facts).eligible;
+            let caps_ok = t.model.caps().satisfies(&needs) || !t.provider.strict();
+            let ctx_ok = t
+                .model
+                .context_window
+                .map(|c| c <= 0 || request_facts.input_tokens <= c as u64)
+                .unwrap_or(true);
+            let provider_allowed = descriptor.allowed_providers.is_empty()
+                || descriptor.allowed_providers.contains(&t.provider.id);
+            if predicate_ok && caps_ok && ctx_ok && provider_allowed {
+                hard_eligible.push(t.clone());
+            }
+        }
+
+        let route = route.as_ref().expect("adaptive dry-run route");
+        let ordered = order_route_targets(state, route, hard_eligible).await;
+        Some(
+            ordered
+                .iter()
+                .enumerate()
+                .map(|(rank, target)| (adaptive_candidate_key(target), rank))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+    } else {
+        None
+    };
+
     let mut candidates = Vec::new();
     let mut selected: Option<String> = None;
+    let mut selected_rank = usize::MAX;
     for t in &targets {
         let tgt_facts = TargetFacts {
             model_id: &t.model.id,
@@ -4342,10 +4701,27 @@ pub async fn dry_run(
         let provider_allowed = descriptor.allowed_providers.is_empty()
             || descriptor.allowed_providers.contains(&t.provider.id);
         let quota_ok = !descriptor.soft_quota_reached;
-        let would_select =
-            elig.eligible && account_eligible && caps_ok && ctx_ok && provider_allowed && quota_ok;
-        if would_select && selected.is_none() {
-            selected = Some(format!("{} @ {}", t.model.display_name, t.account.label));
+        let adaptive_capacity_ok = dry_run_traffic
+            .as_ref()
+            .and_then(|snapshots| snapshots.get(&traffic_key(t)))
+            .map(|snapshot| snapshot.has_capacity)
+            .unwrap_or(true);
+        let would_select = elig.eligible
+            && account_eligible
+            && caps_ok
+            && ctx_ok
+            && provider_allowed
+            && quota_ok
+            && adaptive_capacity_ok;
+        if would_select {
+            let rank = adaptive_rank
+                .as_ref()
+                .and_then(|ranks| ranks.get(&adaptive_candidate_key(t)).copied())
+                .unwrap_or(0);
+            if selected.is_none() || rank < selected_rank {
+                selected_rank = rank;
+                selected = Some(format!("{} @ {}", t.model.display_name, t.account.label));
+            }
         }
         // Enumerate the reasons a candidate is not selected so the dry run is
         // explainable (FR-8.7), not just a boolean.
@@ -4368,6 +4744,9 @@ pub async fn dry_run(
         if !quota_ok {
             reasons.push("soft_quota");
         }
+        if !adaptive_capacity_ok {
+            reasons.push("adaptive_saturated");
+        }
         candidates.push(serde_json::json!({
             "target": format!("{} @ {}", t.model.display_name, t.account.label),
             "model": t.model.display_name,
@@ -4388,6 +4767,7 @@ pub async fn dry_run(
             "context_eligible": ctx_ok,
             "provider_permitted": provider_allowed,
             "quota_available": quota_ok,
+            "adaptive_capacity_available": adaptive_route.then_some(adaptive_capacity_ok),
             "eligible": would_select,
             "not_selected_reasons": reasons,
         }));
@@ -4567,6 +4947,623 @@ mod route_policy_tests {
             predicate: TargetPredicate::default(),
             param_overrides: Value::Null,
         }
+    }
+
+    fn snapshot_traffic_targets_for_test(
+        traffic: &crate::upstream_traffic::UpstreamTraffic,
+        targets: &[ResolvedTarget],
+    ) -> std::collections::HashMap<
+        crate::upstream_traffic::TargetKey,
+        crate::upstream_traffic::TrafficSnapshot,
+    > {
+        targets
+            .iter()
+            .map(|target| {
+                let key = traffic_key(target);
+                (key.clone(), traffic.snapshot(&key))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn adaptive_ordering_uses_error_observations_without_ttft_samples() {
+        let mut primary = target();
+        primary.account.id = "acc_primary".into();
+        primary.priority = 1;
+
+        let mut fallback = target();
+        fallback.account.id = "acc_fallback".into();
+        fallback.priority = 2;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+        traffic
+            .acquire(traffic_key(&primary), Duration::ZERO)
+            .await
+            .unwrap()
+            .finish(traffic_outcome_for_failure(FailureKind::ServerError));
+        traffic
+            .acquire(traffic_key(&fallback), Duration::ZERO)
+            .await
+            .unwrap()
+            .finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let targets = vec![primary.clone(), fallback.clone()];
+        let snapshots = snapshot_traffic_targets_for_test(&traffic, &targets);
+        let scores = build_adaptive_scores(&targets, &snapshots);
+
+        assert_eq!(
+            snapshots[&traffic_key(&primary)].ttft_samples,
+            0,
+            "5xx-only targets must still contribute error telemetry"
+        );
+        assert_eq!(
+            compare_adaptive_targets(&primary, &fallback, &scores),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[tokio::test]
+    async fn first_event_health_prefers_streaming_fallback_before_completion() {
+        let mut primary = target();
+        primary.account.id = "acc_primary".into();
+        primary.priority = 1;
+
+        let mut fallback = target();
+        fallback.account.id = "acc_fallback".into();
+        fallback.priority = 2;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+        traffic
+            .acquire(traffic_key(&primary), Duration::ZERO)
+            .await
+            .unwrap()
+            .finish(traffic_outcome_for_failure(FailureKind::ServerError));
+
+        let fallback_permit = traffic
+            .acquire(traffic_key(&fallback), Duration::ZERO)
+            .await
+            .unwrap();
+        fallback_permit.mark_first_event(Duration::from_millis(100));
+
+        let targets = vec![primary.clone(), fallback.clone()];
+        let snapshots = snapshot_traffic_targets_for_test(&traffic, &targets);
+        let scores = build_adaptive_scores(&targets, &snapshots);
+
+        assert_eq!(
+            snapshots[&traffic_key(&fallback)].error_observations,
+            0,
+            "first-event health stays provisional until the stream terminates"
+        );
+        assert_eq!(snapshots[&traffic_key(&fallback)].error_ewma, 0.0);
+        assert_eq!(
+            compare_adaptive_targets(&primary, &fallback, &scores),
+            std::cmp::Ordering::Greater
+        );
+
+        fallback_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn concurrent_failure_outranks_older_provisional_stream_health() {
+        let mut primary = target();
+        primary.account.id = "acc_primary".into();
+        primary.priority = 1;
+
+        let mut fallback = target();
+        fallback.account.id = "acc_fallback".into();
+        fallback.priority = 2;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+
+        let open_stream = traffic
+            .acquire(traffic_key(&primary), Duration::ZERO)
+            .await
+            .unwrap();
+        open_stream.mark_first_event(Duration::from_millis(100));
+
+        let failed_request = traffic
+            .acquire(traffic_key(&primary), Duration::ZERO)
+            .await
+            .unwrap();
+        failed_request.finish(crate::upstream_traffic::TrafficOutcome::Error);
+
+        traffic
+            .acquire(traffic_key(&fallback), Duration::ZERO)
+            .await
+            .unwrap()
+            .finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let targets = vec![primary.clone(), fallback.clone()];
+        let snapshots = snapshot_traffic_targets_for_test(&traffic, &targets);
+        let scores = build_adaptive_scores(&targets, &snapshots);
+
+        assert!(
+            snapshots[&traffic_key(&primary)].error_ewma > 0.9,
+            "newer failure must remain visible while an older validated stream is open"
+        );
+        assert_eq!(
+            compare_adaptive_targets(&primary, &fallback, &scores),
+            std::cmp::Ordering::Greater,
+            "adaptive routing must prefer the healthy fallback after the concurrent failure"
+        );
+
+        open_stream.finish(crate::upstream_traffic::TrafficOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn decayed_failure_penalty_allows_priority_primary_to_recover() {
+        let mut primary = target();
+        primary.account.id = "acc_primary".into();
+        primary.priority = 1;
+
+        let mut fallback = target();
+        fallback.account.id = "acc_fallback".into();
+        fallback.priority = 2;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+        traffic
+            .acquire(traffic_key(&primary), Duration::ZERO)
+            .await
+            .unwrap()
+            .finish(traffic_outcome_for_failure(FailureKind::ServerError));
+
+        let fallback_permit = traffic
+            .acquire(traffic_key(&fallback), Duration::ZERO)
+            .await
+            .unwrap();
+        fallback_permit.mark_first_event(Duration::from_millis(100));
+        fallback_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let future = Instant::now() + Duration::from_secs(5 * 60 + 1);
+        let mut recovered = std::collections::HashMap::new();
+        recovered.insert(
+            traffic_key(&primary),
+            traffic.snapshot_at(&traffic_key(&primary), future),
+        );
+        recovered.insert(
+            traffic_key(&fallback),
+            traffic.snapshot_at(&traffic_key(&fallback), future),
+        );
+        let targets = vec![primary.clone(), fallback.clone()];
+        let scores = build_adaptive_scores(&targets, &recovered);
+
+        assert_eq!(recovered[&traffic_key(&primary)].error_ewma, 0.0);
+        assert_eq!(
+            compare_adaptive_targets(&primary, &fallback, &scores),
+            std::cmp::Ordering::Less,
+            "once the transient failure penalty decays to neutral, configured priority should win"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_ttft_score_is_transitive_with_observed_cold_observed_targets() {
+        let mut a = target();
+        a.account.id = "acc_a".into();
+        a.priority = 1;
+
+        let mut b = target();
+        b.account.id = "acc_b".into();
+        b.priority = 2;
+
+        let mut c_target = target();
+        c_target.account.id = "acc_c".into();
+        c_target.priority = 3;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+
+        let a_permit = traffic
+            .acquire(traffic_key(&a), Duration::ZERO)
+            .await
+            .unwrap();
+        a_permit.mark_first_event(Duration::from_millis(200));
+        a_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let c_permit = traffic
+            .acquire(traffic_key(&c_target), Duration::ZERO)
+            .await
+            .unwrap();
+        c_permit.mark_first_event(Duration::from_millis(100));
+        c_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let targets = vec![a.clone(), b.clone(), c_target.clone()];
+        let snapshots = snapshot_traffic_targets_for_test(&traffic, &targets);
+        let scores = build_adaptive_scores(&targets, &snapshots);
+
+        assert_eq!(scores[&adaptive_candidate_key(&a)].ttft_ms, 200.0);
+        assert_eq!(scores[&adaptive_candidate_key(&b)].ttft_ms, 150.0);
+        assert_eq!(scores[&adaptive_candidate_key(&c_target)].ttft_ms, 100.0);
+
+        assert_eq!(
+            compare_adaptive_targets(&c_target, &b, &scores),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_adaptive_targets(&b, &a, &scores),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_adaptive_targets(&c_target, &a, &scores),
+            std::cmp::Ordering::Less
+        );
+
+        let mut first = targets.clone();
+        first.sort_by(|left, right| compare_adaptive_targets(left, right, &scores));
+        let mut second = targets;
+        second.sort_by(|left, right| compare_adaptive_targets(left, right, &scores));
+
+        let first_ids: Vec<_> = first
+            .iter()
+            .map(|target| target.account.id.as_str())
+            .collect();
+        let second_ids: Vec<_> = second
+            .iter()
+            .map(|target| target.account.id.as_str())
+            .collect();
+        assert_eq!(first_ids, vec!["acc_c", "acc_b", "acc_a"]);
+        assert_eq!(first_ids, second_ids);
+    }
+
+    #[tokio::test]
+    async fn stale_ttft_becomes_neutral_and_priority_can_recover() {
+        let mut primary = target();
+        primary.account.id = "acc_primary".into();
+        primary.priority = 1;
+
+        let mut fallback = target();
+        fallback.account.id = "acc_fallback".into();
+        fallback.priority = 2;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+
+        let primary_permit = traffic
+            .acquire(traffic_key(&primary), Duration::ZERO)
+            .await
+            .unwrap();
+        primary_permit.mark_first_event(Duration::from_secs(5));
+        primary_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let fallback_permit = traffic
+            .acquire(traffic_key(&fallback), Duration::ZERO)
+            .await
+            .unwrap();
+        fallback_permit.mark_first_event(Duration::from_millis(100));
+        fallback_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let targets = vec![primary.clone(), fallback.clone()];
+        let current = snapshot_traffic_targets_for_test(&traffic, &targets);
+        let current_scores = build_adaptive_scores(&targets, &current);
+        assert_eq!(
+            compare_adaptive_targets(&primary, &fallback, &current_scores),
+            std::cmp::Ordering::Greater
+        );
+
+        let future = Instant::now() + Duration::from_secs(5 * 60 + 1);
+        let mut recovered = current;
+        recovered.insert(
+            traffic_key(&primary),
+            traffic.snapshot_at(&traffic_key(&primary), future),
+        );
+        assert_eq!(recovered[&traffic_key(&primary)].fast_ttft_ms, None);
+
+        let recovered_scores = build_adaptive_scores(&targets, &recovered);
+        assert_eq!(
+            recovered_scores[&adaptive_candidate_key(&primary)].ttft_ms,
+            recovered_scores[&adaptive_candidate_key(&fallback)].ttft_ms
+        );
+        assert_eq!(
+            compare_adaptive_targets(&primary, &fallback, &recovered_scores),
+            std::cmp::Ordering::Less,
+            "stale TTFT must become neutral so configured priority can reclaim the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn ineligible_observed_target_does_not_change_eligible_adaptive_ordering() {
+        let mut a = target();
+        a.account.id = "acc_a".into();
+        a.priority = 2;
+
+        let mut b = target();
+        b.account.id = "acc_b".into();
+        b.priority = 1;
+
+        let mut ineligible = target();
+        ineligible.account.id = "acc_ineligible".into();
+        ineligible.priority = 3;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+
+        let a_permit = traffic
+            .acquire(traffic_key(&a), Duration::ZERO)
+            .await
+            .unwrap();
+        a_permit.mark_first_event(Duration::from_millis(100));
+        a_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let ineligible_permit = traffic
+            .acquire(traffic_key(&ineligible), Duration::ZERO)
+            .await
+            .unwrap();
+        ineligible_permit.mark_first_event(Duration::from_secs(10));
+        ineligible_permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+
+        let all_targets = vec![a.clone(), b.clone(), ineligible.clone()];
+        let all_snapshots = snapshot_traffic_targets_for_test(&traffic, &all_targets);
+        let eligible = vec![a.clone(), b.clone()];
+
+        let scores_with_extra_snapshot = build_adaptive_scores(&eligible, &all_snapshots);
+        let mut eligible_snapshots = all_snapshots.clone();
+        eligible_snapshots.remove(&traffic_key(&ineligible));
+        let scores_without_extra_snapshot = build_adaptive_scores(&eligible, &eligible_snapshots);
+
+        assert_eq!(
+            scores_with_extra_snapshot[&adaptive_candidate_key(&b)].ttft_ms,
+            100.0
+        );
+        assert_eq!(
+            compare_adaptive_targets(&b, &a, &scores_with_extra_snapshot),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_adaptive_targets(&b, &a, &scores_without_extra_snapshot),
+            std::cmp::Ordering::Less
+        );
+
+        let all_scores = build_adaptive_scores(&all_targets, &all_snapshots);
+        assert_eq!(
+            all_scores[&adaptive_candidate_key(&b)].ttft_ms,
+            5_050.0,
+            "test setup must prove the excluded 10s sample would otherwise move the neutral median"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_ordering_ignores_unavailable_fast_sibling_telemetry() {
+        let (state, root, _, _, _) = adaptive_dry_run_state().await;
+
+        let mut route_row = route(serde_json::json!({}));
+        route_row.strategy = "adaptive".into();
+
+        let mut a_unavailable = target();
+        a_unavailable.route_target_id = Some("rt_a".into());
+        a_unavailable.account.id = "acc_a_exhausted".into();
+        a_unavailable.account.status = "exhausted".into();
+        a_unavailable.priority = 1;
+
+        let mut a_healthy = target();
+        a_healthy.route_target_id = Some("rt_a".into());
+        a_healthy.account.id = "acc_a_healthy".into();
+        a_healthy.priority = 1;
+
+        let mut b_healthy = target();
+        b_healthy.route_target_id = Some("rt_b".into());
+        b_healthy.account.id = "acc_b_healthy".into();
+        b_healthy.priority = 2;
+
+        for (candidate, ttft) in [
+            (&a_unavailable, Duration::from_millis(50)),
+            (&a_healthy, Duration::from_secs(5)),
+            (&b_healthy, Duration::from_millis(100)),
+        ] {
+            let permit = state
+                .upstream_traffic
+                .acquire(traffic_key(candidate), Duration::ZERO)
+                .await
+                .unwrap();
+            permit.mark_first_event(ttft);
+            permit.finish(crate::upstream_traffic::TrafficOutcome::Success);
+        }
+
+        let ordered = order_route_targets(
+            &state,
+            &route_row,
+            vec![a_unavailable.clone(), a_healthy.clone(), b_healthy.clone()],
+        )
+        .await;
+        let account_ids: Vec<_> = ordered
+            .iter()
+            .map(|candidate| candidate.account.id.as_str())
+            .collect();
+
+        assert_eq!(
+            account_ids,
+            vec!["acc_b_healthy", "acc_a_healthy", "acc_a_exhausted"],
+            "the exhausted 50ms sibling must neither represent target A nor outrank dispatchable accounts"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn adaptive_dry_run_state() -> (AppState, std::path::PathBuf, String, String, Vec<String>)
+    {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-adaptive-dry-run-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = crate::paths::Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+        };
+        paths.ensure_dirs().unwrap();
+        let database_url = paths.database_url();
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let config = Arc::new(crate::config::Config {
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://127.0.0.1".into(),
+            database_url,
+            master_key: [42_u8; 32],
+            admin_token: "test-admin".into(),
+            cf_access_aud: None,
+            cf_access_team_domain: None,
+            log_json: false,
+            bootstrap_file: None,
+            allow_private_upstreams: true,
+            allow_insecure_tls: true,
+            data_dir: paths.data_dir.clone(),
+            shutdown_grace_secs: 1,
+            alert_webhook_url: None,
+            alert_fallback_rate: 1.0,
+            alert_error_rate: 1.0,
+            alert_min_requests: 1,
+            alert_interval_secs: 60,
+            alert_p95_latency_ms: 1_000,
+            ip_rate_limit_per_min: 0,
+            session_ttl_minutes: 60,
+            export_retention_days: 1,
+            paths,
+            generated_admin_password: None,
+        });
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry,
+            Arc::new(crate::crypto::Crypto::new(&[42_u8; 32])),
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool, 16),
+            0,
+        );
+
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "adaptive-provider",
+                base_url: "https://api.example.com",
+                wire_format: crate::types::WireFormat::Openai,
+                auth_scheme: crate::types::AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: serde_json::json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: serde_json::json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "adaptive-model",
+                display_name: "Adaptive Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: serde_json::json!({}),
+                prices: serde_json::json!({}),
+                parameters: serde_json::json!({}),
+                thinking_map: serde_json::json!({}),
+                extra_request: serde_json::json!({}),
+                discovery: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut account_ids = Vec::new();
+        for label in ["primary", "fallback"] {
+            account_ids.push(
+                db::insert_account(&state.pool, &provider_id, label, "", "", 1, 1, None, "none")
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let route_id = db::insert_route(
+            &state.pool,
+            &db::NewRoute {
+                name: "adaptive-dry-run",
+                description: "",
+                strategy: "adaptive",
+                fallback_triggers: serde_json::json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: None,
+            },
+        )
+        .await
+        .unwrap();
+        for (priority, account_id) in account_ids.iter().enumerate() {
+            db::insert_route_target(
+                &state.pool,
+                &route_id,
+                Some(account_id),
+                &model_id,
+                priority as i64 + 1,
+                1,
+                "{}",
+                "{}",
+            )
+            .await
+            .unwrap();
+        }
+        state.registry.reload(&state.pool).await.unwrap();
+
+        (state, root, provider_id, model_id, account_ids)
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_no_selection_when_all_adaptive_targets_are_saturated() {
+        let (state, root, provider_id, model_id, account_ids) = adaptive_dry_run_state().await;
+        let mut permits = Vec::new();
+
+        for account_id in &account_ids {
+            let key = crate::upstream_traffic::TargetKey::new(
+                provider_id.clone(),
+                account_id.clone(),
+                model_id.clone(),
+            );
+            loop {
+                match state
+                    .upstream_traffic
+                    .acquire(key.clone(), Duration::ZERO)
+                    .await
+                {
+                    Ok(permit) => permits.push(permit),
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let result = dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+            .await
+            .unwrap();
+
+        assert!(result["would_select"].is_null());
+        let candidates = result["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|candidate| {
+            candidate["eligible"].as_bool() == Some(false)
+                && candidate["adaptive_capacity_available"].as_bool() == Some(false)
+                && candidate["not_selected_reasons"]
+                    .as_array()
+                    .is_some_and(|reasons| {
+                        reasons
+                            .iter()
+                            .any(|reason| reason.as_str() == Some("adaptive_saturated"))
+                    })
+        }));
+
+        drop(permits);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     struct PluginThinkingTestAdapter {

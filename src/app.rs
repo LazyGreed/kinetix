@@ -68,6 +68,9 @@ pub struct AppState {
     pub last_backup_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Atomic per-key RPM/TPM/budget admission state.
     pub admission: crate::admission::AdmissionController,
+    /// Target-local adaptive upstream concurrency. This is deliberately
+    /// independent from virtual-key admission limits.
+    pub upstream_traffic: crate::upstream_traffic::UpstreamTraffic,
     /// Per-IP abuse limiter (NFR-3.6), applied before virtual-key auth.
     pub ip_limiter: crate::ratelimit::IpLimiter,
     /// In-memory admin sessions (dropped on restart; TTL-bounded).
@@ -172,6 +175,7 @@ impl AppState {
             last_backup_at: Arc::new(parking_lot::Mutex::new(None)),
             last_backup_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission: crate::admission::AdmissionController::default(),
+            upstream_traffic: crate::upstream_traffic::UpstreamTraffic::default(),
             ip_limiter: crate::ratelimit::IpLimiter::new(config_ip_limit),
             sessions,
             plugin_auth_sessions,
