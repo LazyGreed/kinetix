@@ -853,6 +853,61 @@ async fn terminal_resolve_credential_expired_disables_account_and_uses_fallback(
 }
 
 #[tokio::test]
+async fn token_count_terminal_resolve_disables_account() {
+    let strategy = Arc::new(TerminalResolveCredential::new());
+    let harness = setup(strategy, None, 1).await;
+    sqlx::query("UPDATE providers SET wire_format = ? WHERE id = ?")
+        .bind(WireFormat::Anthropic.as_str())
+        .bind(&harness.provider_id)
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    harness.state.registry.reload(&harness.pool).await.unwrap();
+    let key = db::VirtualKeyRow {
+        id: "token-count-test-key".into(),
+        key_hash: String::new(),
+        name: "token-count-test".into(),
+        owner: "test".into(),
+        tag: String::new(),
+        allowed_models: "[\"*\"]".into(),
+        allowed_providers: "[]".into(),
+        rpm_limit: None,
+        tpm_limit: None,
+        daily_budget: None,
+        monthly_budget: None,
+        expires_at: None,
+        status: "active".into(),
+        allowed_ips: "[]".into(),
+        body_logging: 0,
+        created_at: db::now_iso(),
+        revoked_at: None,
+    };
+
+    let result = pipeline::count_tokens(
+        &harness.state,
+        &key,
+        &harness.request,
+        "req_plugin_auth_token_count_terminal_resolve",
+        &[],
+    )
+    .await;
+
+    assert!(result.is_err());
+    let account = db::get_account(&harness.pool, &harness.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.status, "disabled");
+    let fallback = db::get_account(&harness.pool, &harness.fallback_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fallback.status, "healthy");
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
 async fn confirmed_missing_account_forgets_refresh_schedule() {
     let strategy = Arc::new(TestCredential::new(RotationMode::Success { delay_ms: 0 }));
     let harness = setup(strategy, None, 1).await;

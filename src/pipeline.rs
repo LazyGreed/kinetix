@@ -272,11 +272,30 @@ pub async fn count_tokens(
     if !adapter.supports_count_tokens() {
         return Ok(estimate());
     }
-    let credential = state
+    let credential = match state
         .credential_for(&target.provider, &target.account)
         .await
-        .map_err(|_| ProxyError::internal("credential unavailable"))?
-        .secret;
+    {
+        Ok(credential) => credential.secret,
+        Err(error) => {
+            if let Err(disable_error) = state
+                .disable_invalid_credential(
+                    &target.account,
+                    &error,
+                    "token-count credential resolution",
+                )
+                .await
+            {
+                tracing::error!(
+                    account = %target.account.id,
+                    credential_error = %error,
+                    %disable_error,
+                    "failed to disable account after token-count credential resolution confirmed invalid"
+                );
+            }
+            return Err(ProxyError::internal("credential unavailable"));
+        }
+    };
     let ctx = UpstreamContext {
         provider: &target.provider,
         model: &target.model,
@@ -858,7 +877,7 @@ pub async fn run(
                 );
                 crate::alerts::record_credential_failure();
                 last_error = Some(ProxyError::internal("credential unavailable"));
-                if state
+                match state
                     .disable_invalid_credential(
                         &target.account,
                         &error,
@@ -866,15 +885,30 @@ pub async fn run(
                     )
                     .await
                 {
-                    let detail = format!("{}:credential_invalid(disabled)", target.account.label);
-                    meta.fallback_path.push(detail.clone());
-                    trace.step("skip", Some(target.account.label.clone()), detail);
-                } else {
-                    trace.step(
+                    Ok(true) => {
+                        let detail =
+                            format!("{}:credential_invalid(disabled)", target.account.label);
+                        meta.fallback_path.push(detail.clone());
+                        trace.step("skip", Some(target.account.label.clone()), detail);
+                    }
+                    Ok(false) => trace.step(
                         "skip",
                         Some(target.account.label.clone()),
                         "credential unavailable",
-                    );
+                    ),
+                    Err(disable_error) => {
+                        tracing::error!(
+                            account = %target.account.id,
+                            credential_error = %error,
+                            %disable_error,
+                            "failed to disable account after request credential resolution confirmed invalid"
+                        );
+                        trace.step(
+                            "skip",
+                            Some(target.account.label.clone()),
+                            "credential invalid; account disable failed",
+                        );
+                    }
                 }
                 continue;
             }

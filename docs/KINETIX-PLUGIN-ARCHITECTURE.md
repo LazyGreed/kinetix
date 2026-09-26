@@ -249,8 +249,12 @@ matches the integration's declared credential strategy. State is consumed
 before token exchange, so callback replay fails closed. After inserting the new
 account, Kinetix resolves its credential immediately to seed lease scheduling.
 If that resolve confirms `credential_expired` (or another terminal invalid
-credential error), the account is disabled and the completion result is
-`reauthorization_required`, not `success`.
+credential error), Kinetix persists the disabled status and reloads the registry
+before returning `reauthorization_required`; if that state transition fails,
+completion returns an error rather than claiming reauthorization is required or
+reporting success. The same terminal-error handling applies to request
+inference, token counting, native model discovery, provider tests, and startup
+schedule seeding.
 
 The browser never receives access or refresh tokens from Kinetix. Provider
 client constraints remain plugin-specific: for example, the bundled
@@ -305,10 +309,14 @@ concurrent request is rescheduled instead of being rotated as stale work. A host
 coordinator schedules renewal off the request path, applies bounded retry backoff, and shares one
 account-scoped singleflight gate across request-path `resolve`, scheduled refresh, and reactive
 auth-error renewal. This is required because API v1 credential plugins are allowed to refresh inside
-`resolve`. Startup seed and request-path resolution preserve typed errors: terminal
-`credential_expired` evidence disables the account and requires re-authorization instead of being
-downgraded to a retryable host error. A transient proactive refresh failure does not cool down or
-disable an otherwise still-valid account.
+`resolve`. Startup seed and every other credential consumer preserve typed errors: terminal
+`credential_expired` evidence triggers a persisted account disable and registry reload instead of
+being downgraded to a retryable host error. Failure to persist or reload that state propagates to the
+caller; it is never represented as a successful disable. After a successful rotation, Kinetix also
+requires at least a one-minute delay before another attempt. This bounds retries when a plugin reports
+success without advancing its expiry or refresh hint, including after that unchanged lease reaches
+expiry. A transient proactive refresh failure does not cool down or disable an otherwise still-valid
+account.
 
 ### 6.2 ModelSource
 

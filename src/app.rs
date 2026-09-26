@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use dashmap::DashMap;
 
 use crate::adapters::AdapterRegistry;
@@ -274,24 +275,19 @@ impl AppState {
     }
 
     /// Disable an account when credential resolution confirms its credential
-    /// is terminally invalid. Returns whether the error was terminal.
+    /// is terminally invalid. Returns whether it was terminal, and propagates
+    /// persistence or registry-reload failures instead of claiming success.
     pub(crate) async fn disable_invalid_credential(
         &self,
         account: &crate::db::AccountRow,
         error: &CredentialRotationError,
         context: &'static str,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         if !error.invalid_credential() {
-            return false;
+            return Ok(false);
         }
 
-        tracing::warn!(
-            account = %account.id,
-            code = %error.code,
-            context,
-            "credential confirmed invalid; disabling account"
-        );
-        let _ = crate::db::set_account_status(
+        crate::db::set_account_status(
             &self.pool,
             &account.id,
             "disabled",
@@ -299,9 +295,21 @@ impl AppState {
             None,
             Some(&format!("{context}: {}", error.message)),
         )
-        .await;
-        let _ = self.registry.reload(&self.pool).await;
-        true
+        .await
+        .with_context(|| format!("failed to persist disabling invalid account {}", account.id))?;
+        self.registry.reload(&self.pool).await.with_context(|| {
+            format!(
+                "account {} was disabled but registry reload failed",
+                account.id
+            )
+        })?;
+        tracing::warn!(
+            account = %account.id,
+            code = %error.code,
+            context,
+            "credential confirmed invalid; account disabled"
+        );
+        Ok(true)
     }
 
     /// Force renewal for a plugin-backed credential after an upstream auth
@@ -366,16 +374,24 @@ impl AppState {
                     continue;
                 }
                 if let Err(error) = self.credential_for(&provider, &account).await {
-                    if !self
+                    match self
                         .disable_invalid_credential(&account, &error, "startup credential seed")
                         .await
                     {
-                        tracing::debug!(
+                        Ok(true) => {}
+                        Ok(false) => tracing::debug!(
                             provider = %provider.id,
                             account = %account.id,
                             %error,
                             "credential refresh seed resolve failed"
-                        );
+                        ),
+                        Err(disable_error) => tracing::error!(
+                            provider = %provider.id,
+                            account = %account.id,
+                            credential_error = %error,
+                            %disable_error,
+                            "failed to disable account after startup credential resolution confirmed invalid"
+                        ),
                     }
                 }
             }
@@ -481,20 +497,26 @@ impl AppState {
                 "proactively refreshed credential"
             ),
             Ok(false) => {}
-            Err(error) => {
-                if !self
-                    .disable_invalid_credential(&account, &error, "proactive credential refresh")
-                    .await
-                {
-                    tracing::warn!(
-                        provider = %provider.id,
-                        account = %account.id,
-                        code = %error.code,
-                        retryable = error.retryable,
-                        "proactive credential refresh failed; keeping current credential until expiry"
-                    );
-                }
-            }
+            Err(error) => match self
+                .disable_invalid_credential(&account, &error, "proactive credential refresh")
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    provider = %provider.id,
+                    account = %account.id,
+                    code = %error.code,
+                    retryable = error.retryable,
+                    "proactive credential refresh failed; keeping current credential until expiry"
+                ),
+                Err(disable_error) => tracing::error!(
+                    provider = %provider.id,
+                    account = %account.id,
+                    credential_error = %error,
+                    %disable_error,
+                    "failed to disable account after proactive credential refresh confirmed invalid"
+                ),
+            },
         }
     }
 

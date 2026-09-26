@@ -18,6 +18,7 @@ const DEFAULT_REFRESH_LEAD_SECS: i64 = 5 * 60;
 const MIN_RETRY_SECS: u64 = 5;
 const MAX_RETRY_SECS: u64 = 5 * 60;
 const CLAIM_GRACE_SECS: i64 = 60;
+const MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS: i64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CredentialKey {
@@ -80,7 +81,7 @@ impl RefreshCoordinator {
     /// proactive renewal. Explicit plugin-provided `refresh_after` wins;
     /// otherwise core derives a provider-neutral five-minute lead from expiry.
     pub fn observe(&self, provider_id: &str, account_id: &str, credential: &ResolvedCredential) {
-        self.store_schedule(provider_id, account_id, credential, false);
+        self.store_schedule(provider_id, account_id, credential, false, Utc::now(), None);
     }
 
     /// Resolve an account credential under the same account-scoped gate used
@@ -99,7 +100,16 @@ impl RefreshCoordinator {
 
         match strategy.resolve(account).await {
             Ok(current) => {
-                self.observe(provider_id, &account.id, &current);
+                if current.rotated {
+                    self.observe_successful_rotation(
+                        provider_id,
+                        &account.id,
+                        &current,
+                        Utc::now(),
+                    );
+                } else {
+                    self.observe(provider_id, &account.id, &current);
+                }
                 Ok(current)
             }
             Err(error) => {
@@ -117,7 +127,26 @@ impl RefreshCoordinator {
         account_id: &str,
         credential: &ResolvedCredential,
     ) {
-        self.store_schedule(provider_id, account_id, credential, true);
+        self.store_schedule(provider_id, account_id, credential, true, Utc::now(), None);
+    }
+
+    fn observe_successful_rotation(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        credential: &ResolvedCredential,
+        now: DateTime<Utc>,
+    ) {
+        let not_before =
+            now.to_owned() + ChronoDuration::seconds(MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS);
+        self.store_schedule(
+            provider_id,
+            account_id,
+            credential,
+            true,
+            now,
+            Some(not_before),
+        );
     }
 
     fn store_schedule(
@@ -126,12 +155,17 @@ impl RefreshCoordinator {
         account_id: &str,
         credential: &ResolvedCredential,
         reset_failures: bool,
+        now: DateTime<Utc>,
+        not_before: Option<DateTime<Utc>>,
     ) {
         let key = CredentialKey::new(provider_id, account_id);
-        let Some(mut schedule) = schedule_from_credential(credential, Utc::now()) else {
+        let Some(mut schedule) = schedule_from_credential(credential, now) else {
             self.schedules.remove(&key);
             return;
         };
+        if let Some(not_before) = not_before {
+            schedule.next_attempt_at = schedule.next_attempt_at.max(not_before);
+        }
 
         if !reset_failures {
             if let Some(existing) = self.schedules.get(&key) {
@@ -211,14 +245,19 @@ impl RefreshCoordinator {
 
         let result = match strategy.resolve(account).await {
             Ok(current) if current.secret != failed_secret => {
-                self.observe_refreshed(provider_id, &account.id, &current);
+                self.observe_successful_rotation(provider_id, &account.id, &current, Utc::now());
                 Ok(true)
             }
             Err(error) if error.invalid_credential() => Err(error),
             Ok(_) | Err(_) => match strategy.rotate(account).await {
                 Ok(()) => match strategy.resolve(account).await {
                     Ok(current) => {
-                        self.observe_refreshed(provider_id, &account.id, &current);
+                        self.observe_successful_rotation(
+                            provider_id,
+                            &account.id,
+                            &current,
+                            Utc::now(),
+                        );
                         Ok(true)
                     }
                     Err(error) => {
@@ -317,7 +356,12 @@ impl RefreshCoordinator {
                         return Err(error);
                     }
                 };
-                self.observe_refreshed(provider_id, &account.id, &current);
+                self.observe_successful_rotation(
+                    provider_id,
+                    &account.id,
+                    &current,
+                    Utc::now().max(now),
+                );
                 // A scheduled rotation changed the generation, but it did not
                 // produce a reactive auth result. Clear any older auth result
                 // so a queued 401 waiter re-resolves instead of reusing stale
@@ -712,6 +756,60 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(strategy.rotations.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn rotated_lease_returned_by_resolve_gets_a_safe_retry_delay() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let strategy = Arc::new(FixedShortLeaseStrategy {
+            expires_at: (Utc::now() - ChronoDuration::seconds(1)).to_rfc3339(),
+            rotations: AtomicUsize::new(1),
+        });
+
+        let resolved = coordinator.resolve("p1", strategy, &account).await.unwrap();
+
+        assert!(resolved.rotated);
+        let now = Utc::now();
+        let next_attempt = coordinator.next_attempt_at("p1", &account.id).unwrap();
+        assert!(next_attempt >= now + ChronoDuration::seconds(59));
+        assert!(coordinator.claim_due(now).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_timing_hints_cannot_spin_after_successful_rotations() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let observed_at = Utc::now();
+        let expires_at = observed_at.to_owned() + ChronoDuration::minutes(4);
+        let strategy = Arc::new(FixedShortLeaseStrategy {
+            expires_at: expires_at.to_rfc3339(),
+            rotations: AtomicUsize::new(0),
+        });
+        let initial = strategy.resolve(&account).await.unwrap();
+        coordinator.observe("p1", &account.id, &initial);
+        let mut due_at = coordinator.next_attempt_at("p1", &account.id).unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(coordinator.claim_due(due_at).len(), 1);
+            assert!(coordinator
+                .rotate_scheduled_at("p1", strategy.clone(), &account, due_at)
+                .await
+                .unwrap());
+
+            let next_attempt = coordinator.next_attempt_at("p1", &account.id).unwrap();
+            assert!(
+                next_attempt >= due_at + ChronoDuration::seconds(60),
+                "unchanged timing hints must impose a post-success delay, including at expiry"
+            );
+            due_at = next_attempt;
+        }
+
+        assert_eq!(strategy.rotations.load(Ordering::Relaxed), 3);
+        assert!(coordinator
+            .claim_due(due_at - ChronoDuration::seconds(1))
+            .is_empty());
+        assert!(due_at > expires_at);
     }
 
     #[tokio::test]
