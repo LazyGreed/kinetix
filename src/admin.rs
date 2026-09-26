@@ -26,7 +26,7 @@ use crate::db::{self, Pool};
 use crate::frontends::FrontendFormat;
 use crate::limits;
 use crate::pipeline;
-use crate::types::{AuthScheme, Capabilities, Prices, ThinkingMap, WireFormat};
+use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
@@ -1193,6 +1193,8 @@ struct DiscoveredObservation {
     price_sources: Value,
     raw_metadata: Option<Value>,
     raw_metadata_truncated: bool,
+    transport: Option<String>,
+    transport_source: Option<String>,
     canonical_identity: Option<Value>,
     canonical_model_id: Option<String>,
     canonical_match: Option<String>,
@@ -1602,6 +1604,27 @@ fn discovered_observation_with_catalog(
         .or_else(|| fallback_metadata.as_ref().and_then(normalized_modalities))
         .or(catalog_modalities);
     let (raw_metadata, raw_metadata_truncated) = bounded_raw_metadata(provider_metadata.as_ref());
+    let provider_transport = provider_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/transport/format"))
+        .and_then(Value::as_str);
+    let plugin_transport = fallback_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/transport/format"))
+        .and_then(Value::as_str);
+    let (transport, transport_source) = if let Some(format) = provider_transport {
+        (
+            Some(format.to_string()),
+            Some("provider_metadata".to_string()),
+        )
+    } else if let Some(format) = plugin_transport {
+        (
+            Some(format.to_string()),
+            Some("plugin_capabilities_json".to_string()),
+        )
+    } else {
+        (None, None)
+    };
 
     let provider_declares_reasoning = provider_metadata
         .as_ref()
@@ -1745,9 +1768,16 @@ fn discovered_observation_with_catalog(
         .as_ref()
         .map(crate::model_catalog::CatalogResolution::catalog_json);
     let execution_supported = execution_supported_for_model_type(catalog_model_type.as_deref());
-    let thinking_map = reasoning
-        .as_ref()
-        .and_then(|capability| thinking_map_for_reasoning_with_wire(capability, wire));
+    let thinking_map = reasoning.as_ref().and_then(|capability| {
+        if let Some(transport) = transport
+            .as_deref()
+            .and_then(crate::adapters::TargetTransport::parse)
+        {
+            crate::adapters::thinking_map_for_transport(capability, &transport)
+        } else {
+            thinking_map_for_reasoning_with_wire(capability, wire)
+        }
+    });
 
     DiscoveredObservation {
         model,
@@ -1761,6 +1791,8 @@ fn discovered_observation_with_catalog(
         price_sources,
         raw_metadata,
         raw_metadata_truncated,
+        transport,
+        transport_source,
         canonical_identity,
         canonical_model_id,
         canonical_match,
@@ -1782,31 +1814,12 @@ fn discovered_capabilities(observation: &DiscoveredObservation) -> Value {
     })
 }
 
-fn merge_model_discovery(existing: &str, fresh: Value) -> Value {
-    let mut merged = serde_json::from_str::<Value>(existing)
-        .ok()
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-
-    if let (Some(current), Value::Object(update)) = (merged.as_object_mut(), fresh) {
-        for (key, value) in update {
-            current.insert(key, value);
-        }
-        if current.get("disappeared").and_then(Value::as_bool) == Some(false) {
-            current.remove("flagged_at");
-        }
-    }
-
-    merged
-}
-
 async fn persist_model_discovery_update(
     pool: &Pool,
     row: &db::ModelRow,
     fresh: Value,
 ) -> anyhow::Result<()> {
-    let merged = merge_model_discovery(&row.discovery, fresh);
-    db::set_model_discovery(pool, &row.id, &merged).await
+    db::merge_model_discovery(pool, &row.id, &fresh).await
 }
 
 fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a Value> {
@@ -1971,6 +1984,8 @@ pub async fn discover_models(
                     "capabilities": discovered_capabilities(observation),
                     "reasoning_capability": &observation.reasoning,
                     "thinking_map": &observation.thinking_map,
+                    "transport": observation.transport.as_ref().map(|format| json!({ "format": format })),
+                    "transport_source": &observation.transport_source,
                     "capability_sources": &observation.capability_sources,
                     "modalities": &observation.modalities,
                     "prices": &observation.prices,
@@ -2006,6 +2021,8 @@ pub async fn discover_models(
             "capabilities": discovered_capabilities(observation),
             "reasoning_capability": &observation.reasoning,
             "thinking_map": &observation.thinking_map,
+            "transport": &observation.transport,
+            "transport_source": &observation.transport_source,
             "capability_sources": &observation.capability_sources,
             "modalities": &observation.modalities,
             "prices": &observation.prices,
@@ -2514,6 +2531,9 @@ fn model_json(m: &db::ModelRow, providers: &[db::ProviderRow]) -> Value {
         "parameters": m.params(),
         "thinking_map": m.thinking(),
         "extra_request": m.extra_request_value(),
+        "transport_override": serde_json::from_str::<Value>(&m.discovery)
+            .ok()
+            .and_then(|discovery| discovery.get("configured_transport").cloned()),
         // Discovery-suggested values (FR-10.5). Surfaced so an admin can see
         // what the last discovery observed, including models that have since
         // disappeared upstream (flagged, never silently deleted).
@@ -2541,6 +2561,31 @@ pub struct ModelBody {
     pub extra_request: Value,
     #[serde(default)]
     pub discovery: Value,
+    #[serde(default)]
+    pub transport_override: Option<String>,
+}
+
+fn validate_model_transport_override(
+    provider: &db::ProviderRow,
+    transport: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let Some(transport) = transport
+        .map(str::trim)
+        .filter(|transport| !transport.is_empty())
+    else {
+        return Ok(None);
+    };
+    let parsed = crate::adapters::TargetTransport::parse(transport)
+        .ok_or_else(|| ApiError::bad(format!("unsupported model transport '{transport}'")))?;
+    if let Some(reference) = provider.wire_plugin_ref() {
+        let bound = crate::adapters::TargetTransport::Plugin(reference.to_string_ref());
+        if parsed != bound {
+            return Err(ApiError::bad(
+                "model transport override conflicts with the provider's explicit plugin adapter",
+            ));
+        }
+    }
+    Ok(Some(parsed.as_str().to_string()))
 }
 
 fn default_true() -> bool {
@@ -2629,6 +2674,8 @@ pub async fn create_model(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let transport_override =
+        validate_model_transport_override(&provider, body.transport_override.as_deref())?;
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
@@ -2654,6 +2701,9 @@ pub async fn create_model(
     )
     .await
     .map_err(ApiError::internal)?;
+    db::set_model_transport_override(&state.pool, &id, transport_override.as_deref())
+        .await
+        .map_err(ApiError::internal)?;
     let imported_from_discovery = body
         .discovery
         .get("imported_from_discovery")
@@ -2696,6 +2746,16 @@ pub async fn update_model(
     Path(id): Path<String>,
     Json(body): Json<ModelBody>,
 ) -> ApiResult {
+    let model = db::get_model(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("model not found"))?;
+    let provider = db::get_provider(&state.pool, &model.provider_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let transport_override =
+        validate_model_transport_override(&provider, body.transport_override.as_deref())?;
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
@@ -2714,6 +2774,9 @@ pub async fn update_model(
     )
     .await
     .map_err(ApiError::internal)?;
+    db::set_model_transport_override(&state.pool, &id, transport_override.as_deref())
+        .await
+        .map_err(ApiError::internal)?;
     if prices.is_configured() {
         let _ = db::insert_price_version(&state.pool, &id, &prices).await;
     }
@@ -3431,10 +3494,20 @@ pub async fn validate_model_edit(
         &body.prices,
         &body.parameters,
     );
-    let thinking_problems = body.thinking_map.validation_errors();
-    if !thinking_problems.is_empty() {
+    let mut validation_problems = body.thinking_map.validation_errors();
+    if let Some(transport) = body
+        .transport_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|transport| !transport.is_empty())
+    {
+        if crate::adapters::TargetTransport::parse(transport).is_none() {
+            validation_problems.push(format!("unsupported model transport '{transport}'"));
+        }
+    }
+    if !validation_problems.is_empty() {
         if let Some(problems) = out.get_mut("problems").and_then(Value::as_array_mut) {
-            problems.extend(thinking_problems.into_iter().map(Value::String));
+            problems.extend(validation_problems.into_iter().map(Value::String));
         }
         out["valid"] = Value::Bool(false);
     }
@@ -4394,6 +4467,9 @@ pub async fn export_config(
                 "parameters": serde_json::from_str::<Value>(&m.parameters).unwrap_or(json!({})),
                 "thinking_map": serde_json::from_str::<Value>(&m.thinking_map).unwrap_or(json!({})),
                 "extra_request": serde_json::from_str::<Value>(&m.extra_request).unwrap_or(json!({})),
+                "transport_override": serde_json::from_str::<Value>(&m.discovery)
+                    .ok()
+                    .and_then(|discovery| discovery.get("configured_transport").cloned()),
             })
         })
         .collect();
@@ -4662,6 +4738,19 @@ pub async fn import_config(
         if provider.is_empty() || upstream.is_empty() {
             problems.push("a model entry is missing provider or upstream_id".into());
         }
+        if let Some(value) = m.get("transport_override").filter(|value| !value.is_null()) {
+            match value.as_str() {
+                Some(transport)
+                    if transport.trim().is_empty()
+                        || crate::adapters::TargetTransport::parse(transport.trim()).is_some() => {}
+                Some(transport) => problems.push(format!(
+                    "model '{provider}/{upstream}' has unsupported transport override '{transport}'"
+                )),
+                None => problems.push(format!(
+                    "model '{provider}/{upstream}' transport_override must be a string or null"
+                )),
+            }
+        }
         plan.push(
             json!({"kind": "model", "name": format!("{provider}/{upstream}"), "action": "upsert"}),
         );
@@ -4872,8 +4961,7 @@ pub async fn import_config(
         let Some(pid) = provider_ids.get(provider) else {
             continue;
         };
-        let caps: Capabilities =
-            serde_json::from_value(m["capabilities"].clone()).unwrap_or_default();
+        let caps = normalize_model_capabilities(&m["capabilities"]);
         let prices: Prices = serde_json::from_value(m["prices"].clone()).unwrap_or_default();
         let display = m["display_name"].as_str().unwrap_or(upstream);
         let enabled = m["enabled"].as_bool().unwrap_or(true);
@@ -4887,7 +4975,7 @@ pub async fn import_config(
                 enabled,
                 context_window,
                 max_output_tokens,
-                serde_json::to_value(&caps).unwrap(),
+                caps.clone(),
                 serde_json::to_value(&prices).unwrap(),
                 m["parameters"].clone(),
                 m["thinking_map"].clone(),
@@ -4895,6 +4983,13 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::internal)?;
+            let transport_override = m["transport_override"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            db::set_model_transport_override(&state.pool, existing, transport_override)
+                .await
+                .map_err(ApiError::internal)?;
         } else {
             let id = db::insert_model(
                 &state.pool,
@@ -4905,7 +5000,7 @@ pub async fn import_config(
                     enabled,
                     context_window,
                     max_output_tokens,
-                    capabilities: serde_json::to_value(&caps).unwrap(),
+                    capabilities: caps,
                     prices: serde_json::to_value(&prices).unwrap(),
                     parameters: m["parameters"].clone(),
                     thinking_map: m["thinking_map"].clone(),
@@ -4915,6 +5010,13 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::internal)?;
+            let transport_override = m["transport_override"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            db::set_model_transport_override(&state.pool, &id, transport_override)
+                .await
+                .map_err(ApiError::internal)?;
             model_ids.insert(format!("{provider}/{upstream}"), id);
         }
     }
@@ -7491,6 +7593,39 @@ mod reasoning_discovery_control_plane_tests {
     }
 
     #[test]
+    fn discovery_transport_preserves_provider_precedence_and_plugin_fallback() {
+        let provider = discovered_observation(
+            model("transport-model"),
+            Some(json!({"transport":{"format":"openai-responses"}})),
+            Some(json!({
+                "schema_version": 1,
+                "transport": {"format": "anthropic"}
+            })),
+            WireFormat::Plugin,
+        );
+        assert_eq!(provider.transport.as_deref(), Some("openai-responses"));
+        assert_eq!(
+            provider.transport_source.as_deref(),
+            Some("provider_metadata")
+        );
+
+        let plugin = discovered_observation(
+            model("transport-model"),
+            Some(json!({"id": "transport-model"})),
+            Some(json!({
+                "schema_version": 1,
+                "transport": {"format": "anthropic"}
+            })),
+            WireFormat::Plugin,
+        );
+        assert_eq!(plugin.transport.as_deref(), Some("anthropic"));
+        assert_eq!(
+            plugin.transport_source.as_deref(),
+            Some("plugin_capabilities_json")
+        );
+    }
+
+    #[test]
     fn generic_effort_metadata_is_not_executable_on_anthropic_transport() {
         let observation = discovered_observation(
             model("reasoner"),
@@ -7702,7 +7837,7 @@ mod reasoning_discovery_control_plane_tests {
     }
 
     #[test]
-    fn responses_transport_stays_descriptive_on_openai_chat_dispatch() {
+    fn responses_transport_uses_responses_reasoning_mapping() {
         let observation = discovered_observation(
             model("reasoner"),
             Some(json!({"id": "reasoner", "owned_by": "example"})),
@@ -7723,7 +7858,10 @@ mod reasoning_discovery_control_plane_tests {
         let reasoning = observation.reasoning.unwrap();
         assert_eq!(reasoning.upstream_format, "responses_effort");
         assert_eq!(reasoning.default.as_deref(), Some("high"));
-        assert!(observation.thinking_map.is_none());
+        assert_eq!(
+            observation.thinking_map.and_then(|map| map.level_field),
+            Some("reasoning.effort".to_string())
+        );
     }
 
     #[test]
@@ -8398,6 +8536,7 @@ mod reasoning_discovery_control_plane_tests {
                 discovery: json!({
                     "imported_from_discovery": true
                 }),
+                transport_override: None,
             }),
         )
         .await
@@ -8429,6 +8568,7 @@ mod reasoning_discovery_control_plane_tests {
                     "model_type": "decision",
                     "execution_supported": true
                 }),
+                transport_override: None,
             }),
         )
         .await
@@ -8540,6 +8680,7 @@ mod reasoning_discovery_control_plane_tests {
                     "imported_from_discovery": true,
                     "execution_supported": true
                 }),
+                transport_override: None,
             }),
         )
         .await
@@ -9329,6 +9470,39 @@ mod credential_enrollment_regression_tests {
             Some("public"),
         )
         .await;
+        let source_model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &noauth_provider,
+                upstream_id: "mixed-transport-model",
+                display_name: "Mixed Transport Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({"transport":{"format":"anthropic"}}),
+            },
+        )
+        .await
+        .unwrap();
+        db::set_model_transport_override(&source.pool, &source_model_id, Some("openai-responses"))
+            .await
+            .unwrap();
+        let source_model = db::get_model(&source.pool, &source_model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        persist_model_discovery_update(
+            &source.pool,
+            &source_model,
+            json!({"transport":{"format":"gemini"}}),
+        )
+        .await
+        .unwrap();
 
         let encrypted = source.crypto.encrypt("oauth-secret").unwrap();
         db::insert_account(
@@ -9389,9 +9563,13 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .iter()
             .all(|account| account["label"] != "__kinetix_noauth__"));
+        assert_eq!(
+            exported["models"][0]["transport_override"],
+            "openai-responses"
+        );
 
         let (target, target_root) = test_state("export-target").await;
-        import_config(
+        let _ = import_config(
             State(target.clone()),
             auth(),
             Json(ImportBody {
@@ -9430,6 +9608,16 @@ mod credential_enrollment_regression_tests {
         assert_eq!(public.credential_mode, "none");
         assert_eq!(public.source_plugin_id.as_deref(), Some("plugin.public"));
         assert_eq!(public.source_integration_id.as_deref(), Some("public"));
+        let imported_model =
+            db::find_model_by_upstream(&target.pool, &public.id, "mixed-transport-model")
+                .await
+                .unwrap()
+                .unwrap();
+        let imported_discovery: Value = serde_json::from_str(&imported_model.discovery).unwrap();
+        assert_eq!(
+            imported_discovery["configured_transport"],
+            "openai-responses"
+        );
 
         let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
             .await

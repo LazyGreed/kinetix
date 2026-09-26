@@ -135,6 +135,8 @@ export function mapModel(j: any): ModelConfig {
     parameters: (j.parameters && typeof j.parameters === 'object'
       ? j.parameters
       : {}) as ModelConfig['parameters'],
+    transportOverride:
+      typeof j.transport_override === 'string' ? j.transport_override : null,
     thinkingMap: {
       levels: thinkingLevels,
       mode:

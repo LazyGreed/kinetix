@@ -6,22 +6,31 @@ presets** — nothing is assumed about a vendor.
 
 ## Wire formats
 
-Kinetix has three outbound adapters, selected by the provider's configured
-`wire_format` (not by vendor):
+Provider `wire_format` supplies the default outbound transport (not a vendor identity):
 
 | `wire_format` | Upstream protocol | Default models path |
 | --- | --- | --- |
 | `openai` | OpenAI-compatible `/chat/completions` (streaming) | `/models` |
 | `anthropic` | Anthropic `/messages` (streaming) | `/models` |
 | `gemini` | Gemini `:streamGenerateContent?alt=sse` | `/models` |
+| model transport `openai-responses` | OpenAI Responses `/responses` (streaming) | `/models` |
 
 Providers can also bind to external WebAssembly plugin adapters via `wire_plugin` (e.g. `plugin:dev.kinetix.antigravity-oauth/antigravity`).
 For these providers, set `wire_format = "plugin"`; the concrete adapter identity comes from the namespaced `wire_plugin` reference, not from a vendor-specific core wire enum.
 
-Inbound formats are OpenAI Chat Completions and Anthropic Messages. When inbound
-and outbound formats match, Kinetix uses **same-format passthrough** and forwards
-the client body byte-for-byte (preserving unknown/vendor fields) while extracting
-usage.
+A model's effective transport is resolved per selected target in this order:
+operator `transport_override` > discovered `discovery.transport.format` >
+provider `wire_format`. Existing models without an override or observation keep
+the provider default. Supported values are `openai`, `openai-responses`,
+`anthropic`, `gemini`, and a namespaced `plugin:<id>/<adapter>` reference.
+Rediscovery updates observed metadata without replacing the operator override.
+
+Inbound formats include OpenAI Chat, OpenAI Responses, and Anthropic Messages.
+OpenAI Chat and Anthropic same-format requests use passthrough when their
+outbound transport matches. Responses requests are re-encoded from Kinetix's
+canonical representation and may use the native Responses adapter at
+`/responses`; only the explicitly supported subset is preserved, and unsupported
+response-object/storage semantics continue to fail closed.
 
 ## Auth schemes
 
@@ -38,7 +47,8 @@ usage.
 
 - **Capabilities** (`text`, `vision`, `reasoning`, `tool_calling`, `audio`) drive
   strict-provider filtering and are surfaced in `GET /v1/models`. Unconfigured
-  metadata is treated as unknown, not assumed false.
+  metadata is treated as unknown, not assumed false; strict checks reject only
+  explicitly unsupported capabilities.
 - **Parameters** (`temperature`, `top_p`, `top_k`, …) each carry a policy
   (`forward` / `clamp` / `reject` / `drop`) and optional min/max/default. A
   configured default is applied when the client omits the field; a client value
@@ -63,7 +73,10 @@ weight, an optional soft quota, and a quota type (`none` / `daily` / `monthly` /
 `POST /admin/api/providers/{id}/discover` (or the dashboard's **Fetch Models**)
 lists the upstream's models and flags already-imported and disappeared ones.
 Discovery **never overwrites admin edits** and never silently deletes a model
-(FR-10.5); it records a per-model observation in the `discovery` column.
+(FR-10.5); it records a per-model observation in the `discovery` column. If a
+model-source plugin reports `{"transport":{"format":"openai-responses"}}`,
+that observed transport participates in per-target execution unless an operator
+`transport_override` is configured.
 
 ## Outbound security (SSRF / TLS / redirects)
 

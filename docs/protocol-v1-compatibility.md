@@ -72,18 +72,19 @@ not a claim that every field of every upstream vendor API is implemented.
 
 | Field / behavior | Native / same-format | Translated / other path | Contract | Evidence |
 |---|---|---|---|---|
-| model | required | translated | Responses is an explicit translated subset; there is no native Responses passthrough. | `responses.translate.openai.sync`<br>`responses.translate.gemini.sync`<br>`responses.translate.anthropic.sync` |
-| input string / message items | n/a | translated | Text and message items map to canonical messages. | `responses.input.variants` |
-| input_image URL/data URL | n/a | translated | Vision input is supported. | `responses.image.variants` |
-| instructions | n/a | translated | Text instructions map to canonical system prompts. | `responses.translate.openai.sync`<br>`responses.translate.gemini.sync`<br>`responses.translate.anthropic.sync` |
-| function tools / function_call / function_call_output | n/a | translated | Custom function tools and tool history/results are supported. | `responses.translate.openai.sync`<br>`responses.translate.openai.tool_continuation` |
+| model / outbound transport | required | translated | A target may resolve to the native Responses adapter at POST /responses; supported fields are re-encoded from canonical state, not raw-forwarded. | `responses.native.openai.sync`<br>`responses.translate.openai.sync`<br>`responses.translate.gemini.sync`<br>`responses.translate.anthropic.sync` |
+| input string / message items | Responses-native encoding | translated | Supported text and message items map through canonical messages and are encoded using the selected target dialect. | `responses.input.variants`<br>`responses.native.openai.sync` |
+| input_image URL/data URL | Responses-native encoding | translated | Supported image input maps through canonical vision parts. | `responses.image.variants`<br>`responses.native.openai.sync` |
+| instructions | Responses-native instructions | translated | Text instructions map through canonical system prompts. | `responses.native.openai.sync`<br>`responses.translate.openai.sync`<br>`responses.translate.gemini.sync`<br>`responses.translate.anthropic.sync` |
+| function tools / function_call / function_call_output | Responses-native function items | translated | Custom function tools and supported tool history/results use Responses function-call items. | `responses.native.openai.sync`<br>`responses.translate.openai.sync`<br>`responses.translate.openai.tool_continuation` |
 | tool_choice auto/none/required/named function | n/a | translated | Other tool-choice semantics are rejected. | `responses.tool_choice.variants` |
 | parallel tool calls from upstream | n/a | translated | Distinct tool ids are retained; request field parallel_tool_calls is not enforceable and is rejected. | `responses.translate.anthropic.parallel_tools` |
-| temperature / top_p / top_k / max_output_tokens / penalties | n/a | translated subject to target capability; penalties are asserted on OpenAI-compatible translation | The executable fixture sends every listed field and the synthetic OpenAI upstream rejects if any are dropped. | `responses.translate.openai.sync` |
-| reasoning.effort / reasoning_effort | n/a | translated only with model thinking_map | Reasoning summary/output semantics are not implemented. | `responses.translate.openai.sync`<br>`responses.translate.gemini.sync`<br>`responses.translate.anthropic.sync` |
-| prompt_cache_key | n/a | portable hint where target supports it | Preserved as a canonical extension. | `responses.translate.openai.sync` |
-| stream false / true | n/a | translated | Stream lifecycle terminates with response.completed; no Chat [DONE]. | `responses.translate.openai.sync`<br>`responses.translate.openai.stream`<br>`responses.translate.gemini.sync`<br>`responses.translate.gemini.stream`<br>`responses.translate.anthropic.sync`<br>`responses.translate.anthropic.stream` |
-| store:true / background:true | n/a | rejected (422) | Kinetix has no Responses object store/background execution. | `responses.supported_options`<br>`responses.unsupported_fields.reject` |
+| temperature / top_p / max_output_tokens | forwarded when model parameter policy allows | translated subject to target capability | Responses-native requests preserve supported fields; model parameter bounds/defaults still apply. | `responses.native.openai.sync`<br>`responses.translate.openai.sync` |
+| top_k / stop / seed / presence_penalty / frequency_penalty | rejected | translated only where supported | Unsupported native Responses parameters fail rather than being silently dropped. | `responses.native.unsupported_parameters`<br>`responses.translate.openai.sync` |
+| reasoning.effort / reasoning_effort | mapped to reasoning.effort only with executable model thinking_map | translated only with model thinking_map | Reasoning summary/output semantics are not implemented. | `responses.native.openai.sync`<br>`responses.translate.openai.sync`<br>`responses.translate.gemini.sync`<br>`responses.translate.anthropic.sync` |
+| prompt_cache_key | preserved | portable hint where target supports it | Preserved as a canonical extension. | `responses.native.openai.sync`<br>`responses.translate.openai.sync` |
+| stream false / true | native Responses SSE + canonical aggregation | translated | Client-facing lifecycle terminates with response.completed; no Chat [DONE]. | `responses.native.openai.sync`<br>`responses.native.openai.stream`<br>`responses.translate.openai.sync`<br>`responses.translate.openai.stream`<br>`responses.translate.gemini.sync`<br>`responses.translate.gemini.stream`<br>`responses.translate.anthropic.sync`<br>`responses.translate.anthropic.stream` |
+| store:true / background:true | rejected (422) | rejected (422) | Kinetix has no Responses object store/background execution; native calls explicitly disable storage. | `responses.supported_options`<br>`responses.unsupported_fields.reject`<br>`responses.native.openai.sync` |
 | include expansions | n/a | only empty array accepted | Non-empty include is rejected. | `responses.supported_options`<br>`responses.unsupported_fields.reject` |
 | text.format | n/a | only {type:"text"} accepted | Structured output formats are rejected. | `responses.supported_options`<br>`responses.unsupported_fields.reject` |
 | truncation | n/a | only "disabled" accepted | Automatic truncation is not implemented. | `responses.supported_options`<br>`responses.unsupported_fields.reject` |
@@ -127,6 +128,9 @@ not a claim that every field of every upstream vendor API is implemented.
 | `messages.translate.openai.stream` | http | messages translated OpenAI-compatible streaming path preserves terminal, usage and tool identity semantics |
 | `responses.translate.openai.sync` | http | responses translated OpenAI-compatible synchronous path preserves documented request/response semantics |
 | `responses.translate.openai.stream` | http | responses translated OpenAI-compatible streaming path preserves terminal, usage and tool identity semantics |
+| `responses.native.openai.sync` | cargo | Native Responses adapter pairs the Responses body dialect with POST /responses |
+| `responses.native.openai.stream` | cargo | Native Responses SSE events normalize text, tool calls, usage and terminal reason |
+| `responses.native.unsupported_parameters` | cargo | Unsupported Responses transport parameters fail closed rather than being dropped |
 | `responses.translate.gemini.sync` | http | responses translated Gemini synchronous path preserves documented request/response semantics |
 | `responses.translate.gemini.stream` | http | responses translated Gemini streaming path preserves terminal, usage and tool identity semantics |
 | `responses.translate.anthropic.sync` | http | responses translated Anthropic synchronous path preserves documented request/response semantics |

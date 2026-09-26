@@ -74,6 +74,21 @@
       "summary": "responses translated OpenAI-compatible streaming path preserves terminal, usage and tool identity semantics"
     },
     {
+      "id": "responses.native.openai.sync",
+      "runner": "cargo",
+      "summary": "Native Responses adapter pairs the Responses body dialect with POST /responses"
+    },
+    {
+      "id": "responses.native.openai.stream",
+      "runner": "cargo",
+      "summary": "Native Responses SSE events normalize text, tool calls, usage and terminal reason"
+    },
+    {
+      "id": "responses.native.unsupported_parameters",
+      "runner": "cargo",
+      "summary": "Unsupported Responses transport parameters fail closed rather than being dropped"
+    },
+    {
       "id": "responses.translate.gemini.sync",
       "runner": "http",
       "summary": "responses translated Gemini synchronous path preserves documented request/response semantics"
@@ -694,11 +709,12 @@
       "endpoint": "POST /v1/responses",
       "rows": [
         [
-          "model",
+          "model / outbound transport",
           "required",
           "translated",
-          "Responses is an explicit translated subset; there is no native Responses passthrough.",
+          "A target may resolve to the native Responses adapter at POST /responses; supported fields are re-encoded from canonical state, not raw-forwarded.",
           [
+            "responses.native.openai.sync",
             "responses.translate.openai.sync",
             "responses.translate.gemini.sync",
             "responses.translate.anthropic.sync"
@@ -706,28 +722,31 @@
         ],
         [
           "input string / message items",
-          "n/a",
+          "Responses-native encoding",
           "translated",
-          "Text and message items map to canonical messages.",
+          "Supported text and message items map through canonical messages and are encoded using the selected target dialect.",
           [
-            "responses.input.variants"
+            "responses.input.variants",
+            "responses.native.openai.sync"
           ]
         ],
         [
           "input_image URL/data URL",
-          "n/a",
+          "Responses-native encoding",
           "translated",
-          "Vision input is supported.",
+          "Supported image input maps through canonical vision parts.",
           [
-            "responses.image.variants"
+            "responses.image.variants",
+            "responses.native.openai.sync"
           ]
         ],
         [
           "instructions",
-          "n/a",
+          "Responses-native instructions",
           "translated",
-          "Text instructions map to canonical system prompts.",
+          "Text instructions map through canonical system prompts.",
           [
+            "responses.native.openai.sync",
             "responses.translate.openai.sync",
             "responses.translate.gemini.sync",
             "responses.translate.anthropic.sync"
@@ -735,10 +754,11 @@
         ],
         [
           "function tools / function_call / function_call_output",
-          "n/a",
+          "Responses-native function items",
           "translated",
-          "Custom function tools and tool history/results are supported.",
+          "Custom function tools and supported tool history/results use Responses function-call items.",
           [
+            "responses.native.openai.sync",
             "responses.translate.openai.sync",
             "responses.translate.openai.tool_continuation"
           ]
@@ -762,20 +782,32 @@
           ]
         ],
         [
-          "temperature / top_p / top_k / max_output_tokens / penalties",
-          "n/a",
-          "translated subject to target capability; penalties are asserted on OpenAI-compatible translation",
-          "The executable fixture sends every listed field and the synthetic OpenAI upstream rejects if any are dropped.",
+          "temperature / top_p / max_output_tokens",
+          "forwarded when model parameter policy allows",
+          "translated subject to target capability",
+          "Responses-native requests preserve supported fields; model parameter bounds/defaults still apply.",
           [
+            "responses.native.openai.sync",
+            "responses.translate.openai.sync"
+          ]
+        ],
+        [
+          "top_k / stop / seed / presence_penalty / frequency_penalty",
+          "rejected",
+          "translated only where supported",
+          "Unsupported native Responses parameters fail rather than being silently dropped.",
+          [
+            "responses.native.unsupported_parameters",
             "responses.translate.openai.sync"
           ]
         ],
         [
           "reasoning.effort / reasoning_effort",
-          "n/a",
+          "mapped to reasoning.effort only with executable model thinking_map",
           "translated only with model thinking_map",
           "Reasoning summary/output semantics are not implemented.",
           [
+            "responses.native.openai.sync",
             "responses.translate.openai.sync",
             "responses.translate.gemini.sync",
             "responses.translate.anthropic.sync"
@@ -783,19 +815,22 @@
         ],
         [
           "prompt_cache_key",
-          "n/a",
+          "preserved",
           "portable hint where target supports it",
           "Preserved as a canonical extension.",
           [
+            "responses.native.openai.sync",
             "responses.translate.openai.sync"
           ]
         ],
         [
           "stream false / true",
-          "n/a",
+          "native Responses SSE + canonical aggregation",
           "translated",
-          "Stream lifecycle terminates with response.completed; no Chat [DONE].",
+          "Client-facing lifecycle terminates with response.completed; no Chat [DONE].",
           [
+            "responses.native.openai.sync",
+            "responses.native.openai.stream",
             "responses.translate.openai.sync",
             "responses.translate.openai.stream",
             "responses.translate.gemini.sync",
@@ -806,12 +841,13 @@
         ],
         [
           "store:true / background:true",
-          "n/a",
           "rejected (422)",
-          "Kinetix has no Responses object store/background execution.",
+          "rejected (422)",
+          "Kinetix has no Responses object store/background execution; native calls explicitly disable storage.",
           [
             "responses.supported_options",
-            "responses.unsupported_fields.reject"
+            "responses.unsupported_fields.reject",
+            "responses.native.openai.sync"
           ]
         ],
         [

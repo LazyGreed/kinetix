@@ -33,6 +33,9 @@ pub struct TraceStep {
     pub predicate: Option<String>,
     /// Why the candidate was skipped, or the attempt outcome.
     pub detail: String,
+    /// Transport resolved for this target attempt (admin/internal metadata).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_transport: Option<String>,
     /// Wall-clock offset from request start.
     pub elapsed_ms: u64,
 }
@@ -110,6 +113,19 @@ impl RouteTrace {
             eligible: None,
             predicate: None,
             detail: detail.into(),
+            resolved_transport: None,
+            elapsed_ms: self.started.elapsed().as_millis() as u64,
+        });
+    }
+
+    pub fn resolved_transport(&mut self, target: impl Into<String>, transport: &str) {
+        self.steps.push(TraceStep {
+            stage: "attempt".into(),
+            target: Some(target.into()),
+            eligible: None,
+            predicate: None,
+            detail: "target execution profile resolved".into(),
+            resolved_transport: Some(transport.to_string()),
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -127,6 +143,7 @@ impl RouteTrace {
             eligible: Some(eligible),
             predicate,
             detail: detail.into(),
+            resolved_transport: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -139,6 +156,7 @@ impl RouteTrace {
             eligible: None,
             predicate: None,
             detail: w.clone(),
+            resolved_transport: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
         self.warnings.push(w);
@@ -171,6 +189,7 @@ impl RouteTrace {
             eligible: None,
             predicate: None,
             detail: format!("= {value}"),
+            resolved_transport: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -187,6 +206,7 @@ impl RouteTrace {
             eligible: None,
             predicate: Some("unknown".into()),
             detail: format!("fact provider failed: {reason}"),
+            resolved_transport: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -309,6 +329,16 @@ impl Default for FlightRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_trace_serializes_resolved_transport_per_attempt() {
+        let mut trace = RouteTrace::new("req-1".into(), "model".into());
+        trace.resolved_transport("model-a", "openai-responses");
+        let value: serde_json::Value = serde_json::from_str(&trace.steps_json()).unwrap();
+        assert_eq!(value[0]["stage"], "attempt");
+        assert_eq!(value[0]["resolved_transport"], "openai-responses");
+        assert_eq!(value[0]["target"], "model-a");
+    }
 
     #[test]
     fn flight_recorder_is_bounded() {

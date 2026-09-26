@@ -50,8 +50,8 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | Method & path | Purpose |
 | --- | --- |
 | `GET /admin/api/models` | List (all providers). |
-| `POST /admin/api/providers/{id}/models` | Create a model for a provider. |
-| `PUT /admin/api/models/{id}` | Update. |
+| `POST /admin/api/providers/{id}/models` | Create a model for a provider. Optional `transport_override` selects `openai`, `openai-responses`, `anthropic`, `gemini`, or a `plugin:<id>/<adapter>` reference; omit/null to use discovered transport, then provider default. |
+| `PUT /admin/api/models/{id}` | Update, including optional `transport_override`. |
 | `DELETE /admin/api/models/{id}` | Delete. |
 
 ## Accounts
@@ -96,7 +96,7 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | Method & path | Purpose |
 | --- | --- |
 | `GET /admin/api/config/export` | Export portable config (secret-free; `?include_secrets=true` adds encrypted blobs). |
-| `POST /admin/api/config/import` | Two-phase: `apply:false` = Validate/Dry Run (no writes); `apply:true` = upsert by name. |
+| `POST /admin/api/config/import` | Two-phase: `apply:false` = Validate/Dry Run (no writes); `apply:true` = upsert by name. Model `transport_override` values round-trip through export/import. |
 
 ## Usage, requests, traces
 

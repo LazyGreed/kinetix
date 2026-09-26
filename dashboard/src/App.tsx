@@ -360,6 +360,7 @@ export default function App() {
       Kinetix.createModel(model.providerId, {
         upstream_id: model.upstreamModelId,
         display_name: model.displayName,
+        transport_override: model.transportOverride ?? null,
         enabled: model.enabled,
         context_window: model.contextWindow,
         max_output_tokens: model.maxOutputTokens,
@@ -389,6 +390,7 @@ export default function App() {
       Kinetix.updateModel(model.id, {
         upstream_id: model.upstreamModelId,
         display_name: model.displayName,
+        transport_override: model.transportOverride ?? null,
         enabled: model.enabled,
         context_window: model.contextWindow,
         max_output_tokens: model.maxOutputTokens,

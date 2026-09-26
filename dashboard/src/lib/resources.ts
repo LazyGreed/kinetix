@@ -56,6 +56,8 @@ export interface DiscoveredModel {
   } | null;
   reasoning_capability?: DiscoveredReasoningCapability | null;
   thinking_map?: DiscoveredThinkingMap | null;
+  transport?: string | null;
+  transport_source?: string | null;
   capability_sources?: Record<string, string | null> | null;
   modalities?: {
     input?: string[] | null;

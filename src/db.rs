@@ -899,6 +899,77 @@ pub async fn set_model_discovery(pool: &Pool, id: &str, discovery: &Value) -> Re
     Ok(())
 }
 
+/// Atomically merge observed discovery fields into the model metadata object.
+/// The operator-owned `configured_transport` key is never touched by this
+/// operation, even if an admin update races with model rediscovery.
+pub async fn merge_model_discovery(pool: &Pool, id: &str, fresh: &Value) -> Result<()> {
+    let Some(fields) = fresh.as_object() else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Ok(());
+    }
+
+    let base = "CASE WHEN json_valid(discovery) THEN CASE \
+        WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END \
+        ELSE '{}' END";
+    let mut expression = format!("json_set({base}");
+    for _ in fields {
+        expression.push_str(", '$.' || ?, json(?)");
+    }
+    expression.push(')');
+    if fresh.get("disappeared").and_then(Value::as_bool) == Some(false) {
+        expression = format!("json_remove({expression}, '$.flagged_at')");
+    }
+    let sql = format!("UPDATE models SET discovery = {expression} WHERE id = ?");
+    let mut query = sqlx::query(&sql);
+    for (key, value) in fields {
+        query = query.bind(key).bind(value.to_string());
+    }
+    query.bind(id).execute(pool).await?;
+    Ok(())
+}
+
+/// Set the operator-owned model transport override in the existing discovery
+/// metadata envelope. Rediscovery merges observed fields and leaves this key
+/// untouched, keeping operator configuration authoritative without duplicating
+/// the model provenance schema.
+pub async fn set_model_transport_override(
+    pool: &Pool,
+    id: &str,
+    transport: Option<&str>,
+) -> Result<()> {
+    // Update only the operator-owned JSON key atomically. Rediscovery may merge
+    // observed metadata concurrently, but can neither overwrite this override
+    // nor lose its own unrelated fields through a read/modify/write race.
+    match transport {
+        Some(transport) => {
+            sqlx::query(
+                "UPDATE models SET discovery = json_set(\
+                    CASE WHEN json_valid(discovery) THEN \
+                        CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END \
+                    ELSE '{}' END, '$.configured_transport', ?) WHERE id = ?",
+            )
+            .bind(transport)
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "UPDATE models SET discovery = json_remove(\
+                    CASE WHEN json_valid(discovery) THEN \
+                        CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END \
+                    ELSE '{}' END, '$.configured_transport') WHERE id = ?",
+            )
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn set_model_opaque_state_plugin(pool: &Pool, id: &str, plugin_id: &str) -> Result<()> {
     sqlx::query("UPDATE models SET opaque_state_plugin=? WHERE id=?")
         .bind(plugin_id)

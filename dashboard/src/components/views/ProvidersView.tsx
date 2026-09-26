@@ -128,6 +128,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   // New Custom Model Form State
   const [modelUpstreamId, setModelUpstreamId] = useState('');
   const [modelDisplayName, setModelDisplayName] = useState('');
+  const [modelTransportOverride, setModelTransportOverride] = useState('');
   const [modelContextWindow, setModelContextWindow] = useState(DEFAULT_CONTEXT_WINDOW);
   const [modelMaxOutput, setModelMaxOutput] = useState(DEFAULT_MAX_OUTPUT);
   const [modelInputPrice, setModelInputPrice] = useState<number | null>(1.0);
@@ -274,6 +275,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         capabilities: m.capabilities || {},
         reasoning_capability: m.reasoning_capability || null,
         thinking_map: m.thinking_map || null,
+        transport: m.transport ? { format: m.transport } : null,
+        transport_source: m.transport_source || null,
         capability_sources: m.capability_sources || {},
         modalities: m.modalities || null,
         prices: m.prices || null,
@@ -492,6 +495,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setEditingModelId(m.id);
     setModelUpstreamId(m.upstreamModelId);
     setModelDisplayName(m.displayName);
+    setModelTransportOverride(m.transportOverride || '');
     setModelContextWindow(m.contextWindow ?? 0);
     setModelMaxOutput(m.maxOutputTokens ?? 0);
     setModelInputPrice(m.prices.inputPer1M);
@@ -524,6 +528,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setEditingModelId(null);
     setModelUpstreamId('');
     setModelDisplayName('');
+    setModelTransportOverride('');
     setModelContextWindow(DEFAULT_CONTEXT_WINDOW);
     setModelMaxOutput(DEFAULT_MAX_OUTPUT);
     setModelInputPrice(1.0);
@@ -566,6 +571,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       providerName: activeProvider.name,
       upstreamModelId: modelUpstreamId.trim(),
       displayName: modelDisplayName.trim() || modelUpstreamId.trim(),
+      transportOverride: modelTransportOverride.trim() || null,
       enabled: editingModel?.enabled ?? true,
       contextWindow:
         Number(modelContextWindow) || (editingModelId ? null : DEFAULT_CONTEXT_WINDOW),
@@ -607,6 +613,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     return {
       upstream_id: modelUpstreamId.trim(),
       display_name: modelDisplayName.trim() || modelUpstreamId.trim(),
+      transport_override: modelTransportOverride.trim() || null,
       enabled: true,
       context_window:
         Number(modelContextWindow) || (editingModelId ? null : DEFAULT_CONTEXT_WINDOW),
@@ -922,6 +929,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         ) : null}
                         {m.context_window ? (
                           <span className="text-[var(--ink)]/50">{m.context_window.toLocaleString()} ctx</span>
+                        ) : null}
+                        {m.transport ? (
+                          <span className="text-[var(--pen-blue)]">transport: {m.transport}</span>
                         ) : null}
                         {m.reasoning_capability ? (
                           <span className="text-[var(--pen-blue)]">
@@ -1506,6 +1516,23 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base font-mono sketch-shadow-sm focus:outline-none"
                     style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
                   />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Execution Transport Override
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="leave blank for discovery/provider default"
+                    value={modelTransportOverride}
+                    onChange={(e) => setModelTransportOverride(e.target.value)}
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base font-mono sketch-shadow-sm focus:outline-none"
+                    style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+                  />
+                  <p className="text-xs font-body text-[var(--ink)]/60 mt-1">
+                    Use openai, openai-responses, anthropic, gemini, or a plugin:&lt;id&gt;/&lt;adapter&gt; reference. Blank keeps discovery/provider defaults.
+                  </p>
                 </div>
 
                 <div>
