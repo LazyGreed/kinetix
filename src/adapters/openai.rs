@@ -178,7 +178,7 @@ impl OpenAiAdapter {
     }
 }
 
-fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
+pub(super) fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
     let parts: Vec<&str> = path.split('.').collect();
     insert_dotted_rec(obj, &parts, value);
 }

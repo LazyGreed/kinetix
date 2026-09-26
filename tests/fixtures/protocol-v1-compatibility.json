@@ -79,9 +79,24 @@
       "summary": "Native Responses adapter pairs the Responses body dialect with POST /responses"
     },
     {
+      "id": "responses.native.openai.passthrough",
+      "runner": "cargo",
+      "summary": "Responses API end-to-end preserves validated raw fields while rewriting model, store and endpoint"
+    },
+    {
       "id": "responses.native.openai.stream",
       "runner": "cargo",
       "summary": "Native Responses SSE events normalize text, tool calls, usage and terminal reason"
+    },
+    {
+      "id": "responses.native.openai.refusal",
+      "runner": "cargo",
+      "summary": "Native Responses refusal objects and refusal.delta events preserve refusal text"
+    },
+    {
+      "id": "responses.native.openai.incomplete",
+      "runner": "cargo",
+      "summary": "Native response.incomplete events preserve usage and classify the terminal reason"
     },
     {
       "id": "responses.native.unsupported_parameters",
@@ -712,9 +727,10 @@
           "model / outbound transport",
           "required",
           "translated",
-          "A target may resolve to the native Responses adapter at POST /responses; supported fields are re-encoded from canonical state, not raw-forwarded.",
+          "Validated Responses-to-Responses requests use raw passthrough to preserve same-format semantics; cross-format requests are re-encoded from canonical state.",
           [
             "responses.native.openai.sync",
+            "responses.native.openai.passthrough",
             "responses.translate.openai.sync",
             "responses.translate.gemini.sync",
             "responses.translate.anthropic.sync"
@@ -724,10 +740,11 @@
           "input string / message items",
           "Responses-native encoding",
           "translated",
-          "Supported text and message items map through canonical messages and are encoded using the selected target dialect.",
+          "Same-format Responses requests preserve validated input items; cross-format requests map through canonical messages and the selected target dialect.",
           [
             "responses.input.variants",
-            "responses.native.openai.sync"
+            "responses.native.openai.sync",
+            "responses.native.openai.passthrough"
           ]
         ],
         [
@@ -827,16 +844,28 @@
           "stream false / true",
           "native Responses SSE + canonical aggregation",
           "translated",
-          "Client-facing lifecycle terminates with response.completed; no Chat [DONE].",
+          "Responses passthrough preserves native response.completed/response.incomplete events; aggregation emits response.completed. No Chat [DONE]. Incomplete events retain usage and terminal classification.",
           [
             "responses.native.openai.sync",
             "responses.native.openai.stream",
+            "responses.native.openai.incomplete",
             "responses.translate.openai.sync",
             "responses.translate.openai.stream",
             "responses.translate.gemini.sync",
             "responses.translate.gemini.stream",
             "responses.translate.anthropic.sync",
             "responses.translate.anthropic.stream"
+          ]
+        ],
+        [
+          "refusal content / response.refusal.delta",
+          "preserved in native refusal item/event",
+          "normalized to canonical text",
+          "Responses passthrough preserves native refusal semantics; translated adapters retain user-visible refusal text through the canonical output path.",
+          [
+            "responses.native.openai.refusal",
+            "responses.native.openai.stream",
+            "responses.native.openai.passthrough"
           ]
         ],
         [

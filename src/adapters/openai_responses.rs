@@ -249,14 +249,13 @@ impl OpenAiResponsesAdapter {
                 Some("message") => {
                     if let Some(content) = item.get("content").and_then(Value::as_array) {
                         for part in content {
-                            if let Some("output_text" | "refusal") =
-                                part.get("type").and_then(Value::as_str)
-                            {
-                                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                    if !text.is_empty() {
-                                        events.push(StreamEvent::TextDelta(text.to_string()));
-                                    }
-                                }
+                            let text = match part.get("type").and_then(Value::as_str) {
+                                Some("output_text") => part.get("text").and_then(Value::as_str),
+                                Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                                _ => None,
+                            };
+                            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                                events.push(StreamEvent::TextDelta(text.to_string()));
                             }
                         }
                     }
@@ -304,21 +303,22 @@ impl OpenAiResponsesAdapter {
         events
     }
 
-    fn response_events(response: &Value) -> Vec<StreamEvent> {
-        let mut events = Vec::new();
-        if let Some(output) = response.get("output").and_then(Value::as_array) {
-            events.extend(Self::output_events(output));
-        }
-        if let Some(usage) = Self::usage(response) {
-            events.push(StreamEvent::Usage(usage));
-        }
-        let finish = if response
+    fn finish_reason(response: &Value, incomplete_event: bool) -> FinishReason {
+        let incomplete_reason = response
             .pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-            == Some("max_output_tokens")
+            .and_then(Value::as_str);
+        if incomplete_event
+            || response.get("status").and_then(Value::as_str) == Some("incomplete")
+            || incomplete_reason.is_some()
         {
-            FinishReason::Length
-        } else if response
+            return match incomplete_reason {
+                Some("max_output_tokens") => FinishReason::Length,
+                Some("content_filter") => FinishReason::ContentFilter,
+                Some(reason) => FinishReason::Other(reason.to_string()),
+                None => FinishReason::Other("incomplete".to_string()),
+            };
+        }
+        if response
             .get("output")
             .and_then(Value::as_array)
             .is_some_and(|items| {
@@ -330,39 +330,28 @@ impl OpenAiResponsesAdapter {
             FinishReason::ToolCalls
         } else {
             FinishReason::Stop
-        };
-        events.push(StreamEvent::Finish(finish));
+        }
+    }
+
+    fn terminal_events(response: &Value, incomplete_event: bool) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        if let Some(usage) = Self::usage(response) {
+            events.push(StreamEvent::Usage(usage));
+        }
+        events.push(StreamEvent::Finish(Self::finish_reason(
+            response,
+            incomplete_event,
+        )));
         events
     }
 
-    fn insert_dotted(body: &mut Map<String, Value>, path: &str, value: Value) {
-        let mut parts = path.split('.').peekable();
-        let Some(first) = parts.next() else {
-            return;
-        };
-        let mut current = body.entry(first.to_string()).or_insert_with(|| json!({}));
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                if !current.is_object() {
-                    *current = json!({});
-                }
-                if let Some(object) = current.as_object_mut() {
-                    object.insert(part.to_string(), value);
-                }
-                return;
-            }
-            if !current.is_object() {
-                *current = json!({});
-            }
-            current = current
-                .as_object_mut()
-                .expect("object was created")
-                .entry(part.to_string())
-                .or_insert_with(|| json!({}));
+    fn response_events(response: &Value) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            events.extend(Self::output_events(output));
         }
-        if let Some(object) = current.as_object_mut() {
-            object.insert("effort".to_string(), value);
-        }
+        events.extend(Self::terminal_events(response, false));
+        events
     }
 }
 
@@ -507,10 +496,14 @@ impl Adapter for OpenAiResponsesAdapter {
             if let Some(value) = thinking.levels.get(key) {
                 if let Some(fields) = value.as_object() {
                     for (path, field_value) in fields {
-                        Self::insert_dotted(&mut body, path, field_value.clone());
+                        crate::adapters::openai::insert_dotted(
+                            &mut body,
+                            path,
+                            field_value.clone(),
+                        );
                     }
                 } else if let Some(field) = thinking.scalar_field() {
-                    Self::insert_dotted(&mut body, field, value.clone());
+                    crate::adapters::openai::insert_dotted(&mut body, field, value.clone());
                 }
             }
         }
@@ -550,6 +543,12 @@ impl Adapter for OpenAiResponsesAdapter {
             .unwrap_or_default();
         match event_type {
             "response.output_text.delta" => Ok(value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+                .map(|delta| vec![StreamEvent::TextDelta(delta.to_string())])
+                .unwrap_or_default()),
+            "response.refusal.delta" => Ok(value
                 .get("delta")
                 .and_then(Value::as_str)
                 .filter(|delta| !delta.is_empty())
@@ -603,33 +602,12 @@ impl Adapter for OpenAiResponsesAdapter {
                     }]
                 })
                 .unwrap_or_default()),
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 let response = value.get("response").unwrap_or(&value);
-                let mut events = Vec::new();
-                if let Some(usage) = Self::usage(response) {
-                    events.push(StreamEvent::Usage(usage));
-                }
-                let finish = if response
-                    .pointer("/incomplete_details/reason")
-                    .and_then(Value::as_str)
-                    == Some("max_output_tokens")
-                {
-                    FinishReason::Length
-                } else if response
-                    .get("output")
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.get("type").and_then(Value::as_str) == Some("function_call")
-                        })
-                    })
-                {
-                    FinishReason::ToolCalls
-                } else {
-                    FinishReason::Stop
-                };
-                events.push(StreamEvent::Finish(finish));
-                Ok(events)
+                Ok(Self::terminal_events(
+                    response,
+                    event_type == "response.incomplete",
+                ))
             }
             "response.failed" | "error" => {
                 let message = value
@@ -842,5 +820,96 @@ mod tests {
         let mut req = request();
         req.params.seed = Some(123);
         assert!(OpenAiResponsesAdapter.build_body(&ctx, &req).is_err());
+    }
+
+    #[test]
+    fn configured_single_field_thinking_mapping_stays_scalar() {
+        let provider = provider();
+        let mut model = model();
+        model.thinking_map = json!({
+            "levels": {"high": "high"},
+            "mode": "level",
+            "level_field": "reasoning_effort"
+        })
+        .to_string();
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: None,
+            credential: "secret".into(),
+        };
+        let mut req = request();
+        req.thinking = Some(ThinkingLevel::High);
+        let body = OpenAiResponsesAdapter.build_body(&ctx, &req).unwrap();
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn full_responses_refusal_content_is_emitted_as_text() {
+        let events = OpenAiResponsesAdapter
+            .parse_full_response(&json!({
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "I cannot help with that."}]
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 6}
+            }))
+            .unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, StreamEvent::TextDelta(text) if text == "I cannot help with that.")
+        ));
+    }
+
+    #[test]
+    fn streamed_responses_refusal_delta_is_emitted_as_text() {
+        let events = OpenAiResponsesAdapter
+            .parse_stream_chunk(
+                r#"{"type":"response.refusal.delta","delta":"I cannot help with that."}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::TextDelta(text)] if text == "I cannot help with that."
+        ));
+    }
+
+    #[test]
+    fn incomplete_responses_events_collect_usage_and_classify_terminal_reason() {
+        let max_tokens = OpenAiResponsesAdapter
+            .parse_stream_chunk(
+                r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":7,"output_tokens":9}}}"#,
+            )
+            .unwrap();
+        assert!(max_tokens.iter().any(
+            |event| matches!(event, StreamEvent::Usage(usage) if usage.input == Some(7) && usage.output == Some(9))
+        ));
+        assert!(matches!(
+            max_tokens.last(),
+            Some(StreamEvent::Finish(FinishReason::Length))
+        ));
+
+        let content_filter = OpenAiResponsesAdapter
+            .parse_full_response(&json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "output": []
+            }))
+            .unwrap();
+        assert!(matches!(
+            content_filter.last(),
+            Some(StreamEvent::Finish(FinishReason::ContentFilter))
+        ));
+
+        let steered = OpenAiResponsesAdapter
+            .parse_stream_chunk(
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"steered"}}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            steered.last(),
+            Some(StreamEvent::Finish(FinishReason::Other(reason))) if reason == "steered"
+        ));
     }
 }

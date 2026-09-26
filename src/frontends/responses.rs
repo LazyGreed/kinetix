@@ -1,8 +1,9 @@
 //! OpenAI Responses API inbound frontend (POST /v1/responses).
 //!
-//! Implements Kinetix's explicitly supported translated subset of the OpenAI
-//! Responses API. Kinetix does not provide native Responses upstream passthrough
-//! or response-object storage/chaining; unsupported semantics fail closed.
+//! Implements Kinetix's explicitly supported subset of the OpenAI Responses API.
+//! Requests are validated and decoded for cross-format translation; the API
+//! boundary retains the validated raw body so Responses targets can use native
+//! same-format passthrough. Response-object storage/chaining remains unsupported.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -22,6 +23,9 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         .as_object()
         .ok_or_else(|| ProxyError::bad_request("request body must be a JSON object"))?;
     validate_supported_subset(obj)?;
+    // Preserve the validated Responses body for same-format dispatch. The HTTP
+    // API handler replaces this normalized JSON with the exact received bytes.
+    let validated_raw_body = body.to_string();
 
     let model = obj
         .get("model")
@@ -92,9 +96,10 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
 
     let stream = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
-    // Responses input is always translated through Kinetix's canonical model;
-    // there is no native Responses passthrough. Keep only explicitly supported
-    // portable extensions; unknown top-level semantics still fail closed.
+    // Keep the canonical representation for cross-format translation. For a
+    // Responses target, the validated raw body is retained for native
+    // same-format passthrough; unsupported top-level semantics already failed
+    // validation above.
     let mut extra = serde_json::Map::new();
     if let Some(prompt_cache_key) = obj.get("prompt_cache_key") {
         extra.insert("prompt_cache_key".to_string(), prompt_cache_key.clone());
@@ -118,7 +123,7 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
         include_usage: false,
         thinking,
         extra,
-        raw_body: None,
+        raw_body: Some(validated_raw_body),
     })
 }
 
@@ -1199,4 +1204,35 @@ pub fn aggregate_responses(
         "output": output,
         "usage": usage_obj
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validated_responses_body_is_retained_for_native_passthrough() {
+        let body = json!({
+            "model": "example",
+            "input": "hello",
+            "stream": true,
+            "stream_options": {"include_obfuscation": false}
+        });
+        let expected = body.to_string();
+        let request = decode_request(body).unwrap();
+        assert_eq!(request.raw_body.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn unsupported_responses_semantics_are_rejected_before_passthrough() {
+        let error = decode_request(json!({
+            "model": "example",
+            "input": "hello",
+            "metadata": {"private": "value"}
+        }))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("response metadata storage is unsupported"));
+    }
 }
