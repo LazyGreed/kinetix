@@ -19,6 +19,7 @@ const CORRELATION_WINDOW_SECS: i64 = 30;
 const OPEN_COOLDOWN_SECS: i64 = 30;
 const ABANDONED_PROBE_RETRY_SECS: i64 = 1;
 const MIN_DISTINCT_ACCOUNTS: usize = 2;
+const MIN_DISTINCT_TARGETS: usize = 2;
 const MAX_RECENT_FAILURES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -51,6 +52,15 @@ pub struct ProviderCircuitSnapshot {
     pub recoveries: u64,
     pub rejects: u64,
     pub half_open_probes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCorrelationPolicy {
+    /// Credential-backed providers require failures from multiple accounts.
+    DistinctAccounts,
+    /// Account-less providers have no credential diversity; failures across
+    /// logical targets can provide the correlation signal instead.
+    AccountlessTargets,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -86,6 +96,7 @@ struct Circuit {
     retry_at: Option<DateTime<Utc>>,
     last_successful_probe: Option<DateTime<Utc>>,
     half_open_inflight: u32,
+    generation: u64,
     opens: u64,
     recoveries: u64,
     rejects: u64,
@@ -101,6 +112,7 @@ impl Default for Circuit {
             retry_at: None,
             last_successful_probe: None,
             half_open_inflight: 0,
+            generation: 0,
             opens: 0,
             recoveries: 0,
             rejects: 0,
@@ -173,12 +185,13 @@ impl Circuit {
         changed
     }
 
-    fn release_probe_without_verdict(&mut self, now: DateTime<Utc>) {
-        self.half_open_inflight = self.half_open_inflight.saturating_sub(1);
-        if self.state == ProviderCircuitState::HalfOpen {
-            self.state = ProviderCircuitState::Open;
-            self.retry_at = Some(now + ChronoDuration::seconds(ABANDONED_PROBE_RETRY_SECS));
+    fn release_probe_without_verdict(&mut self, generation: u64, now: DateTime<Utc>) {
+        if generation != self.generation || self.state != ProviderCircuitState::HalfOpen {
+            return;
         }
+        self.half_open_inflight = 0;
+        self.state = ProviderCircuitState::Open;
+        self.retry_at = Some(now + ChronoDuration::seconds(ABANDONED_PROBE_RETRY_SECS));
     }
 }
 
@@ -195,6 +208,21 @@ impl ProviderCircuits {
         provider_id: &str,
         account_id: &str,
         target_id: &str,
+    ) -> Result<ProviderAttempt, ProviderCircuitReject> {
+        self.begin_attempt_with_policy(
+            provider_id,
+            account_id,
+            target_id,
+            ProviderCorrelationPolicy::DistinctAccounts,
+        )
+    }
+
+    pub fn begin_attempt_with_policy(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        target_id: &str,
+        correlation_policy: ProviderCorrelationPolicy,
     ) -> Result<ProviderAttempt, ProviderCircuitReject> {
         let circuit = self.circuit(provider_id);
         let now = Utc::now();
@@ -235,12 +263,15 @@ impl ProviderCircuits {
                 true
             }
         };
+        let generation = state.generation;
         drop(state);
 
         Ok(ProviderAttempt {
             account_id: account_id.to_string(),
             target_id: target_id.to_string(),
             circuit,
+            generation,
+            correlation_policy,
             half_open_probe,
             finished: AtomicBool::new(false),
         })
@@ -265,6 +296,8 @@ pub struct ProviderAttempt {
     account_id: String,
     target_id: String,
     circuit: Arc<Mutex<Circuit>>,
+    generation: u64,
+    correlation_policy: ProviderCorrelationPolicy,
     half_open_probe: bool,
     finished: AtomicBool,
 }
@@ -280,17 +313,20 @@ impl ProviderAttempt {
         }
         let now = Utc::now();
         let mut state = self.circuit.lock();
-        let recovered = state.state == ProviderCircuitState::HalfOpen || self.half_open_probe;
-        if self.half_open_probe {
-            state.half_open_inflight = state.half_open_inflight.saturating_sub(1);
-        }
-        state.state = ProviderCircuitState::Closed;
-        state.opened_at = None;
-        state.retry_at = None;
-        state.failures.clear();
-        if recovered {
-            state.last_successful_probe = Some(now);
-            state.recoveries = state.recoveries.saturating_add(1);
+        let mut recovered = false;
+        if state.generation == self.generation {
+            if self.half_open_probe && state.state == ProviderCircuitState::HalfOpen {
+                state.half_open_inflight = 0;
+                state.state = ProviderCircuitState::Closed;
+                state.opened_at = None;
+                state.retry_at = None;
+                state.failures.clear();
+                state.last_successful_probe = Some(now);
+                state.recoveries = state.recoveries.saturating_add(1);
+                recovered = true;
+            } else if !self.half_open_probe && state.state == ProviderCircuitState::Closed {
+                state.failures.clear();
+            }
         }
         ProviderCircuitTransition {
             recovered,
@@ -309,10 +345,22 @@ impl ProviderAttempt {
         }
         let now = Utc::now();
         let mut state = self.circuit.lock();
+        let attempt_owns_state = state.generation == self.generation
+            && if self.half_open_probe {
+                state.state == ProviderCircuitState::HalfOpen
+            } else {
+                state.state == ProviderCircuitState::Closed
+            };
+        if !attempt_owns_state {
+            return ProviderCircuitTransition {
+                half_open_probe: self.half_open_probe,
+                ..Default::default()
+            };
+        }
 
         if !qualifies(kind, status) {
             if self.half_open_probe {
-                state.release_probe_without_verdict(now);
+                state.release_probe_without_verdict(self.generation, now);
             }
             return ProviderCircuitTransition {
                 half_open_probe: self.half_open_probe,
@@ -343,12 +391,20 @@ impl ProviderAttempt {
             .collect::<HashSet<_>>()
             .len();
 
-        let opened = if self.half_open_probe || state.state == ProviderCircuitState::HalfOpen {
-            state.open(now)
-        } else if distinct_accounts >= MIN_DISTINCT_ACCOUNTS
-            || distinct_targets >= MIN_DISTINCT_ACCOUNTS
-        {
-            state.open(now)
+        let correlated = match self.correlation_policy {
+            ProviderCorrelationPolicy::DistinctAccounts => {
+                distinct_accounts >= MIN_DISTINCT_ACCOUNTS
+            }
+            ProviderCorrelationPolicy::AccountlessTargets => {
+                distinct_targets >= MIN_DISTINCT_TARGETS
+            }
+        };
+        let opened = if self.half_open_probe || correlated {
+            let changed = state.open(now);
+            if changed {
+                state.generation = state.generation.wrapping_add(1);
+            }
+            changed
         } else {
             false
         };
@@ -367,7 +423,7 @@ impl ProviderAttempt {
         if self.half_open_probe {
             self.circuit
                 .lock()
-                .release_probe_without_verdict(Utc::now());
+                .release_probe_without_verdict(self.generation, Utc::now());
         }
         ProviderCircuitTransition {
             half_open_probe: self.half_open_probe,
@@ -384,7 +440,7 @@ impl Drop for ProviderAttempt {
         if self.half_open_probe {
             self.circuit
                 .lock()
-                .release_probe_without_verdict(Utc::now());
+                .release_probe_without_verdict(self.generation, Utc::now());
         }
     }
 }
@@ -436,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_targets_on_one_account_can_open_provider_circuit() {
+    fn same_account_failures_across_targets_do_not_open_credentialed_provider() {
         let circuits = ProviderCircuits::default();
         circuits
             .begin_attempt("p", "a", "route-a")
@@ -447,14 +503,61 @@ mod tests {
             .unwrap()
             .finish_failure(FailureKind::ServerError, Some(503));
 
-        assert!(transition.opened);
+        assert!(!transition.opened);
         let snapshot = circuits.snapshot("p");
+        assert_eq!(snapshot.state, ProviderCircuitState::Closed);
         assert_eq!(snapshot.distinct_failing_accounts, 1);
         assert_eq!(snapshot.distinct_failing_targets, 2);
     }
 
     #[test]
-    fn half_open_allows_one_probe_and_terminal_success_recovers() {
+    fn accountless_provider_can_correlate_failures_across_targets() {
+        let circuits = ProviderCircuits::default();
+        circuits
+            .begin_attempt_with_policy(
+                "p",
+                "noauth",
+                "route-a",
+                ProviderCorrelationPolicy::AccountlessTargets,
+            )
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        let transition = circuits
+            .begin_attempt_with_policy(
+                "p",
+                "noauth",
+                "route-b",
+                ProviderCorrelationPolicy::AccountlessTargets,
+            )
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+
+        assert!(transition.opened);
+        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Open);
+    }
+
+    #[test]
+    fn late_success_cannot_close_a_circuit_opened_after_admission() {
+        let circuits = ProviderCircuits::default();
+        let late_success = circuits.begin_attempt("p", "c", "route-c").unwrap();
+        circuits
+            .begin_attempt("p", "a", "route-a")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        circuits
+            .begin_attempt("p", "b", "route-b")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+
+        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Open);
+        assert!(!late_success.finish_success().recovered);
+        let snapshot = circuits.snapshot("p");
+        assert_eq!(snapshot.state, ProviderCircuitState::Open);
+        assert_eq!(snapshot.recent_qualifying_failures, 2);
+    }
+
+    #[test]
+    fn half_open_probe_recovers_at_validated_success_boundary() {
         let circuits = ProviderCircuits::default();
         circuits
             .begin_attempt("p", "a", "route-a")
@@ -475,6 +578,8 @@ mod tests {
         assert!(probe.is_half_open_probe());
         assert!(circuits.begin_attempt("p", "b", "route-b").is_err());
 
+        // The probe's first validated success recovers the circuit before the
+        // response stream reaches terminal completion.
         let transition = probe.finish_success();
         assert!(transition.recovered);
         assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);

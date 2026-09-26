@@ -24,6 +24,9 @@ pub struct QuotaSnapshot {
 
 impl QuotaSnapshot {
     pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        if self.reset_at.is_some_and(|reset_at| reset_at <= now) {
+            return false;
+        }
         now.signed_duration_since(self.observed_at)
             .to_std()
             .map(|age| age <= Duration::from_secs(self.max_age_secs))
@@ -34,6 +37,9 @@ impl QuotaSnapshot {
     /// known low headroom is negative evidence. A near reset can only make a
     /// small bounded adjustment.
     pub fn preference(&self, now: DateTime<Utc>) -> f64 {
+        if !self.is_fresh(now) {
+            return 0.0;
+        }
         let Some(remaining) = self.remaining_fraction else {
             return 0.0;
         };
@@ -53,6 +59,13 @@ impl QuotaSnapshot {
         }
         score.clamp(-0.5, 0.5)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaHeaderObservation {
+    pub remaining_fraction: f64,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub exhausted: bool,
 }
 
 #[derive(Clone, Default)]
@@ -127,7 +140,12 @@ impl QuotaRegistry {
         }
     }
 
-    pub fn observe_headers(&self, provider_id: &str, account_id: &str, headers: &HeaderMap) {
+    pub fn observe_headers(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        headers: &HeaderMap,
+    ) -> Option<QuotaHeaderObservation> {
         let pairs = [
             (
                 "anthropic-ratelimit-requests-remaining",
@@ -144,22 +162,33 @@ impl QuotaRegistry {
             let Some(remaining) = header_f64(headers, remaining_name) else {
                 continue;
             };
-            let Some(limit) = header_f64(headers, limit_name) else {
-                continue;
+            let reset_at = parse_reset_header(headers);
+            let (remaining_fraction, exhausted) = if remaining <= 0.0 {
+                (0.0, true)
+            } else {
+                let Some(limit) = header_f64(headers, limit_name) else {
+                    continue;
+                };
+                if limit <= 0.0 {
+                    continue;
+                }
+                ((remaining / limit).clamp(0.0, 1.0), false)
             };
-            if limit <= 0.0 {
-                continue;
-            }
             self.observe(
                 provider_id,
                 account_id,
-                Some(remaining / limit),
-                parse_reset_header(headers),
+                Some(remaining_fraction),
+                reset_at,
                 format!("response_header:{remaining_name}"),
                 DEFAULT_MAX_AGE,
             );
-            return;
+            return Some(QuotaHeaderObservation {
+                remaining_fraction,
+                reset_at,
+                exhausted,
+            });
         }
+        None
     }
 
     pub fn snapshot(&self, provider_id: &str, account_id: &str) -> Option<QuotaSnapshot> {
@@ -291,6 +320,36 @@ mod tests {
         };
         assert!((-0.5..=0.5).contains(&snapshot.preference(now)));
         assert!(snapshot.preference(now) < 0.0);
+    }
+
+    #[test]
+    fn expired_reset_makes_recent_quota_unknown_immediately() {
+        let now = Utc::now();
+        let snapshot = QuotaSnapshot {
+            remaining_fraction: Some(0.05),
+            reset_at: Some(now - chrono::Duration::seconds(1)),
+            observed_at: now,
+            source: "test".into(),
+            max_age_secs: 300,
+        };
+
+        assert!(!snapshot.is_fresh(now));
+        assert_eq!(snapshot.preference(now), 0.0);
+    }
+
+    #[test]
+    fn zero_remaining_header_is_reported_as_hard_exhaustion() {
+        let registry = QuotaRegistry::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+
+        let observation = registry.observe_headers("p", "a", &headers).unwrap();
+        assert!(observation.exhausted);
+        assert_eq!(observation.remaining_fraction, 0.0);
+        assert_eq!(
+            registry.snapshot("p", "a").unwrap().remaining_fraction,
+            Some(0.0)
+        );
     }
 
     #[test]

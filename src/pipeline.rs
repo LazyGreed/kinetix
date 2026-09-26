@@ -410,11 +410,20 @@ struct Attempt {
     passthrough: bool,
     /// Adaptive target-local permit held for the full upstream lifecycle.
     traffic_permit: Option<crate::upstream_traffic::TrafficPermit>,
-    /// Provider-wide breaker attempt. Recovery is committed only when the
-    /// validated response reaches a terminal success.
+    /// Provider-wide breaker attempt.
     provider_attempt: crate::provider_circuit::ProviderAttempt,
+    /// Half-open recovery is committed at response validation, before stream completion.
+    provider_circuit_transition: Option<crate::provider_circuit::ProviderCircuitTransition>,
     /// Target-attempt-local start, excluding routing and credential work.
     attempt_started: Instant,
+}
+
+fn finish_provider_probe_at_validation(
+    provider_attempt: &crate::provider_circuit::ProviderAttempt,
+) -> Option<crate::provider_circuit::ProviderCircuitTransition> {
+    provider_attempt
+        .is_half_open_probe()
+        .then(|| provider_attempt.finish_success())
 }
 
 /// Run the full pipeline and produce a client response.
@@ -951,13 +960,19 @@ pub async fn run(
 
         // Provider-wide transient outage gate. It is checked before credential
         // resolution so an open provider does not churn sibling credentials.
-        let provider_attempt = match state.provider_circuits.begin_attempt(
+        let correlation_policy = if target.provider.credential_mode == "none" {
+            crate::provider_circuit::ProviderCorrelationPolicy::AccountlessTargets
+        } else {
+            crate::provider_circuit::ProviderCorrelationPolicy::DistinctAccounts
+        };
+        let provider_attempt = match state.provider_circuits.begin_attempt_with_policy(
             &target.provider.id,
             &target.account.id,
             target
                 .route_target_id
                 .as_deref()
                 .unwrap_or(target.model.id.as_str()),
+            correlation_policy,
         ) {
             Ok(attempt) => attempt,
             Err(reject) => {
@@ -1326,11 +1341,23 @@ pub async fn run(
 
         match send_result {
             Ok(resp) => {
-                state.quota.observe_headers(
+                if let Some(quota) = state.quota.observe_headers(
                     &target.provider.id,
                     &target.account.id,
                     resp.headers(),
-                );
+                ) {
+                    if quota.exhausted {
+                        let _ = pool::mark_exhausted(
+                            &state.pool,
+                            &target.account.id,
+                            quota.reset_at,
+                            default_quota_window(&target.account),
+                            "upstream response headers reported zero remaining quota",
+                        )
+                        .await;
+                        let _ = state.registry.reload(&state.pool).await;
+                    }
+                }
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
                     let first_event_remaining =
@@ -1450,6 +1477,8 @@ pub async fn run(
                     );
                     // Only validated responses clear the circuit-breaker counter.
                     let _ = pool::clear_circuit(&state.pool, &target.account.id).await;
+                    let provider_circuit_transition =
+                        finish_provider_probe_at_validation(&provider_attempt);
                     let attempt = Attempt {
                         target: target.clone(),
                         upstream_request_id,
@@ -1462,6 +1491,7 @@ pub async fn run(
                         passthrough: use_passthrough && prepared.is_sse,
                         traffic_permit,
                         provider_attempt,
+                        provider_circuit_transition,
                         attempt_started,
                     };
                     return Ok(stream_response(
@@ -4754,31 +4784,30 @@ async fn finalize_log(
         permit.finish(outcome);
     }
 
-    let (telemetry_outcome, circuit_transition) = if status == "success" {
-        (
-            crate::target_telemetry::TelemetryOutcome::Success,
-            attempt.provider_attempt.finish_success(),
-        )
+    let telemetry_outcome = if status == "success" {
+        crate::target_telemetry::TelemetryOutcome::Success
     } else if status == "client_disconnect" {
-        (
-            crate::target_telemetry::TelemetryOutcome::Cancelled,
-            attempt.provider_attempt.finish_neutral(),
-        )
-    } else if let Some((kind, upstream_status)) = provider_failure {
-        (
-            telemetry_outcome_for_failure(kind),
-            attempt
-                .provider_attempt
-                .finish_failure(kind, upstream_status),
-        )
+        crate::target_telemetry::TelemetryOutcome::Cancelled
+    } else if let Some((kind, _)) = provider_failure {
+        telemetry_outcome_for_failure(kind)
     } else {
         // Framing/adapter/local stream-controller errors remain visible as
         // terminal target failures but are not provider-outage evidence.
-        (
-            crate::target_telemetry::TelemetryOutcome::TargetError,
-            attempt.provider_attempt.finish_neutral(),
-        )
+        crate::target_telemetry::TelemetryOutcome::TargetError
     };
+    let circuit_transition = attempt.provider_circuit_transition.unwrap_or_else(|| {
+        if status == "success" {
+            attempt.provider_attempt.finish_success()
+        } else if status == "client_disconnect" {
+            attempt.provider_attempt.finish_neutral()
+        } else if let Some((kind, upstream_status)) = provider_failure {
+            attempt
+                .provider_attempt
+                .finish_failure(kind, upstream_status)
+        } else {
+            attempt.provider_attempt.finish_neutral()
+        }
+    });
     let attempt_offset_ms = attempt
         .attempt_started
         .saturating_duration_since(started)

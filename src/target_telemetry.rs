@@ -158,6 +158,9 @@ impl TargetTelemetry {
                 row.try_get::<i64, _>("fallback_failures")?.max(0) as u64;
             aggregate.rate_limits += row.try_get::<i64, _>("rate_limits")?.max(0) as u64;
             aggregate.quota_exhausted += row.try_get::<i64, _>("quota_exhausted")?.max(0) as u64;
+            aggregate.auth_errors += row.try_get::<i64, _>("auth_errors")?.max(0) as u64;
+            aggregate.target_errors += row.try_get::<i64, _>("target_errors")?.max(0) as u64;
+            aggregate.bad_requests += row.try_get::<i64, _>("bad_requests")?.max(0) as u64;
             aggregate.server_5xx += row.try_get::<i64, _>("server_5xx")?.max(0) as u64;
             aggregate.connection_errors +=
                 row.try_get::<i64, _>("connection_errors")?.max(0) as u64;
@@ -234,6 +237,9 @@ struct BucketAggregate {
     fallback_failures: u64,
     rate_limits: u64,
     quota_exhausted: u64,
+    auth_errors: u64,
+    target_errors: u64,
+    bad_requests: u64,
     server_5xx: u64,
     connection_errors: u64,
     timeouts: u64,
@@ -256,6 +262,9 @@ impl BucketAggregate {
         self.fallback_failures += event.caused_fallback as u64;
         self.rate_limits += (event.outcome == TelemetryOutcome::RateLimit) as u64;
         self.quota_exhausted += (event.outcome == TelemetryOutcome::QuotaExhausted) as u64;
+        self.auth_errors += (event.outcome == TelemetryOutcome::AuthError) as u64;
+        self.target_errors += (event.outcome == TelemetryOutcome::TargetError) as u64;
+        self.bad_requests += (event.outcome == TelemetryOutcome::BadRequest) as u64;
         self.server_5xx += (event.outcome == TelemetryOutcome::ServerError) as u64;
         self.connection_errors += (event.outcome == TelemetryOutcome::ConnectionError) as u64;
         self.timeouts += (event.outcome == TelemetryOutcome::Timeout) as u64;
@@ -362,6 +371,7 @@ async fn flush(
             "INSERT INTO target_health_buckets (
                 bucket_start, scope, provider_id, account_id, model_id,
                 attempts, successes, fallback_failures, rate_limits, quota_exhausted,
+                auth_errors, target_errors, bad_requests,
                 server_5xx, connection_errors, timeouts, cancellations, fallbacks,
                 adaptive_saturation, provider_circuit_rejects, provider_circuit_opens,
                 provider_circuit_recoveries, half_open_probes,
@@ -370,7 +380,7 @@ async fn flush(
                 duration_b5, duration_b6, duration_b7, duration_b8, duration_b9
              ) VALUES (
                 ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -382,6 +392,9 @@ async fn flush(
                 fallback_failures = fallback_failures + excluded.fallback_failures,
                 rate_limits = rate_limits + excluded.rate_limits,
                 quota_exhausted = quota_exhausted + excluded.quota_exhausted,
+                auth_errors = auth_errors + excluded.auth_errors,
+                target_errors = target_errors + excluded.target_errors,
+                bad_requests = bad_requests + excluded.bad_requests,
                 server_5xx = server_5xx + excluded.server_5xx,
                 connection_errors = connection_errors + excluded.connection_errors,
                 timeouts = timeouts + excluded.timeouts,
@@ -423,6 +436,9 @@ async fn flush(
         .bind(value.fallback_failures as i64)
         .bind(value.rate_limits as i64)
         .bind(value.quota_exhausted as i64)
+        .bind(value.auth_errors as i64)
+        .bind(value.target_errors as i64)
+        .bind(value.bad_requests as i64)
         .bind(value.server_5xx as i64)
         .bind(value.connection_errors as i64)
         .bind(value.timeouts as i64)
@@ -500,6 +516,9 @@ pub struct TelemetrySummary {
     pub fallback_failures: u64,
     pub rate_limits: u64,
     pub quota_exhausted: u64,
+    pub auth_errors: u64,
+    pub target_errors: u64,
+    pub bad_requests: u64,
     pub server_5xx: u64,
     pub connection_errors: u64,
     pub timeouts: u64,
@@ -536,6 +555,9 @@ impl TelemetrySummary {
             fallback_failures: value.fallback_failures,
             rate_limits: value.rate_limits,
             quota_exhausted: value.quota_exhausted,
+            auth_errors: value.auth_errors,
+            target_errors: value.target_errors,
+            bad_requests: value.bad_requests,
             server_5xx: value.server_5xx,
             connection_errors: value.connection_errors,
             timeouts: value.timeouts,
@@ -563,6 +585,60 @@ fn empty_to_none(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failure_taxonomy_is_persisted_and_returned_by_summaries() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-telemetry-taxonomy-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("health.db").display());
+        let pool = crate::db::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+
+        let mut pending = HashMap::new();
+        for outcome in [
+            TelemetryOutcome::AuthError,
+            TelemetryOutcome::TargetError,
+            TelemetryOutcome::BadRequest,
+        ] {
+            add_event(
+                &mut pending,
+                TelemetryEvent::attempt(
+                    TargetKey::new("p", "a", "m"),
+                    outcome,
+                    None,
+                    10,
+                    false,
+                    false,
+                ),
+            );
+        }
+        flush(&pool, &mut pending).await.unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let telemetry = TargetTelemetry {
+            tx,
+            dropped_queue: Arc::new(AtomicU64::new(0)),
+            dropped_persistence: Arc::new(AtomicU64::new(0)),
+        };
+        let summaries = telemetry.summaries(&pool, 3600).await.unwrap();
+        let provider = summaries
+            .iter()
+            .find(|row| row.scope == "provider")
+            .unwrap();
+        assert_eq!(provider.auth_errors, 1);
+        assert_eq!(provider.target_errors, 1);
+        assert_eq!(provider.bad_requests, 1);
+        let json = serde_json::to_value(provider).unwrap();
+        assert_eq!(json["auth_errors"], 1);
+        assert_eq!(json["target_errors"], 1);
+        assert_eq!(json["bad_requests"], 1);
+
+        pool.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn histogram_quantiles_are_bounded_and_monotonic() {

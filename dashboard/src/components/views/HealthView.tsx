@@ -39,6 +39,9 @@ interface Telemetry {
   cancellations: number;
   rate_limits: number;
   quota_exhausted: number;
+  auth_errors: number;
+  target_errors: number;
+  bad_requests: number;
   server_5xx: number;
   connection_errors: number;
   timeouts: number;
@@ -262,7 +265,7 @@ export function HealthView() {
             ))}
           </div>
         </div>
-        <table className="w-full min-w-[1180px] text-sm">
+        <table className="w-full min-w-[1320px] text-sm">
           <thead>
             <tr className="text-left border-b border-[var(--ink)]/30">
               <th className="p-3">Scope</th>
@@ -273,6 +276,7 @@ export function HealthView() {
               <th className="p-3">Duration p50 / p95 / p99</th>
               <th className="p-3">5xx / conn / timeout</th>
               <th className="p-3">Rate / quota</th>
+              <th className="p-3">Auth / target / bad request</th>
               <th className="p-3">Fallback use / failures</th>
               <th className="p-3">Cancelled</th>
               <th className="p-3">Saturation / circuit reject</th>
@@ -295,6 +299,7 @@ export function HealthView() {
                 </td>
                 <td className="p-3">{row.server_5xx} / {row.connection_errors} / {row.timeouts}</td>
                 <td className="p-3">{row.rate_limits} / {row.quota_exhausted}</td>
+                <td className="p-3">{row.auth_errors} / {row.target_errors} / {row.bad_requests}</td>
                 <td className="p-3">
                   {row.fallbacks} ({row.attempts > 0 ? pct(row.fallbacks / row.attempts) : '—'}) / {row.fallback_failures}
                 </td>
@@ -303,7 +308,7 @@ export function HealthView() {
               </tr>
             ))}
             {data && telemetryRows.length === 0 && (
-              <tr><td className="p-4 text-[var(--ink)]/60" colSpan={11}>No persisted target telemetry in this window.</td></tr>
+              <tr><td className="p-4 text-[var(--ink)]/60" colSpan={12}>No persisted target telemetry in this window.</td></tr>
             )}
           </tbody>
         </table>
