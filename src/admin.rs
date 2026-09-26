@@ -6624,6 +6624,68 @@ struct PluginAuthCompletion {
     provider_id: Option<String>,
 }
 
+async fn finalize_plugin_auth_account(
+    state: &AppState,
+    provider: &db::ProviderRow,
+    account_id: &str,
+    label: &str,
+    plugin_id: &str,
+    flow_name: &str,
+) -> &'static str {
+    // Validate a newly authorized account immediately. Transient failures do
+    // not invalidate the completed enrollment, but terminal invalid credentials
+    // mean the account needs reauthorization and must not be reported as a
+    // clean success.
+    if let Ok(Some(account)) = db::get_account(&state.pool, account_id).await {
+        match state.credential_for(provider, &account).await {
+            Ok(_) => {}
+            Err(error) if error.invalid_credential() => {
+                state
+                    .disable_invalid_credential(
+                        &account,
+                        &error,
+                        "OAuth completion credential resolution",
+                    )
+                    .await;
+                let _ = db::insert_audit(
+                    &state.pool,
+                    "admin",
+                    "plugin_auth_credential_invalid",
+                    "account",
+                    account_id,
+                    label,
+                    "The newly authorized credential was rejected as invalid; the account was disabled and must be reauthorized.",
+                )
+                .await;
+                return "reauthorization_required";
+            }
+            Err(error) => {
+                tracing::debug!(
+                    provider = %provider.id,
+                    account = %account.id,
+                    %error,
+                    "new OAuth account credential lease could not be scheduled yet"
+                );
+            }
+        }
+    }
+
+    let _ = db::insert_audit(
+        &state.pool,
+        "admin",
+        "plugin_account_authorized",
+        "account",
+        account_id,
+        label,
+        &format!(
+            "Authorized account through plugin {} flow {}.",
+            plugin_id, flow_name
+        ),
+    )
+    .await;
+    "success"
+}
+
 async fn complete_plugin_auth(
     state: &AppState,
     session: auth::PluginAuthSession,
@@ -6803,19 +6865,6 @@ async fn complete_plugin_auth(
     .await
     .map_err(ApiError::internal)?;
 
-    let _ = db::insert_audit(
-        &state.pool,
-        "admin",
-        "plugin_account_authorized",
-        "account",
-        &account_id,
-        &label,
-        &format!(
-            "Authorized account through plugin {} flow {}.",
-            session.plugin_id, session.flow_name
-        ),
-    )
-    .await;
     state
         .registry
         .reload(&state.pool)
@@ -6824,19 +6873,18 @@ async fn complete_plugin_auth(
 
     // Seed proactive refresh immediately for a newly authorized account rather
     // than waiting for its first inference request or a process restart.
-    if let Ok(Some(account)) = db::get_account(&state.pool, &account_id).await {
-        if let Err(error) = state.credential_for(&provider, &account).await {
-            tracing::debug!(
-                provider = %provider.id,
-                account = %account.id,
-                %error,
-                "new OAuth account credential lease could not be scheduled yet"
-            );
-        }
-    }
+    let result = finalize_plugin_auth_account(
+        state,
+        &provider,
+        &account_id,
+        &label,
+        &session.plugin_id,
+        &session.flow_name,
+    )
+    .await;
 
     Ok(PluginAuthCompletion {
-        result: "success",
+        result,
         provider_id: Some(provider.id),
     })
 }
@@ -8650,6 +8698,30 @@ mod credential_enrollment_regression_tests {
     use super::*;
     use std::sync::Arc;
 
+    struct ExpiredCredential;
+
+    #[async_trait::async_trait]
+    impl crate::credentials::CredentialStrategy for ExpiredCredential {
+        fn name(&self) -> &'static str {
+            "test_expired_auth_credential"
+        }
+
+        async fn resolve(
+            &self,
+            _account: &db::AccountRow,
+        ) -> std::result::Result<
+            crate::credentials::ResolvedCredential,
+            crate::credentials::CredentialRotationError,
+        > {
+            Err(crate::credentials::CredentialRotationError::new(
+                "credential_expired",
+                "new OAuth credential was rejected",
+                false,
+                None,
+            ))
+        }
+    }
+
     async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "kinetix-credential-enrollment-{tag}-{}",
@@ -8776,6 +8848,68 @@ mod credential_enrollment_regression_tests {
             api_key: api_key.map(str::to_string),
             account_label: Some("manual-key".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn completed_oauth_with_expired_credential_disables_account_and_requires_reauthorization()
+    {
+        let (state, root) = test_state("expired-completion").await;
+        let provider_id = insert_provider(
+            &state,
+            "expired-oauth",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("plugin.test"),
+            Some("oauth"),
+        )
+        .await;
+        state.register_plugin_credential_strategy("plugin.test", Arc::new(ExpiredCredential));
+        let encrypted = state.crypto.encrypt("{}").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "connected-account",
+            &encrypted,
+            "oauth:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = finalize_plugin_auth_account(
+            &state,
+            &provider,
+            &account_id,
+            "connected-account",
+            "plugin.test",
+            "oauth",
+        )
+        .await;
+
+        assert_eq!(result, "reauthorization_required");
+        assert_eq!(
+            db::get_account(&state.pool, &account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "disabled"
+        );
+        let audit = db::recent_audit(&state.pool, 10).await.unwrap();
+        assert!(audit.iter().any(|entry| {
+            entry.action == "plugin_auth_credential_invalid" && entry.target_id == account_id
+        }));
+        assert!(!audit.iter().any(|entry| {
+            entry.action == "plugin_account_authorized" && entry.target_id == account_id
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

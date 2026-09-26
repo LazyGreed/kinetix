@@ -793,6 +793,27 @@ async fn terminal_credential_expired_from_scheduled_resolve_disables_account() {
 }
 
 #[tokio::test]
+async fn startup_seed_disables_account_when_resolve_confirms_credential_expired() {
+    let strategy = Arc::new(TerminalResolveCredential::new());
+    let harness = setup(strategy, None, 1).await;
+
+    harness.state.seed_credential_refreshes().await;
+
+    let account = db::get_account(&harness.pool, &harness.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.status, "disabled");
+    let fallback = db::get_account(&harness.pool, &harness.fallback_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fallback.status, "healthy");
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
 async fn terminal_resolve_credential_expired_disables_account_and_uses_fallback() {
     let strategy = Arc::new(TerminalResolveCredential::new());
     let harness = setup(strategy.clone(), None, 2).await;

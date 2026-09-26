@@ -246,7 +246,11 @@ Security ownership is intentionally split:
 
 The callback may enroll only into a provider whose `credential_plugin` still
 matches the integration's declared credential strategy. State is consumed
-before token exchange, so callback replay fails closed.
+before token exchange, so callback replay fails closed. After inserting the new
+account, Kinetix resolves its credential immediately to seed lease scheduling.
+If that resolve confirms `credential_expired` (or another terminal invalid
+credential error), the account is disabled and the completion result is
+`reauthorization_required`, not `success`.
 
 The browser never receives access or refresh tokens from Kinetix. Provider
 client constraints remain plugin-specific: for example, the bundled
@@ -292,12 +296,17 @@ The handle is opaque. When possible, the plugin uses it through the host HTTP ca
 ever receiving plaintext secret bytes.
 
 Credential lifecycle policy remains host-owned. Kinetix records `refresh_after` when supplied;
-otherwise it derives a provider-neutral lead from `expires_at`. A host-owned refresh coordinator
-schedules renewal off the request path, applies bounded retry backoff, and shares one account-scoped
-singleflight gate across request-path `resolve`, scheduled refresh, and reactive auth-error renewal.
-This is required because API v1 credential plugins are allowed to refresh inside `resolve`.
-Structured credential errors remain intact across both `resolve` and `rotate`, so terminal
-`credential_expired` evidence can stop scheduling and require re-authorization instead of being
+otherwise it derives up to a five-minute lead from `expires_at`, proportionally reducing that lead to
+half the remaining lease for leases shorter than ten minutes. The deadline is anchored to the first
+observation of the same expiry/refresh-hint identity and remains stable across resolves; a scheduler
+claim uses a separate grace marker and does not move the deadline. This lets an unchanged short lease
+reach its refresh deadline without sliding toward expiry, while a different lease returned by a
+concurrent request is rescheduled instead of being rotated as stale work. A host-owned refresh
+coordinator schedules renewal off the request path, applies bounded retry backoff, and shares one
+account-scoped singleflight gate across request-path `resolve`, scheduled refresh, and reactive
+auth-error renewal. This is required because API v1 credential plugins are allowed to refresh inside
+`resolve`. Startup seed and request-path resolution preserve typed errors: terminal
+`credential_expired` evidence disables the account and requires re-authorization instead of being
 downgraded to a retryable host error. A transient proactive refresh failure does not cool down or
 disable an otherwise still-valid account.
 

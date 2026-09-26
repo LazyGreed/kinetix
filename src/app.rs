@@ -273,6 +273,37 @@ impl AppState {
         self.credentials.resolve(account).await
     }
 
+    /// Disable an account when credential resolution confirms its credential
+    /// is terminally invalid. Returns whether the error was terminal.
+    pub(crate) async fn disable_invalid_credential(
+        &self,
+        account: &crate::db::AccountRow,
+        error: &CredentialRotationError,
+        context: &'static str,
+    ) -> bool {
+        if !error.invalid_credential() {
+            return false;
+        }
+
+        tracing::warn!(
+            account = %account.id,
+            code = %error.code,
+            context,
+            "credential confirmed invalid; disabling account"
+        );
+        let _ = crate::db::set_account_status(
+            &self.pool,
+            &account.id,
+            "disabled",
+            None,
+            None,
+            Some(&format!("{context}: {}", error.message)),
+        )
+        .await;
+        let _ = self.registry.reload(&self.pool).await;
+        true
+    }
+
     /// Force renewal for a plugin-backed credential after an upstream auth
     /// failure. Proactive and reactive rotation share the coordinator's
     /// account-scoped singleflight gate so rotating refresh tokens cannot race.
@@ -335,12 +366,17 @@ impl AppState {
                     continue;
                 }
                 if let Err(error) = self.credential_for(&provider, &account).await {
-                    tracing::debug!(
-                        provider = %provider.id,
-                        account = %account.id,
-                        %error,
-                        "credential refresh seed resolve failed"
-                    );
+                    if !self
+                        .disable_invalid_credential(&account, &error, "startup credential seed")
+                        .await
+                    {
+                        tracing::debug!(
+                            provider = %provider.id,
+                            account = %account.id,
+                            %error,
+                            "credential refresh seed resolve failed"
+                        );
+                    }
                 }
             }
         }
@@ -445,32 +481,19 @@ impl AppState {
                 "proactively refreshed credential"
             ),
             Ok(false) => {}
-            Err(error) if error.invalid_credential() => {
-                tracing::warn!(
-                    provider = %provider.id,
-                    account = %account.id,
-                    code = %error.code,
-                    "proactive refresh confirmed invalid credential; disabling account"
-                );
-                let _ = crate::db::set_account_status(
-                    &self.pool,
-                    &account.id,
-                    "disabled",
-                    None,
-                    None,
-                    Some(&format!("credential refresh failed: {}", error.message)),
-                )
-                .await;
-                let _ = self.registry.reload(&self.pool).await;
-            }
             Err(error) => {
-                tracing::warn!(
-                    provider = %provider.id,
-                    account = %account.id,
-                    code = %error.code,
-                    retryable = error.retryable,
-                    "proactive credential refresh failed; keeping current credential until expiry"
-                );
+                if !self
+                    .disable_invalid_credential(&account, &error, "proactive credential refresh")
+                    .await
+                {
+                    tracing::warn!(
+                        provider = %provider.id,
+                        account = %account.id,
+                        code = %error.code,
+                        retryable = error.retryable,
+                        "proactive credential refresh failed; keeping current credential until expiry"
+                    );
+                }
             }
         }
     }

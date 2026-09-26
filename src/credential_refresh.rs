@@ -34,10 +34,18 @@ impl CredentialKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeaseIdentity {
+    expires_at: Option<DateTime<Utc>>,
+    refresh_after: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 struct LeaseSchedule {
     next_attempt_at: DateTime<Utc>,
     failures: u32,
+    lease_identity: LeaseIdentity,
+    claim_until: Option<DateTime<Utc>>,
 }
 
 struct RotationGate {
@@ -127,11 +135,23 @@ impl RefreshCoordinator {
 
         if !reset_failures {
             if let Some(existing) = self.schedules.get(&key) {
-                if existing.failures > 0 {
+                if existing.lease_identity == schedule.lease_identity {
+                    // Expiry-derived deadlines depend on the time of first
+                    // observation. Preserve that deadline while the provider
+                    // continues returning the same lease, rather than sliding
+                    // it forward on every request or scheduler re-resolve.
+                    schedule.next_attempt_at = existing.next_attempt_at;
                     schedule.failures = existing.failures;
-                    schedule.next_attempt_at = schedule
-                        .next_attempt_at
-                        .max(existing.next_attempt_at.to_owned());
+                    schedule.claim_until = existing.claim_until;
+                } else {
+                    // A changed lease identity means another path refreshed
+                    // the credential. Invalidate any claim for the old lease.
+                    schedule.claim_until = None;
+                    if existing.failures > 0 {
+                        schedule.failures = existing.failures;
+                        schedule.next_attempt_at =
+                            schedule.next_attempt_at.max(existing.next_attempt_at);
+                    }
                 }
             }
         }
@@ -149,13 +169,19 @@ impl RefreshCoordinator {
 
     /// Atomically claim every lease whose refresh deadline has arrived.
     ///
-    /// Claiming pushes the next attempt out briefly so the scheduler cannot
-    /// enqueue duplicate work while a slow plugin refresh is still running.
+    /// Claiming records a separate grace marker so the scheduler cannot
+    /// enqueue duplicate work while a slow plugin refresh is running; it does
+    /// not move the lease's stable refresh deadline.
     pub fn claim_due(&self, now: DateTime<Utc>) -> Vec<CredentialKey> {
         let mut due = Vec::new();
         for mut entry in self.schedules.iter_mut() {
-            if entry.next_attempt_at <= now {
-                entry.next_attempt_at = now.to_owned() + ChronoDuration::seconds(CLAIM_GRACE_SECS);
+            let claim_active = entry
+                .claim_until
+                .as_ref()
+                .is_some_and(|claim_until| claim_until > &now);
+            if entry.next_attempt_at <= now && !claim_active {
+                entry.claim_until =
+                    Some(now.to_owned() + ChronoDuration::seconds(CLAIM_GRACE_SECS));
                 due.push(entry.key().clone());
             }
         }
@@ -233,6 +259,17 @@ impl RefreshCoordinator {
         strategy: Arc<dyn CredentialStrategy>,
         account: &AccountRow,
     ) -> std::result::Result<bool, CredentialRotationError> {
+        self.rotate_scheduled_at(provider_id, strategy, account, Utc::now())
+            .await
+    }
+
+    async fn rotate_scheduled_at(
+        &self,
+        provider_id: &str,
+        strategy: Arc<dyn CredentialStrategy>,
+        account: &AccountRow,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<bool, CredentialRotationError> {
         let key = CredentialKey::new(provider_id, &account.id);
         let gate = self.gate(&key);
         let _guard = gate.lock.lock().await;
@@ -249,18 +286,21 @@ impl RefreshCoordinator {
             }
         };
 
-        // claim_due() temporarily pushes the stored deadline forward to keep a
-        // slow refresh from being enqueued twice. Re-check the deadline from
-        // the freshly resolved lease itself, not that claim marker. If another
-        // path already refreshed the lease, its new future deadline wins and
-        // this scheduled attempt becomes a no-op.
-        let now = Utc::now();
         let Some(current_schedule) = schedule_from_credential(&current, now.to_owned()) else {
             self.schedules.remove(&key);
             return Ok(false);
         };
-        if current_schedule.next_attempt_at > now {
+        let Some(stored_schedule) = self.schedules.get(&key).map(|entry| entry.clone()) else {
             self.observe_refreshed(provider_id, &account.id, &current);
+            return Ok(false);
+        };
+        if stored_schedule.lease_identity != current_schedule.lease_identity {
+            // The credential changed since it was scheduled/claimed. Reschedule
+            // from the new lease and do not rotate it as stale work.
+            self.observe_refreshed(provider_id, &account.id, &current);
+            return Ok(false);
+        }
+        if stored_schedule.next_attempt_at > now {
             return Ok(false);
         }
 
@@ -315,12 +355,18 @@ impl RefreshCoordinator {
         let mut schedule = self.schedules.entry(key.clone()).or_insert(LeaseSchedule {
             next_attempt_at: now.to_owned(),
             failures: 0,
+            lease_identity: LeaseIdentity {
+                expires_at: None,
+                refresh_after: None,
+            },
+            claim_until: None,
         });
         schedule.failures = schedule.failures.saturating_add(1);
         let retry = error
             .retry_after_secs
             .unwrap_or_else(|| exponential_backoff_secs(schedule.failures));
         schedule.next_attempt_at = now + ChronoDuration::seconds(retry.min(MAX_RETRY_SECS) as i64);
+        schedule.claim_until = None;
     }
 }
 
@@ -332,18 +378,20 @@ fn schedule_from_credential(
     credential: &ResolvedCredential,
     now: DateTime<Utc>,
 ) -> Option<LeaseSchedule> {
-    let expires_at = parse_time(credential.expires_at.as_deref());
-    let refresh_after = parse_time(credential.refresh_after.as_deref());
+    let lease_identity = LeaseIdentity {
+        expires_at: parse_time(credential.expires_at.as_deref()),
+        refresh_after: parse_time(credential.refresh_after.as_deref()),
+    };
 
-    let requested = refresh_after.or_else(|| {
-        expires_at.map(|expires| {
+    let requested = lease_identity.refresh_after.clone().or_else(|| {
+        lease_identity.expires_at.as_ref().map(|expires| {
             // Keep half of a short lease available before refreshing. Applying
             // the fixed five-minute lead to a lease shorter than five minutes
             // clamps its deadline to `now`, causing a successful rotation to
             // be claimed again on every scheduler tick.
-            let remaining_secs = (expires - now).num_seconds().max(0);
+            let remaining_secs = (expires.to_owned() - now.to_owned()).num_seconds().max(0);
             let lead_secs = (remaining_secs / 2).min(DEFAULT_REFRESH_LEAD_SECS);
-            expires - ChronoDuration::seconds(lead_secs)
+            expires.to_owned() - ChronoDuration::seconds(lead_secs)
         })
     })?;
     let next_attempt_at = requested.max(now);
@@ -351,6 +399,8 @@ fn schedule_from_credential(
     Some(LeaseSchedule {
         next_attempt_at,
         failures: 0,
+        lease_identity,
+        claim_until: None,
     })
 }
 
@@ -396,22 +446,33 @@ mod tests {
         rotations: AtomicUsize,
         secret: tokio::sync::Mutex<String>,
         short_lease_after_rotation: bool,
+        initial_expires_at: String,
+        rotated_expires_at: String,
+        short_expires_at: String,
+        initial_refresh_after: String,
+        rotated_refresh_after: String,
     }
 
     impl RotatingStrategy {
         fn new() -> Self {
-            Self {
-                rotations: AtomicUsize::new(0),
-                secret: tokio::sync::Mutex::new("stale".into()),
-                short_lease_after_rotation: false,
-            }
+            Self::with_short_lease(false)
         }
 
         fn with_short_lease_after_rotation() -> Self {
+            Self::with_short_lease(true)
+        }
+
+        fn with_short_lease(short_lease_after_rotation: bool) -> Self {
+            let now = Utc::now();
             Self {
                 rotations: AtomicUsize::new(0),
                 secret: tokio::sync::Mutex::new("stale".into()),
-                short_lease_after_rotation: true,
+                short_lease_after_rotation,
+                initial_expires_at: (now.to_owned() + ChronoDuration::hours(2)).to_rfc3339(),
+                rotated_expires_at: (now.to_owned() + ChronoDuration::hours(3)).to_rfc3339(),
+                short_expires_at: (now.to_owned() + ChronoDuration::minutes(3)).to_rfc3339(),
+                initial_refresh_after: (now.to_owned() - ChronoDuration::seconds(1)).to_rfc3339(),
+                rotated_refresh_after: (now + ChronoDuration::hours(1)).to_rfc3339(),
             }
         }
     }
@@ -427,30 +488,23 @@ mod tests {
             _account: &AccountRow,
         ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
             let rotations = self.rotations.load(Ordering::Relaxed);
-            let now = Utc::now();
             let has_short_lease = self.short_lease_after_rotation && rotations > 0;
+            let expires_at = if has_short_lease {
+                self.short_expires_at.clone()
+            } else if rotations == 0 {
+                self.initial_expires_at.clone()
+            } else {
+                self.rotated_expires_at.clone()
+            };
             Ok(ResolvedCredential {
                 secret: self.secret.lock().await.clone(),
-                expires_at: Some(
-                    (now.to_owned()
-                        + if has_short_lease {
-                            ChronoDuration::minutes(3)
-                        } else {
-                            ChronoDuration::hours(2)
-                        })
-                    .to_rfc3339(),
-                ),
+                expires_at: Some(expires_at),
                 refresh_after: if has_short_lease {
                     None
+                } else if rotations == 0 {
+                    Some(self.initial_refresh_after.clone())
                 } else {
-                    Some(
-                        if rotations == 0 {
-                            now - ChronoDuration::seconds(1)
-                        } else {
-                            now + ChronoDuration::hours(1)
-                        }
-                        .to_rfc3339(),
-                    )
+                    Some(self.rotated_refresh_after.clone())
                 },
                 rotated: rotations > 0,
             })
@@ -462,6 +516,38 @@ mod tests {
         ) -> std::result::Result<(), CredentialRotationError> {
             self.rotations.fetch_add(1, Ordering::Relaxed);
             *self.secret.lock().await = "fresh".into();
+            Ok(())
+        }
+    }
+
+    struct FixedShortLeaseStrategy {
+        expires_at: String,
+        rotations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CredentialStrategy for FixedShortLeaseStrategy {
+        fn name(&self) -> &'static str {
+            "test_fixed_short_lease"
+        }
+
+        async fn resolve(
+            &self,
+            _account: &AccountRow,
+        ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
+            Ok(ResolvedCredential {
+                secret: "fixed-lease-token".into(),
+                expires_at: Some(self.expires_at.clone()),
+                refresh_after: None,
+                rotated: self.rotations.load(Ordering::Relaxed) > 0,
+            })
+        }
+
+        async fn rotate(
+            &self,
+            _account: &AccountRow,
+        ) -> std::result::Result<(), CredentialRotationError> {
+            self.rotations.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -601,6 +687,31 @@ mod tests {
             coordinator.next_attempt_at("p1", &account.id).unwrap()
                 > Utc::now() + ChronoDuration::minutes(30)
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_short_lease_rotates_at_its_original_deadline() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let observed_at = Utc::now();
+        let strategy = Arc::new(FixedShortLeaseStrategy {
+            expires_at: (observed_at.to_owned() + ChronoDuration::minutes(4)).to_rfc3339(),
+            rotations: AtomicUsize::new(0),
+        });
+        let initial = strategy.resolve(&account).await.unwrap();
+        coordinator.observe("p1", &account.id, &initial);
+        let original_deadline = coordinator.next_attempt_at("p1", &account.id).unwrap();
+
+        assert_eq!(
+            coordinator.claim_due(original_deadline).len(),
+            1,
+            "the unchanged four-minute lease should become due at its first scheduled deadline"
+        );
+        assert!(coordinator
+            .rotate_scheduled_at("p1", strategy.clone(), &account, original_deadline)
+            .await
+            .unwrap());
+        assert_eq!(strategy.rotations.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
