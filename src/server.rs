@@ -15,7 +15,7 @@ use crate::logqueue::UsageLogQueue;
 use crate::opaque_state::OpaqueStateStore;
 use crate::plugins::{HostPolicy, PluginManager};
 use crate::registry::Registry;
-use crate::{alerts, bootstrap, db, export, router};
+use crate::{alerts, bootstrap, db, export, pool, router};
 
 pub fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()
@@ -483,6 +483,31 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
                     continue;
                 }
             };
+            state.quota.observe_plugin(
+                &provider.id,
+                &account.id,
+                obs.quota_state.as_deref(),
+                obs.reset_at.as_deref(),
+            );
+            let quota_exhausted = obs.quota_state.as_deref().is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "exhausted" | "empty" | "depleted" | "none" | "0" | "0%"
+                )
+            });
+            if quota_exhausted {
+                let reset_at = obs.reset_at.as_deref().and_then(db::parse_dt);
+                let _ = pool::mark_exhausted(
+                    &state.pool,
+                    &account.id,
+                    reset_at,
+                    3600,
+                    "plugin health probe: quota exhausted",
+                )
+                .await;
+                let _ = state.registry.reload(&state.pool).await;
+                continue;
+            }
             match obs.state.as_str() {
                 "healthy" => {
                     if account.status != "healthy" {

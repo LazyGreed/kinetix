@@ -410,6 +410,11 @@ struct Attempt {
     passthrough: bool,
     /// Adaptive target-local permit held for the full upstream lifecycle.
     traffic_permit: Option<crate::upstream_traffic::TrafficPermit>,
+    /// Provider-wide breaker attempt. Recovery is committed only when the
+    /// validated response reaches a terminal success.
+    provider_attempt: crate::provider_circuit::ProviderAttempt,
+    /// Target-attempt-local start, excluding routing and credential work.
+    attempt_started: Instant,
 }
 
 /// Run the full pipeline and produce a client response.
@@ -690,6 +695,37 @@ pub async fn run(
     if let Some(route) = &route {
         if route.strategy == "adaptive" {
             targets = order_route_targets(state, route, targets).await;
+            for target in &targets {
+                match state
+                    .quota
+                    .snapshot(&target.provider.id, &target.account.id)
+                {
+                    Some(quota) => {
+                        let remaining = quota
+                            .remaining_fraction
+                            .map(|value| format!("{:.1}%", value * 100.0))
+                            .unwrap_or_else(|| "unknown".into());
+                        trace.step(
+                            "candidate",
+                            Some(target.account.label.clone()),
+                            format!(
+                                "quota-evidence: remaining={remaining} reset={} source={} observed={} freshness=fresh",
+                                quota
+                                    .reset_at
+                                    .map(|value| value.to_rfc3339())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                quota.source,
+                                quota.observed_at.to_rfc3339(),
+                            ),
+                        );
+                    }
+                    None => trace.step(
+                        "candidate",
+                        Some(target.account.label.clone()),
+                        "quota-evidence: unknown (no fresh observation)",
+                    ),
+                }
+            }
         }
     }
 
@@ -912,6 +948,43 @@ pub async fn run(
             ));
             continue;
         }
+
+        // Provider-wide transient outage gate. It is checked before credential
+        // resolution so an open provider does not churn sibling credentials.
+        let provider_attempt = match state.provider_circuits.begin_attempt(
+            &target.provider.id,
+            &target.account.id,
+            target
+                .route_target_id
+                .as_deref()
+                .unwrap_or(target.model.id.as_str()),
+        ) {
+            Ok(attempt) => attempt,
+            Err(reject) => {
+                let detail = format!(
+                    "provider_circuit_open: retry in {}s",
+                    reject.retry_after_secs
+                );
+                trace.step("skip", Some(target.account.label.clone()), detail.clone());
+                meta.fallback_path
+                    .push(format!("{}:provider_circuit_open", target.account.label));
+                state.record_skip();
+                state
+                    .target_telemetry
+                    .record(crate::target_telemetry::TelemetryEvent::synthetic(
+                        traffic_key(target),
+                        crate::target_telemetry::TelemetryOutcome::ProviderCircuitReject,
+                    ));
+                last_error = Some(ProxyError::all_unavailable(
+                    format!(
+                        "provider '{}' temporarily unavailable",
+                        target.provider.name
+                    ),
+                    Some(reject.retry_after_secs),
+                ));
+                continue;
+            }
+        };
 
         // Credential. A provider bound to a plugin credential strategy
         // (§6.0) resolves through the plugin; otherwise the built-in static
@@ -1178,6 +1251,12 @@ pub async fn run(
                     meta.fallback_path
                         .push(format!("{}:adaptive_saturated", target.account.label));
                     state.record_skip();
+                    state.target_telemetry.record(
+                        crate::target_telemetry::TelemetryEvent::synthetic(
+                            traffic_key(target),
+                            crate::target_telemetry::TelemetryOutcome::AdaptiveSaturation,
+                        ),
+                    );
                     last_error = Some(ProxyError::all_unavailable(detail, None));
                     continue;
                 }
@@ -1247,6 +1326,11 @@ pub async fn run(
 
         match send_result {
             Ok(resp) => {
+                state.quota.observe_headers(
+                    &target.provider.id,
+                    &target.account.id,
+                    resp.headers(),
+                );
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
                     let first_event_remaining =
@@ -1284,6 +1368,26 @@ pub async fn run(
                                 .await;
                             let can_fallback = allow_fallback
                                 && route_allows_fallback(route.as_ref(), failure.kind);
+                            if failure.kind == FailureKind::QuotaExhausted {
+                                state.quota.observe_exhausted(
+                                    &target.provider.id,
+                                    &target.account.id,
+                                    failure.quota_reset_at,
+                                    "upstream_error",
+                                );
+                            }
+                            let circuit_transition =
+                                provider_attempt.finish_failure(failure.kind, failure.status);
+                            record_target_telemetry(
+                                state,
+                                target,
+                                telemetry_outcome_for_failure(failure.kind),
+                                attempt_started,
+                                None,
+                                attempts_done > 1,
+                                can_fallback,
+                                circuit_transition,
+                            );
                             if !can_fallback {
                                 trace.step(
                                     "attempt",
@@ -1357,6 +1461,8 @@ pub async fn run(
                         adapter: adapter.clone(),
                         passthrough: use_passthrough && prepared.is_sse,
                         traffic_permit,
+                        provider_attempt,
+                        attempt_started,
                     };
                     return Ok(stream_response(
                         state, snap, format, meta, target_req, attempt, started, key, trace,
@@ -1404,6 +1510,16 @@ pub async fn run(
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
+                if failure.kind == FailureKind::QuotaExhausted {
+                    state.quota.observe_exhausted(
+                        &target.provider.id,
+                        &target.account.id,
+                        failure.quota_reset_at,
+                        "upstream_error",
+                    );
+                }
+                let circuit_transition =
+                    provider_attempt.finish_failure(failure.kind, failure.status);
                 state.flight.record(
                     &meta.request_id,
                     started.elapsed().as_millis() as u64,
@@ -1423,6 +1539,16 @@ pub async fn run(
                         .await
                     {
                         Ok(true) => {
+                            record_target_telemetry(
+                                state,
+                                target,
+                                telemetry_outcome_for_failure(failure.kind),
+                                attempt_started,
+                                None,
+                                attempts_done > 1,
+                                false,
+                                circuit_transition,
+                            );
                             auth_retried_accounts.insert(target.account.id.clone());
                             // Credential renewal is part of this logical target
                             // attempt, not a route fallback hop.
@@ -1489,6 +1615,16 @@ pub async fn run(
                             );
                             let can_fallback = allow_fallback
                                 && route_allows_fallback(route.as_ref(), FailureKind::AuthError);
+                            record_target_telemetry(
+                                state,
+                                target,
+                                telemetry_outcome_for_failure(failure.kind),
+                                attempt_started,
+                                None,
+                                attempts_done > 1,
+                                can_fallback,
+                                circuit_transition,
+                            );
                             if !can_fallback {
                                 trace.finish("failed");
                                 state.live.finish(
@@ -1519,6 +1655,16 @@ pub async fn run(
                 );
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                record_target_telemetry(
+                    state,
+                    target,
+                    telemetry_outcome_for_failure(failure.kind),
+                    attempt_started,
+                    None,
+                    attempts_done > 1,
+                    can_fallback,
+                    circuit_transition,
+                );
                 if !can_fallback {
                     trace.step(
                         "attempt",
@@ -1546,6 +1692,16 @@ pub async fn run(
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
+                if failure.kind == FailureKind::QuotaExhausted {
+                    state.quota.observe_exhausted(
+                        &target.provider.id,
+                        &target.account.id,
+                        failure.quota_reset_at,
+                        "upstream_error",
+                    );
+                }
+                let circuit_transition =
+                    provider_attempt.finish_failure(failure.kind, failure.status);
                 state.flight.record(
                     &meta.request_id,
                     started.elapsed().as_millis() as u64,
@@ -1555,6 +1711,16 @@ pub async fn run(
                 handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                record_target_telemetry(
+                    state,
+                    target,
+                    telemetry_outcome_for_failure(failure.kind),
+                    attempt_started,
+                    None,
+                    attempts_done > 1,
+                    can_fallback,
+                    circuit_transition,
+                );
                 if !can_fallback {
                     trace.step(
                         "attempt",
@@ -1668,6 +1834,7 @@ struct AdaptiveSortScore {
     has_capacity: bool,
     overload_ewma: f64,
     error_ewma: f64,
+    quota_preference: f64,
     ttft_ms: f64,
     priority: i64,
     route_target_id: String,
@@ -1709,7 +1876,19 @@ fn build_adaptive_scores(
         crate::upstream_traffic::TrafficSnapshot,
     >,
 ) -> std::collections::HashMap<String, AdaptiveSortScore> {
+    build_adaptive_scores_with_quota(targets, snapshots, &std::collections::HashMap::new())
+}
+
+fn build_adaptive_scores_with_quota(
+    targets: &[ResolvedTarget],
+    snapshots: &std::collections::HashMap<
+        crate::upstream_traffic::TargetKey,
+        crate::upstream_traffic::TrafficSnapshot,
+    >,
+    quota: &std::collections::HashMap<String, crate::quota::QuotaSnapshot>,
+) -> std::collections::HashMap<String, AdaptiveSortScore> {
     let neutral_ttft = median_observed_ttft(targets, snapshots).unwrap_or(0.0);
+    let now = chrono::Utc::now();
     targets
         .iter()
         .map(|target| {
@@ -1730,6 +1909,10 @@ fn build_adaptive_scores(
                 has_capacity: snapshot.has_capacity,
                 overload_ewma: snapshot.overload_ewma,
                 error_ewma: snapshot.error_ewma,
+                quota_preference: quota
+                    .get(&adaptive_candidate_key(target))
+                    .map(|snapshot| snapshot.preference(now))
+                    .unwrap_or(0.0),
                 ttft_ms,
                 priority: target.priority,
                 route_target_id: target.route_target_id.clone().unwrap_or_default(),
@@ -1756,6 +1939,11 @@ fn compare_adaptive_targets(
     b_score
         .has_capacity
         .cmp(&a_score.has_capacity)
+        .then_with(|| {
+            b_score
+                .quota_preference
+                .total_cmp(&a_score.quota_preference)
+        })
         .then_with(|| a_score.overload_ewma.total_cmp(&b_score.overload_ewma))
         .then_with(|| a_score.error_ewma.total_cmp(&b_score.error_ewma))
         .then_with(|| a_score.ttft_ms.total_cmp(&b_score.ttft_ms))
@@ -1776,6 +1964,44 @@ fn traffic_outcome_for_failure(kind: FailureKind) -> crate::upstream_traffic::Tr
         | FailureKind::TargetError
         | FailureKind::BadRequest => TrafficOutcome::Neutral,
     }
+}
+
+fn telemetry_outcome_for_failure(kind: FailureKind) -> crate::target_telemetry::TelemetryOutcome {
+    use crate::target_telemetry::TelemetryOutcome;
+    match kind {
+        FailureKind::RateLimit => TelemetryOutcome::RateLimit,
+        FailureKind::QuotaExhausted => TelemetryOutcome::QuotaExhausted,
+        FailureKind::ServerError => TelemetryOutcome::ServerError,
+        FailureKind::ConnectionError => TelemetryOutcome::ConnectionError,
+        FailureKind::Timeout => TelemetryOutcome::Timeout,
+        FailureKind::AuthError => TelemetryOutcome::AuthError,
+        FailureKind::TargetError => TelemetryOutcome::TargetError,
+        FailureKind::BadRequest => TelemetryOutcome::BadRequest,
+    }
+}
+
+fn record_target_telemetry(
+    state: &AppState,
+    target: &ResolvedTarget,
+    outcome: crate::target_telemetry::TelemetryOutcome,
+    attempt_started: Instant,
+    ttft_ms: Option<u64>,
+    fallback_attempt: bool,
+    caused_fallback: bool,
+    circuit: crate::provider_circuit::ProviderCircuitTransition,
+) {
+    let mut event = crate::target_telemetry::TelemetryEvent::attempt(
+        traffic_key(target),
+        outcome,
+        ttft_ms,
+        attempt_started.elapsed().as_millis() as u64,
+        fallback_attempt,
+        caused_fallback,
+    );
+    event.provider_circuit_open = circuit.opened;
+    event.provider_circuit_recovery = circuit.recovered;
+    event.half_open_probe = circuit.half_open_probe;
+    state.target_telemetry.record(event);
 }
 
 fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> bool {
@@ -2706,6 +2932,18 @@ async fn order_route_targets(
             .map(adaptive_candidate_key)
             .collect::<std::collections::HashSet<_>>()
     });
+    let adaptive_quota = adaptive_dispatchable.as_ref().map(|dispatchable_keys| {
+        targets
+            .iter()
+            .filter(|target| dispatchable_keys.contains(&adaptive_candidate_key(target)))
+            .filter_map(|target| {
+                state
+                    .quota
+                    .snapshot(&target.provider.id, &target.account.id)
+                    .map(|snapshot| (adaptive_candidate_key(target), snapshot))
+            })
+            .collect::<std::collections::HashMap<_, _>>()
+    });
     let adaptive_scores = adaptive_dispatchable.as_ref().map(|dispatchable_keys| {
         let dispatchable: Vec<_> = targets
             .iter()
@@ -2713,7 +2951,11 @@ async fn order_route_targets(
             .cloned()
             .collect();
         let snapshots = snapshot_traffic_targets(state, &dispatchable);
-        build_adaptive_scores(&dispatchable, &snapshots)
+        build_adaptive_scores_with_quota(
+            &dispatchable,
+            &snapshots,
+            adaptive_quota.as_ref().expect("adaptive quota snapshot"),
+        )
     });
 
     let mut groups: Vec<Vec<ResolvedTarget>> = Vec::new();
@@ -3710,6 +3952,7 @@ async fn drive_stream(
     let mut status = "success";
     let mut status_code = 200i64;
     let mut error_message: Option<String> = None;
+    let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
@@ -3768,6 +4011,7 @@ async fn drive_stream(
             error_message,
             key,
             trace,
+            provider_failure,
             committed,
         )
         .await;
@@ -3813,6 +4057,7 @@ async fn drive_stream(
             _ = tokio::time::sleep_until(idle_deadline) => {
                 status = "stream_error";
                 status_code = 504;
+                provider_failure = Some((FailureKind::Timeout, None));
                 error_message = Some("upstream stream idle timeout".into());
                 break 'outer;
             }
@@ -3840,6 +4085,7 @@ async fn drive_stream(
                             if let Some(failure) = payload_error_failure(&adapter, &payload) {
                                 status = "stream_error";
                                 status_code = 502;
+                                provider_failure = Some((failure.kind, failure.status));
                                 error_message = Some(failure.message.clone());
                                 for out in encoder.error_frame(&failure.message) {
                                     let _ = tx.send(Ok(out)).await;
@@ -3891,6 +4137,12 @@ async fn drive_stream(
                     Some(Err(error)) => {
                         status = "stream_error";
                         status_code = 502;
+                        let kind = if error.is_timeout() {
+                            FailureKind::Timeout
+                        } else {
+                            FailureKind::ConnectionError
+                        };
+                        provider_failure = Some((kind, None));
                         error_message = Some(classify_reqwest(&error));
                         break;
                     }
@@ -3946,6 +4198,7 @@ async fn drive_stream(
         error_message,
         key,
         trace,
+        provider_failure,
         committed,
     )
     .await;
@@ -3975,6 +4228,7 @@ async fn drive_stream_passthrough(
     let mut status = "success";
     let mut status_code = 200i64;
     let mut error_message: Option<String> = None;
+    let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
@@ -4020,6 +4274,7 @@ async fn drive_stream_passthrough(
             _ = tokio::time::sleep_until(idle_deadline) => {
                 status = "stream_error";
                 status_code = 504;
+                provider_failure = Some((FailureKind::Timeout, None));
                 error_message = Some("upstream stream idle timeout".into());
                 break 'outer;
             }
@@ -4046,6 +4301,7 @@ async fn drive_stream_passthrough(
                                     if let Some(failure) = payload_error_failure(&adapter, payload) {
                                         status = "stream_error";
                                         status_code = 502;
+                                        provider_failure = Some((failure.kind, failure.status));
                                         error_message = Some(failure.message);
                                         break 'outer;
                                     }
@@ -4146,6 +4402,12 @@ async fn drive_stream_passthrough(
                     Some(Err(error)) => {
                         status = "stream_error";
                         status_code = 502;
+                        let kind = if error.is_timeout() {
+                            FailureKind::Timeout
+                        } else {
+                            FailureKind::ConnectionError
+                        };
+                        provider_failure = Some((kind, None));
                         error_message = Some(classify_reqwest(&error));
                         break;
                     }
@@ -4208,6 +4470,7 @@ async fn drive_stream_passthrough(
         error_message,
         key,
         trace,
+        provider_failure,
         committed,
     )
     .await;
@@ -4277,6 +4540,7 @@ async fn drive_aggregate(
     let mut status = "success";
     let mut status_code = 200i64;
     let mut error_message: Option<String> = None;
+    let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
 
     if let Some(full_events) = attempt.full_events.take() {
@@ -4308,6 +4572,7 @@ async fn drive_aggregate(
                 Err(_) => {
                     status = "stream_error";
                     status_code = 504;
+                    provider_failure = Some((FailureKind::Timeout, None));
                     error_message = Some("upstream stream idle timeout".into());
                     break;
                 }
@@ -4337,6 +4602,7 @@ async fn drive_aggregate(
                         if let Some(failure) = payload_error_failure(&adapter, &payload) {
                             status = "stream_error";
                             status_code = 502;
+                            provider_failure = Some((failure.kind, failure.status));
                             error_message = Some(failure.message);
                             break 'outer;
                         }
@@ -4368,6 +4634,12 @@ async fn drive_aggregate(
                 Err(error) => {
                     status = "stream_error";
                     status_code = 502;
+                    let kind = if error.is_timeout() {
+                        FailureKind::Timeout
+                    } else {
+                        FailureKind::ConnectionError
+                    };
+                    provider_failure = Some((kind, None));
                     error_message = Some(classify_reqwest(&error));
                     break;
                 }
@@ -4407,6 +4679,7 @@ async fn drive_aggregate(
         error_message.clone(),
         key.clone(),
         trace,
+        provider_failure,
         committed,
     )
     .await;
@@ -4468,6 +4741,7 @@ async fn finalize_log(
     error_message: Option<String>,
     key: Option<db::VirtualKeyRow>,
     mut trace: RouteTrace,
+    provider_failure: Option<(FailureKind, Option<u16>)>,
     committed: bool,
 ) {
     if let Some(permit) = attempt.traffic_permit.as_ref() {
@@ -4479,6 +4753,49 @@ async fn finalize_log(
         };
         permit.finish(outcome);
     }
+
+    let (telemetry_outcome, circuit_transition) = if status == "success" {
+        (
+            crate::target_telemetry::TelemetryOutcome::Success,
+            attempt.provider_attempt.finish_success(),
+        )
+    } else if status == "client_disconnect" {
+        (
+            crate::target_telemetry::TelemetryOutcome::Cancelled,
+            attempt.provider_attempt.finish_neutral(),
+        )
+    } else if let Some((kind, upstream_status)) = provider_failure {
+        (
+            telemetry_outcome_for_failure(kind),
+            attempt
+                .provider_attempt
+                .finish_failure(kind, upstream_status),
+        )
+    } else {
+        // Framing/adapter/local stream-controller errors remain visible as
+        // terminal target failures but are not provider-outage evidence.
+        (
+            crate::target_telemetry::TelemetryOutcome::TargetError,
+            attempt.provider_attempt.finish_neutral(),
+        )
+    };
+    let attempt_offset_ms = attempt
+        .attempt_started
+        .saturating_duration_since(started)
+        .as_millis() as i64;
+    let target_ttft_ms = ttft_ms
+        .and_then(|value| value.checked_sub(attempt_offset_ms))
+        .map(|value| value.max(0) as u64);
+    record_target_telemetry(
+        state,
+        &attempt.target,
+        telemetry_outcome,
+        attempt.attempt_started,
+        target_ttft_ms,
+        meta.fallback_hops > 0,
+        false,
+        circuit_transition,
+    );
 
     let prices = attempt.target.model.prices();
     let cost = cost::compute_cost(&prices, &usage);
@@ -5124,6 +5441,70 @@ mod route_policy_tests {
         assert_eq!(
             compare_adaptive_targets(&primary, &fallback, &scores),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn adaptive_ordering_prefers_known_quota_headroom_over_unknown() {
+        let mut unknown = target();
+        unknown.account.id = "acc_unknown".into();
+        unknown.priority = 1;
+
+        let mut known = target();
+        known.account.id = "acc_known".into();
+        known.priority = 2;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+        let targets = vec![unknown.clone(), known.clone()];
+        let snapshots = snapshot_traffic_targets_for_test(&traffic, &targets);
+        let quota = std::collections::HashMap::from([(
+            adaptive_candidate_key(&known),
+            crate::quota::QuotaSnapshot {
+                remaining_fraction: Some(0.8),
+                reset_at: None,
+                observed_at: chrono::Utc::now(),
+                source: "test".into(),
+                max_age_secs: 60,
+            },
+        )]);
+        let scores = build_adaptive_scores_with_quota(&targets, &snapshots, &quota);
+
+        assert_eq!(
+            compare_adaptive_targets(&unknown, &known, &scores),
+            std::cmp::Ordering::Greater,
+            "known healthy quota must beat unknown without treating unknown as full quota"
+        );
+    }
+
+    #[test]
+    fn adaptive_ordering_keeps_unknown_neutral_against_known_low_quota() {
+        let mut low = target();
+        low.account.id = "acc_low".into();
+        low.priority = 1;
+
+        let mut unknown = target();
+        unknown.account.id = "acc_unknown".into();
+        unknown.priority = 2;
+
+        let traffic = crate::upstream_traffic::UpstreamTraffic::default();
+        let targets = vec![low.clone(), unknown.clone()];
+        let snapshots = snapshot_traffic_targets_for_test(&traffic, &targets);
+        let quota = std::collections::HashMap::from([(
+            adaptive_candidate_key(&low),
+            crate::quota::QuotaSnapshot {
+                remaining_fraction: Some(0.1),
+                reset_at: None,
+                observed_at: chrono::Utc::now(),
+                source: "test".into(),
+                max_age_secs: 60,
+            },
+        )]);
+        let scores = build_adaptive_scores_with_quota(&targets, &snapshots, &quota);
+
+        assert_eq!(
+            compare_adaptive_targets(&low, &unknown, &scores),
+            std::cmp::Ordering::Greater,
+            "unknown quota stays neutral and must not be synthesized as exhausted or full"
         );
     }
 
