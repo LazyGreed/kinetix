@@ -1,8 +1,10 @@
 # Kinetix
 
-**Kinetix is a self-hosted LLM gateway for coding agents and small technical teams.** It exposes OpenAI Chat Completions, a documented translated subset of OpenAI Responses, and Anthropic Messages while routing requests across Gemini, OpenAI-compatible, and Anthropic upstreams.
+**Kinetix is a self-hosted LLM gateway for coding agents and small technical teams.**
 
-Use virtual keys, account pools, executable Routes, automatic fallback, usage and cost controls, and an embedded admin dashboard — all from a single Rust binary.
+It exposes OpenAI- and Anthropic-compatible APIs in front of operator-configured LLM providers, with virtual keys, account pools, executable Routes, automatic fallback, usage/cost tracking, and a WebAssembly plugin system.
+
+Everything ships as a single Rust binary with an embedded admin dashboard.
 
 [![CI](https://github.com/PrightCord/kinetix/actions/workflows/ci.yml/badge.svg)](https://github.com/PrightCord/kinetix/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/PrightCord/kinetix)](https://github.com/PrightCord/kinetix/releases/latest)
@@ -11,72 +13,72 @@ Use virtual keys, account pools, executable Routes, automatic fallback, usage an
 
 ## Why Kinetix?
 
-LLM clients usually expect one provider and one API shape. Real deployments often need several providers, multiple credentials, fallback, spend controls, and enough observability to understand why a request went where it did.
+Coding agents and LLM clients usually expect one API endpoint. Real setups often involve multiple providers, accounts, subscriptions, models, quotas, and failure modes.
 
-Kinetix puts those concerns behind one endpoint.
+Kinetix puts them behind one endpoint.
 
-| Capability                    | What Kinetix provides                                                                                |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------- |
-| **Protocol compatibility**    | OpenAI Chat Completions, translated OpenAI Responses subset, and Anthropic Messages inbound APIs     |
-| **Provider portability**      | Gemini, OpenAI-compatible, and Anthropic outbound adapters selected by wire format                   |
-| **Virtual keys**              | Per-client model access, RPM/TPM limits, budgets, expiry, IP restrictions, and optional body logging |
-| **Account pools**             | Multiple credentials per provider with health state, cooldowns, quotas, and automatic failover       |
-| **Executable Routes**         | Priority, round-robin, weighted, least-used, and adaptive target selection with configurable fallback |
-| **Streaming-safe failover**   | Retry another eligible target before response bytes are committed to the client                      |
-| **Extensibility (WASM)**      | Sandboxed WebAssembly (Wasmtime) plugins for custom wire formats, OAuth/credential strategies, routing facts, and probes |
-| **Cost accounting**           | Versioned prices, token usage, cached/thinking-aware accounting, exports, and spend views            |
-| **Routing diagnostics**       | Route traces, request inspection, and flight-recorder diagnostics                                    |
-| **Self-hosted control plane** | SQLite, embedded dashboard, admin API, CLI, backups, and exports                                     |
-| **Single binary**             | The proxy and administration CLI ship together                                                       |
+| Capability | Kinetix |
+| --- | --- |
+| **Client APIs** | OpenAI Chat Completions, OpenAI Responses, Anthropic Messages |
+| **Provider adapters** | Gemini, OpenAI-compatible, Anthropic, and plugin-defined adapters |
+| **Virtual keys** | Per-client access, limits, budgets, expiry, and model restrictions |
+| **Account pools** | Multiple credentials with health, cooldown, quota, and selection strategies |
+| **Routes** | Priority, round-robin, weighted, least-used, adaptive routing, and fallback |
+| **Streaming-safe fallback** | Retry another eligible target before client-visible response commitment |
+| **Plugins** | Sandboxed WASM plugins for adapters, authentication, discovery, routing facts, and probes |
+| **Cost tracking** | Token usage, versioned pricing, budgets, cache/thinking-aware accounting |
+| **Observability** | Request inspection, Route Trace, diagnostics, usage, and spend |
+| **Self-hosted** | SQLite control plane, embedded dashboard, CLI, backups, and exports |
+| **Deployment** | Single Rust binary, Docker, systemd, Cloudflare Tunnel |
 
-Kinetix intentionally ships **no provider presets, bundled price lists, or guessed model capabilities**. Providers, models, prices, and policies remain operator-defined.
+Kinetix intentionally avoids hardcoded provider presets, pricing catalogs, and guessed model capabilities. Providers, models, credentials, prices, and policies remain operator-controlled.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    C["Pi / Codex / SDKs / agents"]
+    C["Pi / Claude Code / Codex / SDKs"]
     K["Kinetix"]
+
     V["Virtual keys"]
-    R["Routes & account pools"]
-    U["Usage & cost accounting"]
+    R["Routes"]
+    P["Account pools"]
 
     G["Gemini"]
     O["OpenAI-compatible"]
     A["Anthropic"]
+    W["WASM plugins"]
 
     C --> K
     K --> V
     V --> R
-    R --> G
-    R --> O
-    R --> A
-    K --> U
+    R --> P
+
+    P --> G
+    P --> O
+    P --> A
+    P --> W
 ```
 
-Clients see a stable OpenAI- or Anthropic-compatible endpoint. Kinetix resolves the requested model or Route, selects an eligible account and upstream target, applies fallback policy when necessary, and records the resulting usage and routing decision.
+Clients talk to a stable Kinetix endpoint.
+
+Kinetix validates the virtual key, resolves the requested model or Route, selects an eligible target and account, translates the request when necessary, streams the response, and records routing and usage information.
+
+Fallback is only attempted before the response has been committed to the client.
 
 ## Quick start
 
-### 1. Install
-
-The recommended Linux installer resolves the latest release and downloads the matching prebuilt binary for `x86_64` or `aarch64`. If a prebuilt binary cannot be used, it falls back to building from source.
+### Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
 ```
 
-The installer places `kinetix` in `~/.local/bin`, initializes the XDG directories, and prints the generated dashboard admin password **once**.
+The installer places `kinetix` in `~/.local/bin` and initializes its local state.
 
-Kinetix needs no `.env` or configuration file for the normal CLI workflow. State is stored under:
+No `.env` file is required for the normal CLI workflow.
 
-```text
-~/.config/kinetix
-~/.local/share/kinetix
-~/.local/state/kinetix
-```
-
-### 2. Add an upstream
+### Add a provider
 
 Example using Gemini:
 
@@ -91,7 +93,7 @@ kinetix provider add \
   --account-label primary
 ```
 
-### 3. Register a model
+### Add a model
 
 ```bash
 kinetix model add \
@@ -100,37 +102,37 @@ kinetix model add \
   --display-name "Gemini 2.5 Flash"
 ```
 
-### 4. Create a virtual key
+### Create a virtual key
 
 ```bash
 kinetix key create --name local-client --owner me
 ```
 
-The secret is printed once and starts with:
+Client keys use the form:
 
 ```text
 sk-kinetix-...
 ```
 
-### 5. Start Kinetix
+### Start Kinetix
 
 ```bash
 kinetix serve
 ```
 
-The proxy listens on:
+Proxy:
 
 ```text
 http://127.0.0.1:8080
 ```
 
-The dashboard is available at:
+Dashboard:
 
 ```text
 http://127.0.0.1:8080/admin
 ```
 
-### 6. Make a request
+### Send a request
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -147,8 +149,6 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-At this point Kinetix is installed, configured, authenticated, and serving inference traffic.
-
 ## Client APIs
 
 Kinetix exposes:
@@ -161,9 +161,11 @@ GET  /v1/models
 GET  /healthz
 ```
 
-Streaming and non-streaming requests are supported by the inference APIs.
+Inference endpoints support streaming and non-streaming operation.
 
-### Pi
+Protocol compatibility and known deviations are documented in [docs/compatibility.md](docs/compatibility.md).
+
+## Pi
 
 Example Pi provider configuration:
 
@@ -179,277 +181,182 @@ Example Pi provider configuration:
 }
 ```
 
-See [docs/pi-compatibility.md](docs/pi-compatibility.md) for Pi-specific compatibility and session-affinity notes.
+See [docs/pi-compatibility.md](docs/pi-compatibility.md) for compatibility and session-affinity details.
 
-For protocol behavior and documented deviations, see [docs/compatibility.md](docs/compatibility.md).
+## Routing
 
-## Routing and fallback
+A **Route** resolves a requested model into one or more concrete targets.
 
-A Route is an ordered set of `(account, model)` targets.
+Supported strategies include:
 
-Routes can select targets using:
+- priority
+- round-robin
+- weighted
+- least-used
+- adaptive
 
-* priority
-* round-robin
-* weighted
-* least-used
-* adaptive (target-local concurrency + TTFT/error EWMA)
+Kinetix tracks account and target health, including rate limits, quota exhaustion, authentication failures, cooldowns, concurrency, and routing telemetry.
 
-Kinetix tracks provider-account state and can react to conditions such as rate limits, quota exhaustion, authentication failures, and configured fallback triggers.
+Routes can also provide fallback and explicit session-affinity behavior.
 
-Where fallback is permitted, another eligible target can be selected before the response is committed to the client.
+Kinetix does not infer conversation identity when the client provides no supported session identifier.
 
-Routes can also use explicit session identity for sticky/cache-aware routing. Kinetix does not guess conversation identity when no supported session identifier is provided.
-
-See the [Routing and Fallback](https://github.com/PrightCord/kinetix/wiki/Routing-and-Fallback) documentation for the full model.
+See the [Routing and Fallback](https://github.com/PrightCord/kinetix/wiki/Routing-and-Fallback) documentation for details.
 
 ## Virtual keys
 
-Client credentials use the `sk-kinetix-...` format.
+Virtual keys allow multiple users, projects, tools, or agents to share one Kinetix deployment without sharing upstream credentials.
 
-Virtual-key secrets are shown once and stored as SHA-256 hashes. Policies can include:
+Policies can include:
 
-* allowed models, aliases, and Routes
-* RPM limits
-* TPM limits
-* daily USD budgets
-* monthly USD budgets
-* expiry
-* allowed IPs
-* optional request/response body logging
+- allowed models and Routes
+- RPM limits
+- TPM limits
+- daily and monthly budgets
+- expiry
+- allowed IPs
+- optional request/response body logging
 
-This lets different clients, developers, projects, or agents share the same Kinetix deployment without sharing upstream provider credentials.
+Virtual-key secrets are displayed once and stored hashed.
 
 ## Providers and accounts
 
-Providers define an upstream endpoint and wire format. Kinetix currently implements outbound adapters for:
+A **Provider** defines an upstream service and protocol configuration.
 
-* **Gemini** — `generateContent` / `streamGenerateContent`
-* **OpenAI-compatible** — `/chat/completions`
-* **Anthropic** — `/messages`
+An **Account** provides credentials or another credential strategy for that provider.
 
-Adapters are selected by configured `wire_format`, not by vendor identity.
+Built-in outbound protocols include:
 
-Each provider can have multiple credential accounts. Kinetix tracks account health and supports cooldown on `429`, `Retry-After`, quota exhaustion, authentication failures, soft spend quotas, and routing across eligible accounts.
+- Gemini
+- OpenAI-compatible
+- Anthropic
 
-Providers can also bind to WebAssembly plugins for custom wire formats (`wire_plugin`), credential strategies (`credential_plugin`), and model discovery (`model_source_plugin`).
+Providers may also use plugins for:
 
-## Plugins and extensibility
+- custom wire adapters
+- OAuth and credential strategies
+- model discovery
+- routing facts
+- health and quota probes
 
-When an upstream integration cannot be expressed through standard configuration or built-in wire formats, Kinetix supports sandboxed WebAssembly Component plugins (built on Wasmtime 48):
+Wire format describes protocol behavior. It is not treated as provider identity.
 
-* **Provider adapters (`wire_plugin`)**: Custom outbound wire translations (such as the bundled `antigravity` adapter for Google's internal API) while Kinetix manages HTTP transport and SSE framing.
-* **Credential strategies (`credential_plugin`)**: Dynamic credential acquisition and refresh (such as OAuth 2.0 refresh-token exchanges) with host-managed encrypted leases.
-* **Routing facts (`plugin.<id>.<name>`)**: Custom typed facts evaluated by Route predicates during target selection.
-* **Health probes**: Core-scheduled background health and quota verification.
-* **Model sources (`model_source_plugin`)**: Custom upstream model discovery.
+## Plugins
 
-Plugins run with zero ambient authority in a strictly isolated WebAssembly sandbox:
+Kinetix supports sandboxed WebAssembly Component plugins using Wasmtime.
 
-* Packaged as signed or hash-verified `.kxp` archives.
-* Declared, all-or-nothing permission grants (host HTTP allowlists, storage).
-* Private, encrypted per-plugin KV storage (`plugin_kv`).
-* Preemptive epoch interruption and per-store memory limits.
-* Automatic circuit breakers that fail closed on repeated faults without impacting native adapters or the core proxy.
+Plugins can extend:
 
-## Cost and usage tracking
+- provider adapters
+- credential acquisition and refresh
+- OAuth flows
+- model discovery
+- routing facts
+- health and quota probes
 
-Kinetix records usage in SQLite through a non-blocking queue.
+Plugins run without ambient authority and interact with Kinetix through the versioned WIT contract.
 
-The accounting model supports:
+Plugin packages use the `.kxp` format.
 
-* versioned per-model prices
-* input/output token accounting
-* cached-token accounting
-* thinking/reasoning-aware billing where available
-* daily and monthly budgets
-* per-day JSONL and CSV exports
-* dashboard spend windows
+Official plugin development, packaging, and catalog sources live in:
 
-Pricing remains operator-defined; Kinetix does not ship a vendor price catalog.
+[github.com/PrightCord/kinetix-plugins](https://github.com/PrightCord/kinetix-plugins)
+
+See [docs/KINETIX-PLUGIN-ARCHITECTURE.md](docs/KINETIX-PLUGIN-ARCHITECTURE.md) for the plugin architecture.
 
 ## Dashboard
 
-The embedded React dashboard is served at `/admin`.
+Kinetix includes an embedded React admin dashboard for managing and inspecting:
 
-It covers:
+- providers and accounts
+- models
+- Routes
+- virtual keys
+- plugins
+- usage and spend
+- request traces
+- routing diagnostics
+- configuration and exports
 
-* virtual keys
-* providers and models
-* provider accounts
-* Routes
-* model aliases
-* usage and spend
-* JSONL/CSV exports
-* live and completed request inspection
-* Route Trace
-* flight-recorder diagnostics
-* audit log
-* admin password management
-* Light / Dark / System themes
+The dashboard is served directly by the Kinetix binary.
 
-Destructive actions require confirmation.
+## Security
 
-> A dashboard screenshot is worth adding here once a stable image is committed to the repository, for example `docs/assets/dashboard.png`.
+Kinetix handles upstream credentials and client API keys.
 
-## Administration
+Relevant protections include:
 
-The same `kinetix` binary provides the management CLI.
+- encrypted upstream credentials at rest
+- hashed virtual-key secrets
+- sandboxed WASM plugins
+- SSRF protections for configured upstream endpoints
+- separate administrator authentication
+- request/response bodies disabled from persistence by default
+- localhost-only defaults
+- dependency and license checks
 
-Examples:
+See [SECURITY.md](SECURITY.md) for the security policy and vulnerability-reporting process.
+
+## Deployment
+
+Kinetix supports:
+
+- native binary
+- systemd
+- Docker / Docker Compose
+- Cloudflare Tunnel
+- Cloudflare Access
+
+Production deployment documentation is available in [deploy/README.md](deploy/README.md).
+
+## CLI
+
+The same `kinetix` binary provides both the gateway and administration CLI.
 
 ```bash
 kinetix status
 kinetix doctor
 
 kinetix provider --help
-kinetix model --help
 kinetix account --help
+kinetix model --help
 kinetix route --help
 kinetix alias --help
 kinetix key --help
 kinetix plugin --help
 ```
 
-Administrative commands operate directly on the SQLite control plane, so most configuration changes work even when the proxy server is stopped and do not require the dashboard or admin password.
-
-The complete command surface is documented in the [CLI Reference](https://github.com/PrightCord/kinetix/wiki/CLI-Reference).
-
-Configuration precedence is:
-
-```text
-CLI flag > environment variable > config file > default
-```
-
-`--home <dir>` creates an isolated Kinetix instance rooted at that directory.
-
-## Security
-
-Kinetix handles upstream credentials and client authentication keys, so its default deployment model is deliberately conservative.
-
-Highlights include:
-
-* AES-256-GCM encryption for upstream credentials at rest
-* WebAssembly Component sandbox (Wasmtime) with all-or-nothing permissions and encrypted KV storage
-* hashed virtual-key storage
-* SSRF protections for administrator-configured upstream endpoints
-* request/response bodies not persisted by default
-* separate administrator authentication
-* in-memory dashboard sessions
-* optional Cloudflare Access integration
-* localhost-only deployment defaults
-* dependency advisory and license checks in CI
-
-Dashboard sessions are intentionally process-local, so restarting the server invalidates existing sessions.
-
-See [SECURITY.md](SECURITY.md) and the [Security](https://github.com/PrightCord/kinetix/wiki/Security) documentation for the security model and vulnerability-reporting process.
-
-## Deployment
-
-### Native / systemd
-
-See [deploy/README.md](deploy/README.md) for the production runbook covering:
-
-* systemd
-* automatic restart
-* graceful drain
-* Cloudflare Tunnel
-* Cloudflare Access
-* backup and restore
-* upgrades
-* health checks
-
-A ready-to-use unit is provided at [deploy/kinetix.service](deploy/kinetix.service).
-
-### Docker
-
-A multi-stage `Dockerfile` and `docker-compose.yml` are included.
-
-```bash
-cp .env.docker.example .env
-docker compose up -d --build
-docker compose logs kinetix | grep -i password
-```
-
-All persistent state lives under `/data`.
-
-The Compose configuration binds Kinetix to localhost by default and includes an optional `cloudflared` profile.
-
-## Install versions
-
-Install the latest release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
-```
-
-Pin a release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh \
-  | KINETIX_VERSION=v0.1.0 bash
-```
-
-Build the current `main` branch instead:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh \
-  | KINETIX_VERSION=main bash
-```
-
-Source builds additionally require Rust/Cargo, Git, Node.js, and npm because the embedded dashboard is built together with the Rust binary.
-
-## Uninstall
-
-```bash
-kinetix uninstall
-```
-
-Or:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/uninstall.sh | bash
-```
-
-Additional options:
-
-```bash
-kinetix uninstall [--yes] [--remove-binary] [--keep-data] [--dry-run]
-```
+See the [CLI Reference](https://github.com/PrightCord/kinetix/wiki/CLI-Reference) for the complete command surface.
 
 ## Documentation
 
-The [Kinetix Wiki](https://github.com/PrightCord/kinetix/wiki) contains task-oriented documentation covering:
-
-* Getting Started
-* CLI Reference
-* Configuration
-* Architecture
-* Providers
-* Routing and Fallback
-* Authentication
-* Plugins
-* Admin API
-* Dashboard
-* Observability
-* Deployment
-* Docker
-* Security
-* Testing
-* Troubleshooting
-* FAQ
-
-Wiki sources live in [docs/wiki/](docs/wiki).
+The [Kinetix Wiki](https://github.com/PrightCord/kinetix/wiki) contains the main user and operator documentation.
 
 Additional technical documentation:
 
-* [docs/DESIGN.md](docs/DESIGN.md) — product and technical design
-* [docs/KINETIX-PLUGIN-ARCHITECTURE.md](docs/KINETIX-PLUGIN-ARCHITECTURE.md) — WebAssembly plugin architecture and WIT specification
-* [docs/compatibility.md](docs/compatibility.md) — protocol compatibility and documented deviations
-* [docs/pi-compatibility.md](docs/pi-compatibility.md) — Pi setup and acceptance notes
-* [docs/benchmarks.md](docs/benchmarks.md) — benchmark methodology and results
-* [CONTRIBUTING.md](CONTRIBUTING.md) — development and contribution guide
-* [SECURITY.md](SECURITY.md) — security policy and vulnerability reporting
+- [Design](docs/DESIGN.md)
+- [Protocol compatibility](docs/compatibility.md)
+- [Pi compatibility](docs/pi-compatibility.md)
+- [Plugin architecture](docs/KINETIX-PLUGIN-ARCHITECTURE.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Deployment](deploy/README.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+
+## Acknowledgements
+
+Kinetix is an independent project, but its development has benefited from studying and testing against other open-source work in the LLM gateway and coding-agent ecosystem.
+
+In particular:
+
+- **[9Router](https://github.com/decolua/9router)** — a useful reference for multi-provider coding-agent routing, OAuth-backed integrations, provider translation, and subscription-oriented workflows.
+- **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)** — a useful reference for routing, provider compatibility, translation behavior, and cross-provider edge cases.
+- **[pi-free](https://github.com/apmantza/pi-free)** — a useful reference for free-provider integrations and compatibility with the Pi coding-agent ecosystem.
+- **[Pi](https://pi.dev/)** — one of the coding-agent environments that motivated Kinetix's focus on streaming, tool use, model portability, routing, and long-running agent sessions.
+
+These projects are references and sources of ideas and compatibility research; Kinetix maintains its own architecture, implementation, and protocol contracts.
+
+Thanks to their maintainers and contributors for making their work available to the community.
 
 ## Contributing
 
@@ -457,7 +364,7 @@ Contributions are welcome.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, conventions, and contribution guidance.
 
-For security vulnerabilities, use the private reporting process in [SECURITY.md](SECURITY.md) rather than opening a public issue.
+For security vulnerabilities, follow the private reporting process in [SECURITY.md](SECURITY.md) rather than opening a public issue.
 
 ## License
 
