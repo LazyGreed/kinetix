@@ -288,6 +288,20 @@ fn anthropic_reset_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .min()
 }
 
+// Anthropic documents context-window exhaustion as a truncated response; the
+// Responses API represents output/context-window token exhaustion with
+// max_output_tokens:
+// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+// https://developers.openai.com/api/docs/guides/reasoning
+fn map_anthropic_stop_reason(reason: &str) -> FinishReason {
+    match reason {
+        "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
+        "tool_use" => FinishReason::ToolCalls,
+        other => FinishReason::Other(other.to_string()),
+    }
+}
+
 fn parse_anthropic_usage(usage: &Value) -> TokenUsage {
     let ordinary = usage.get("input_tokens").and_then(Value::as_u64);
     let cached = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
@@ -489,6 +503,16 @@ impl Adapter for AnthropicAdapter {
         req: &InternalRequest,
         body: &mut Value,
     ) -> Result<(), UpstreamFailure> {
+        let Some(body) = body.as_object_mut() else {
+            return Ok(());
+        };
+        if let Some(max_tokens) = req.params.max_tokens {
+            for alias in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                body.remove(alias);
+            }
+            body.insert("max_tokens".into(), json!(max_tokens));
+        }
+
         let tmap = ctx.model.thinking();
         if !tmap.is_adaptive() {
             return Ok(());
@@ -507,9 +531,6 @@ impl Adapter for AnthropicAdapter {
                 quota_reset_at: None,
             });
         }
-        let Some(body) = body.as_object_mut() else {
-            return Ok(());
-        };
         Self::apply_thinking_map(body, ctx, req);
         Ok(())
     }
@@ -646,12 +667,7 @@ impl Adapter for AnthropicAdapter {
                     events.push(StreamEvent::Usage(parse_anthropic_usage(usage)));
                 }
                 if let Some(reason) = v.pointer("/delta/stop_reason").and_then(|r| r.as_str()) {
-                    events.push(StreamEvent::Finish(match reason {
-                        "end_turn" | "stop_sequence" => FinishReason::Stop,
-                        "max_tokens" => FinishReason::Length,
-                        "tool_use" => FinishReason::ToolCalls,
-                        other => FinishReason::Other(other.to_string()),
-                    }));
+                    events.push(StreamEvent::Finish(map_anthropic_stop_reason(reason)));
                 }
             }
             "message_start" => {
@@ -714,12 +730,7 @@ impl Adapter for AnthropicAdapter {
             events.push(StreamEvent::Usage(parse_anthropic_usage(usage)));
         }
         if let Some(reason) = body.get("stop_reason").and_then(|r| r.as_str()) {
-            events.push(StreamEvent::Finish(match reason {
-                "end_turn" | "stop_sequence" => FinishReason::Stop,
-                "max_tokens" => FinishReason::Length,
-                "tool_use" => FinishReason::ToolCalls,
-                other => FinishReason::Other(other.to_string()),
-            }));
+            events.push(StreamEvent::Finish(map_anthropic_stop_reason(reason)));
         }
         Ok(events)
     }
@@ -752,6 +763,33 @@ impl Adapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_context_window_exceeded_maps_to_length_in_full_and_streaming() {
+        let adapter = AnthropicAdapter::new();
+        for stop_reason in ["max_tokens", "model_context_window_exceeded"] {
+            let full = adapter
+                .parse_full_response(&serde_json::json!({
+                    "content": [{"type": "text", "text": "partial"}],
+                    "stop_reason": stop_reason
+                }))
+                .unwrap();
+            assert!(matches!(
+                full.last(),
+                Some(StreamEvent::Finish(FinishReason::Length))
+            ));
+
+            let streaming = adapter
+                .parse_stream_chunk(&format!(
+                    r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}"}}}}"#
+                ))
+                .unwrap();
+            assert!(matches!(
+                streaming.last(),
+                Some(StreamEvent::Finish(FinishReason::Length))
+            ));
+        }
+    }
 
     #[test]
     fn usage_normalizes_cache_read_and_creation_into_total_input() {
@@ -1022,6 +1060,38 @@ mod tests {
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         assert!(body["system"].is_string());
         assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    // Anthropic's Create a Message API requires `max_tokens` as its output
+    // limit field: https://platform.claude.com/docs/en/api/messages/create.
+    #[test]
+    fn passthrough_normalization_maps_route_token_aliases_to_messages_field() {
+        let p = provider();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let mut req = base_request();
+        req.params.max_tokens = Some(512);
+
+        for alias in ["max_completion_tokens", "max_output_tokens"] {
+            let mut body = json!({
+                "max_tokens": 4096,
+                "messages": [{"role":"user","content":"hello"}]
+            });
+            body[alias] = json!(512);
+
+            AnthropicAdapter::new()
+                .normalize_passthrough_body(&ctx, &req, &mut body)
+                .unwrap();
+
+            assert_eq!(body["max_tokens"], 512);
+            assert!(body.get("max_completion_tokens").is_none());
+            assert!(body.get("max_output_tokens").is_none());
+        }
     }
 
     #[test]

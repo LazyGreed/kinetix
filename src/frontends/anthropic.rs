@@ -536,7 +536,7 @@ impl AnthropicEncoder {
             StreamEvent::Start { .. } => {
                 self.emit_start(&mut out);
             }
-            StreamEvent::TextDelta(t) => {
+            StreamEvent::TextDelta(t) | StreamEvent::RefusalDelta(t) => {
                 self.emit_start(&mut out);
                 self.open_text_block(&mut out);
                 let idx = self.open_block.as_ref().map(|(i, _)| *i).unwrap_or(0);
@@ -634,5 +634,27 @@ impl AnthropicEncoder {
             "error": { "type": "api_error", "message": message }
         });
         vec![sse_frame(Some("error"), &frame.to_string())]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streams_canonical_refusals_as_assistant_text() {
+        let mut encoder = AnthropicEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "request-id".into(),
+            created: 1,
+            responses: crate::frontends::ResponsesResponseFields::default(),
+        });
+        let frames = encoder.encode(StreamEvent::RefusalDelta("not allowed".into()));
+        let wire = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect::<String>();
+        assert!(wire.contains("not allowed"));
+        assert!(wire.contains("text_delta"));
     }
 }

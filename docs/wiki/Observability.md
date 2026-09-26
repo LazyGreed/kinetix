@@ -63,7 +63,9 @@ fallback causes, the commit point, and the final result.
 - Retrieve by the client's opaque id: `GET /admin/api/route-traces/{krt_…}`.
 
 Trace steps look like `resolve → candidate → skip → attempt → commit → result`
-with per-step timings and warnings.
+with per-step timings and warnings. Each target attempt includes its structured
+`resolved_transport` value (for example, `openai-responses`) so transport and
+endpoint decisions can be diagnosed without exposing credentials.
 
 When a request evaluates plugin routing facts (`plugin.<id>.<name>`) or targets a plugin-backed provider (`wire_plugin` / `credential_plugin`), the Route Trace records:
 - Evaluated fact values and their source (`plugin_id`, `plugin_version`, `capability`).

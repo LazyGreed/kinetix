@@ -9,9 +9,274 @@ use std::sync::Arc;
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+pub mod openai_responses;
 
 use crate::opaque_state::OpaqueStateTarget;
-use crate::types::{InternalRequest, ProxyError, StreamEvent, UpstreamFailure, WireFormat};
+use crate::types::{
+    InternalRequest, ParamSpec, ProxyError, StreamEvent, ThinkingMap, UpstreamFailure, WireFormat,
+};
+
+/// Canonical outbound execution transport. Unlike `WireFormat`, this can
+/// distinguish multiple execution surfaces for one provider family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetTransport {
+    OpenAiChat,
+    OpenAiResponses,
+    Anthropic,
+    Gemini,
+    Plugin(String),
+}
+
+impl TargetTransport {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "openai" => Some(Self::OpenAiChat),
+            "openai-responses" => Some(Self::OpenAiResponses),
+            "anthropic" => Some(Self::Anthropic),
+            "gemini" => Some(Self::Gemini),
+            _ => crate::plugins::PluginRef::parse(value)
+                .map(|reference| Self::Plugin(reference.to_string_ref())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::OpenAiChat => "openai",
+            Self::OpenAiResponses => "openai-responses",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+            Self::Plugin(reference) => reference,
+        }
+    }
+
+    fn default_for_provider(provider: &crate::db::ProviderRow) -> Result<Self, ProxyError> {
+        if let Some(reference) = provider.wire_plugin_ref() {
+            return Ok(Self::Plugin(reference.to_string_ref()));
+        }
+        match WireFormat::parse(&provider.wire_format).ok_or_else(|| {
+            ProxyError::unsupported(format!(
+                "unsupported provider wire format '{}'",
+                provider.wire_format
+            ))
+        })? {
+            WireFormat::Openai => Ok(Self::OpenAiChat),
+            WireFormat::Anthropic => Ok(Self::Anthropic),
+            WireFormat::Gemini => Ok(Self::Gemini),
+            WireFormat::Plugin => Err(ProxyError::unsupported(
+                "plugin transport requires a valid provider adapter binding",
+            )),
+        }
+    }
+
+    pub(crate) fn provider_wire_format(&self) -> Option<WireFormat> {
+        match self {
+            Self::OpenAiChat | Self::OpenAiResponses => Some(WireFormat::Openai),
+            Self::Anthropic => Some(WireFormat::Anthropic),
+            Self::Gemini => Some(WireFormat::Gemini),
+            Self::Plugin(_) => None,
+        }
+    }
+}
+
+/// One target-local decision made before adapter dispatch. Every failover
+/// candidate resolves a fresh profile; no decision is carried across targets.
+#[derive(Debug, Clone)]
+pub struct ResolvedExecutionProfile {
+    pub transport: TargetTransport,
+    pub reasoning: Option<ReasoningCapability>,
+    pub parameters: std::collections::HashMap<String, ParamSpec>,
+    pub capabilities: ModelCapabilityFlags,
+    pub thinking_map: ThinkingMap,
+}
+
+fn discovered_transport(discovery: &serde_json::Value) -> Result<Option<&str>, ProxyError> {
+    let normalized = discovery.get("transport").filter(|value| !value.is_null());
+    let raw_metadata = discovery
+        .get("raw_metadata")
+        .filter(|value| !value.is_null());
+    let observed = if let Some(transport) = normalized {
+        Some(transport.get("format").ok_or_else(|| {
+            ProxyError::unsupported("discovered model transport metadata is missing its format")
+        })?)
+    } else if let Some(transport) = raw_metadata.and_then(|metadata| metadata.get("transport")) {
+        if transport.is_null() {
+            None
+        } else {
+            Some(transport.get("format").ok_or_else(|| {
+                ProxyError::unsupported("raw discovered transport metadata is missing its format")
+            })?)
+        }
+    } else {
+        None
+    };
+    observed
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                ProxyError::unsupported("discovered model transport format must be a string")
+            })
+        })
+        .transpose()
+}
+
+/// Resolve model transport, reasoning, parameters, and capabilities in one
+/// place. Explicit invalid metadata is an error, never a signal to fall back.
+pub fn resolve_execution_profile(
+    provider: &crate::db::ProviderRow,
+    model: &crate::db::ModelRow,
+) -> Result<ResolvedExecutionProfile, ProxyError> {
+    let discovery = serde_json::from_str::<serde_json::Value>(&model.discovery)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let provider_wire = WireFormat::parse(&provider.wire_format).ok_or_else(|| {
+        ProxyError::unsupported(format!(
+            "unsupported provider wire format '{}'",
+            provider.wire_format
+        ))
+    })?;
+    let configured = match discovery.get("configured_transport") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            ProxyError::unsupported("configured model transport must be a string")
+        })?),
+    };
+    let observed = discovered_transport(&discovery)?;
+    let provider_plugin = provider.wire_plugin_ref();
+
+    let transport = if let Some(reference) = &provider_plugin {
+        let bound = TargetTransport::Plugin(reference.to_string_ref());
+        if let Some(configured) = configured {
+            let parsed = TargetTransport::parse(configured).ok_or_else(|| {
+                ProxyError::unsupported(format!(
+                    "unknown configured model transport '{configured}'"
+                ))
+            })?;
+            if parsed != bound {
+                return Err(ProxyError::unsupported(
+                    "model transport override conflicts with the provider's explicit plugin adapter",
+                ));
+            }
+        }
+        bound
+    } else if let Some(configured) = configured {
+        TargetTransport::parse(configured).ok_or_else(|| {
+            ProxyError::unsupported(format!("unknown configured model transport '{configured}'"))
+        })?
+    } else if let Some(observed) = observed {
+        TargetTransport::parse(observed).ok_or_else(|| {
+            ProxyError::unsupported(format!(
+                "unsupported discovered model transport '{observed}'"
+            ))
+        })?
+    } else {
+        TargetTransport::default_for_provider(provider)?
+    };
+
+    if provider_plugin.is_none() && provider_wire == WireFormat::Plugin {
+        return Err(ProxyError::unsupported(
+            "plugin transport requires a valid provider adapter binding",
+        ));
+    }
+
+    let reasoning = crate::adapters::normalize_reasoning_capability(&discovery);
+    let admin_thinking = model.thinking();
+    let thinking_map = if !admin_thinking.levels.is_empty()
+        || admin_thinking.mode.is_some()
+        || admin_thinking.budget_field.is_some()
+        || admin_thinking.level_field.is_some()
+    {
+        admin_thinking
+    } else {
+        discovery
+            .get("thinking_map")
+            .and_then(|value| serde_json::from_value::<ThinkingMap>(value.clone()).ok())
+            .filter(|map| {
+                !map.levels.is_empty()
+                    || map.mode.is_some()
+                    || map.budget_field.is_some()
+                    || map.level_field.is_some()
+            })
+            .or_else(|| {
+                reasoning
+                    .as_ref()
+                    .and_then(|capability| thinking_map_for_transport(capability, &transport))
+            })
+            .unwrap_or_default()
+    };
+    let configured_capabilities = serde_json::from_str::<serde_json::Value>(&model.capabilities)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let discovered_capabilities = discovery.get("capabilities");
+    let capability = |name: &str| {
+        if let Some(value) = discovered_capabilities.and_then(|value| value.get(name)) {
+            // A present null is an explicit unknown observation and must not be
+            // collapsed into a legacy false value from the configured model.
+            return value.as_bool();
+        }
+        configured_capabilities
+            .get(name)
+            .and_then(serde_json::Value::as_bool)
+    };
+    let capabilities = ModelCapabilityFlags {
+        text: capability("text"),
+        reasoning: capability("reasoning"),
+        vision: capability("vision"),
+        tool_calling: capability("tool_calling"),
+        structured_output: capability("structured_output"),
+    };
+
+    Ok(ResolvedExecutionProfile {
+        transport,
+        reasoning,
+        parameters: model.params(),
+        capabilities,
+        thinking_map,
+    })
+}
+
+pub(crate) fn thinking_map_for_transport(
+    capability: &ReasoningCapability,
+    transport: &TargetTransport,
+) -> Option<ThinkingMap> {
+    if capability.mode != Some(ReasoningCapabilityMode::Level) {
+        return None;
+    }
+    let level_field = match (transport, capability.upstream_format.as_str()) {
+        (
+            TargetTransport::OpenAiChat,
+            "openai_effort"
+            | "responses_effort"
+            | "provider_supported_thinking_efforts"
+            | "provider_reasoning_supported_efforts"
+            | "provider_supported_reasoning_levels",
+        ) => "reasoning_effort",
+        (
+            TargetTransport::OpenAiResponses,
+            "openai_effort"
+            | "responses_effort"
+            | "provider_supported_thinking_efforts"
+            | "provider_reasoning_supported_efforts"
+            | "provider_supported_reasoning_levels",
+        ) => "reasoning.effort",
+        (TargetTransport::Gemini, "gemini_thinking_level") => "thinkingConfig.thinkingLevel",
+        _ => return None,
+    };
+    let levels = capability
+        .levels
+        .iter()
+        .map(|level| {
+            let upstream = capability
+                .upstream_levels
+                .get(level)
+                .cloned()
+                .unwrap_or_else(|| level.clone());
+            (level.clone(), serde_json::Value::String(upstream))
+        })
+        .collect();
+    Some(ThinkingMap {
+        levels,
+        mode: Some(crate::types::ThinkingMode::Level),
+        budget_field: None,
+        level_field: Some(level_field.to_string()),
+    })
+}
 
 /// Everything an adapter needs to build and authenticate one upstream call.
 pub struct UpstreamContext<'a> {
@@ -930,6 +1195,7 @@ pub fn thinking_map_for_reasoning_with_wire(
 pub struct AdapterRegistry {
     gemini: Arc<dyn Adapter>,
     openai: Arc<dyn Adapter>,
+    openai_responses: Arc<dyn Adapter>,
     anthropic: Arc<dyn Adapter>,
     /// Plugin-host-backed adapters keyed by `plugin:<id>/<capability>` (§6.0).
     /// A `DashMap` so a plugin adapter can be registered at enable time without
@@ -942,6 +1208,9 @@ impl AdapterRegistry {
         AdapterRegistry {
             gemini: Arc::new(crate::adapters::gemini::GeminiAdapter::new()),
             openai: Arc::new(crate::adapters::openai::OpenAiAdapter::new()),
+            openai_responses: Arc::new(
+                crate::adapters::openai_responses::OpenAiResponsesAdapter::new(),
+            ),
             anthropic: Arc::new(crate::adapters::anthropic::AnthropicAdapter::new()),
             plugin: Arc::new(dashmap::DashMap::new()),
         }
@@ -953,6 +1222,33 @@ impl AdapterRegistry {
             WireFormat::Openai => self.openai.clone(),
             WireFormat::Anthropic => self.anthropic.clone(),
             WireFormat::Plugin => Arc::new(UnimplementedAdapter { format: "plugin" }),
+        }
+    }
+
+    /// Resolve the adapter from the already selected target transport. Missing
+    /// plugin adapters fail closed before any credential or upstream dispatch.
+    pub fn for_transport(
+        &self,
+        transport: &TargetTransport,
+    ) -> Result<Arc<dyn Adapter>, ProxyError> {
+        match transport {
+            TargetTransport::OpenAiChat => Ok(self.openai.clone()),
+            TargetTransport::OpenAiResponses => Ok(self.openai_responses.clone()),
+            TargetTransport::Anthropic => Ok(self.anthropic.clone()),
+            TargetTransport::Gemini => Ok(self.gemini.clone()),
+            TargetTransport::Plugin(reference) => self
+                .plugin
+                .get(reference)
+                .or_else(|| {
+                    crate::plugins::PluginRef::parse(reference)
+                        .and_then(|parsed| self.plugin.get(&parsed.plugin_id))
+                })
+                .map(|adapter| adapter.clone())
+                .ok_or_else(|| {
+                    ProxyError::unsupported(format!(
+                        "configured plugin adapter '{reference}' is unavailable"
+                    ))
+                }),
         }
     }
 
@@ -1394,5 +1690,179 @@ mod reasoning_discovery_tests {
         assert_eq!(capability.mode, Some(ReasoningCapabilityMode::Adaptive));
         assert_eq!(capability.upstream_format, "anthropic_effort");
         assert!(thinking_map_for_reasoning(&capability).is_none());
+    }
+}
+
+#[cfg(test)]
+mod execution_profile_tests {
+    use super::*;
+
+    fn provider() -> crate::db::ProviderRow {
+        crate::db::ProviderRow {
+            id: "provider".into(),
+            name: "provider".into(),
+            base_url: "https://example.test/v1".into(),
+            wire_format: "openai".into(),
+            auth_scheme: "bearer".into(),
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: "{}".into(),
+            timeout_ms: 1000,
+            capability_mode: "permissive".into(),
+            models_path: None,
+            rate_limit_rules: "{}".into(),
+            enabled: 1,
+            follow_redirects: 0,
+            credential_hosts: String::new(),
+            allow_insecure_tls: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            wire_plugin: String::new(),
+            credential_plugin: String::new(),
+            model_source_plugin: String::new(),
+            credential_mode: "manual".into(),
+            source_plugin_id: None,
+            source_integration_id: None,
+        }
+    }
+
+    fn model() -> crate::db::ModelRow {
+        crate::db::ModelRow {
+            id: "model".into(),
+            provider_id: "provider".into(),
+            upstream_id: "upstream".into(),
+            display_name: "model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
+    #[test]
+    fn transport_precedence_is_override_then_discovery_then_provider() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "transport": {"format": "anthropic"},
+            "configured_transport": "openai-responses"
+        })
+        .to_string();
+        assert_eq!(
+            resolve_execution_profile(&provider, &model)
+                .unwrap()
+                .transport,
+            TargetTransport::OpenAiResponses
+        );
+
+        model.discovery = serde_json::json!({"transport":{"format":"anthropic"}}).to_string();
+        assert_eq!(
+            resolve_execution_profile(&provider, &model)
+                .unwrap()
+                .transport,
+            TargetTransport::Anthropic
+        );
+
+        model.discovery = "{}".into();
+        assert_eq!(
+            resolve_execution_profile(&provider, &model)
+                .unwrap()
+                .transport,
+            TargetTransport::OpenAiChat
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_transport_and_provider_wire_fail_closed() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "transport": {"format": "not-a-transport"}
+        })
+        .to_string();
+        assert!(resolve_execution_profile(&provider, &model).is_err());
+
+        model.discovery = serde_json::json!({
+            "configured_transport": "not-a-transport"
+        })
+        .to_string();
+        assert!(resolve_execution_profile(&provider, &model).is_err());
+
+        model.discovery = serde_json::json!({
+            "configured_transport": "openai-responses"
+        })
+        .to_string();
+        let mut provider = provider;
+        provider.wire_format = "typo-openai".into();
+        assert!(resolve_execution_profile(&provider, &model).is_err());
+    }
+
+    #[test]
+    fn keeps_absent_capabilities_unknown_and_explicit_values() {
+        let provider = provider();
+        let mut model = model();
+        let profile = resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(profile.capabilities.text, None);
+        assert_eq!(profile.capabilities.vision, None);
+
+        model.capabilities = serde_json::json!({"text": false}).to_string();
+        model.discovery = serde_json::json!({
+            "capabilities": {"vision": true}
+        })
+        .to_string();
+        let profile = resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(profile.capabilities.text, Some(false));
+        assert_eq!(profile.capabilities.vision, Some(true));
+        assert_eq!(profile.capabilities.tool_calling, None);
+
+        model.discovery = serde_json::json!({
+            "capabilities": {"text": null, "vision": true}
+        })
+        .to_string();
+        let profile = resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(profile.capabilities.text, None);
+    }
+
+    #[test]
+    fn responses_transport_uses_responses_reasoning_path_and_admin_mapping_wins() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "transport": {"format": "openai-responses"},
+            "reasoning_capability": {
+                "mode": "level",
+                "levels": ["low", "high"],
+                "can_disable": false,
+                "upstream_format": "responses_effort"
+            }
+        })
+        .to_string();
+        let discovered = resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(
+            discovered.thinking_map.level_field.as_deref(),
+            Some("reasoning.effort")
+        );
+
+        model.thinking_map = serde_json::json!({
+            "levels": {"high": "vendor_high"},
+            "mode": "level",
+            "level_field": "custom.reasoning"
+        })
+        .to_string();
+        let configured = resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(
+            configured.thinking_map.level_field.as_deref(),
+            Some("custom.reasoning")
+        );
+        assert_eq!(
+            configured.thinking_map.levels.get("high"),
+            Some(&serde_json::json!("vendor_high"))
+        );
     }
 }

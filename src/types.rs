@@ -540,6 +540,10 @@ pub enum StreamEvent {
         signature: Option<String>,
     },
     TextDelta(String),
+    /// User-visible refusal text, kept distinct so Responses frontends can
+    /// preserve the protocol's refusal content item while other frontends
+    /// render it as ordinary assistant text.
+    RefusalDelta(String),
     ToolCallStart {
         index: u32,
         id: Option<String>,

@@ -112,7 +112,7 @@ fn event_to_value(event: &StreamEvent) -> Value {
             "text": text,
             "signature": signature,
         }),
-        StreamEvent::TextDelta(text) => json!({
+        StreamEvent::TextDelta(text) | StreamEvent::RefusalDelta(text) => json!({
             "type": "text_delta",
             "text": text,
         }),

@@ -172,8 +172,12 @@ fn token_count_exact_target(
     let allowed_providers = key.allowed_providers();
 
     let eligible = |target: &ResolvedTarget| {
+        let capabilities_match = !target.provider.strict()
+            || crate::adapters::resolve_execution_profile(&target.provider, &target.model)
+                .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
+                .unwrap_or(false);
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
-            && (!target.provider.strict() || target.model.caps().satisfies(&needs))
+            && capabilities_match
     };
 
     match resolved {
@@ -197,7 +201,8 @@ fn token_count_exact_target(
                     "this key is not allowed to use the resolved provider",
                 ));
             }
-            if provider.strict() && !model.caps().satisfies(&needs) {
+            let profile = crate::adapters::resolve_execution_profile(&provider, &model)?;
+            if provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
                 return Err(ProxyError::unsupported(
                     "resolved model cannot satisfy this token-count request",
                 ));
@@ -268,7 +273,8 @@ pub async fn count_tokens(
     let Some(target) = token_count_exact_target(state, key, req)? else {
         return Ok(estimate());
     };
-    let adapter = state.adapters.for_provider(&target.provider);
+    let profile = crate::adapters::resolve_execution_profile(&target.provider, &target.model)?;
+    let adapter = state.adapters.for_transport(&profile.transport)?;
     if !adapter.supports_count_tokens() {
         return Ok(estimate());
     }
@@ -661,14 +667,6 @@ pub async fn run(
             );
             return false;
         }
-        if !t.model.caps().satisfies(&needs) && t.provider.strict() {
-            trace.step(
-                "skip",
-                Some(t.model.display_name.clone()),
-                format!("model={} capability mismatch", t.model.display_name),
-            );
-            return false;
-        }
         if let Some(ctx) = t.model.context_window {
             if ctx > 0 && req.approx_input_tokens() > ctx as u64 {
                 trace.step(
@@ -872,6 +870,49 @@ pub async fn run(
             continue;
         }
 
+        // Resolve target transport and its execution metadata before any
+        // target-specific credential lookup or network dispatch.
+        let profile =
+            match crate::adapters::resolve_execution_profile(&target.provider, &target.model) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    trace.step(
+                        "skip",
+                        Some(target.model.display_name.clone()),
+                        format!("invalid execution profile: {}", error.message),
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+        trace.resolved_transport(
+            target.model.display_name.clone(),
+            profile.transport.as_str(),
+        );
+        let adapter = match state.adapters.for_transport(&profile.transport) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                trace.step(
+                    "skip",
+                    Some(target.model.display_name.clone()),
+                    format!("resolved adapter unavailable: {}", error.message),
+                );
+                last_error = Some(error);
+                continue;
+            }
+        };
+        if target.provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
+            trace.step(
+                "skip",
+                Some(target.model.display_name.clone()),
+                "resolved target capabilities do not satisfy the request",
+            );
+            last_error = Some(ProxyError::unsupported(
+                "resolved target capabilities do not satisfy the request",
+            ));
+            continue;
+        }
+
         // Credential. A provider bound to a plugin credential strategy
         // (§6.0) resolves through the plugin; otherwise the built-in static
         // strategy is used. A disabled/unavailable plugin fails closed.
@@ -929,10 +970,6 @@ pub async fn run(
             }
         };
 
-        // Adapter selection honours a plugin wire-format binding (§6.0); a
-        // bound-but-unavailable plugin adapter fails closed.
-        let adapter = state.adapters.for_provider(&target.provider);
-
         // Every target gets an isolated request view. Target overrides and
         // continuity transforms must never leak into a later fallback target.
         let mut target_req = req.clone();
@@ -949,7 +986,7 @@ pub async fn run(
             })
             .map(|id| id != target.provider.id)
             .unwrap_or(false);
-        let cross_format = !passthrough::is_passthrough(format, target.provider.wire());
+        let cross_format = !passthrough::is_transport_passthrough(format, &profile.transport);
 
         // Inline opaque state is evaluated *before* hydration so a signature we
         // are about to restore for a compatible target is never mistaken for
@@ -1053,15 +1090,18 @@ pub async fn run(
             );
         }
 
+        let mut execution_model = target.model.clone();
+        execution_model.thinking_map = serde_json::to_string(&profile.thinking_map)
+            .expect("ThinkingMap serialization is infallible");
         let ctx = UpstreamContext {
             provider: &target.provider,
-            model: &target.model,
+            model: &execution_model,
             account_id: Some(target.account.id.as_str()),
             credential,
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
-        if let Err(e) = check_param_policy(target, &target_req) {
+        if let Err(e) = check_param_policy(target, &profile, &target_req) {
             trace.finish("rejected");
             state
                 .live
@@ -1072,7 +1112,7 @@ pub async fn run(
 
         // Same-format passthrough (FR-2.7).
         let use_passthrough = target_req.raw_body.is_some()
-            && passthrough::is_passthrough(format, target.provider.wire());
+            && passthrough::is_transport_passthrough(format, &profile.transport);
 
         // Never silently drop behaviorally significant client fields on a
         // translating path (FR-2.8). A request-level failure; never retried.
@@ -1089,7 +1129,7 @@ pub async fn run(
                 ));
             }
             if let Err(error) =
-                check_thinking_translation_for_adapter(adapter.as_ref(), target, &target_req)
+                check_resolved_thinking_translation(adapter.as_ref(), target, &profile, &target_req)
             {
                 trace.finish("rejected");
                 state
@@ -1161,7 +1201,7 @@ pub async fn run(
             format!(
                 "{} via {}{}",
                 target.model.upstream_id,
-                target.provider.wire_format,
+                profile.transport.as_str(),
                 if use_passthrough {
                     " (passthrough)"
                 } else {
@@ -1880,7 +1920,7 @@ fn apply_target_overrides(req: &mut InternalRequest, overrides: &Value) -> Resul
             "temperature" => req.params.temperature = value.as_f64(),
             "top_p" => req.params.top_p = value.as_f64(),
             "top_k" => req.params.top_k = value.as_f64(),
-            "max_tokens" | "max_completion_tokens" => {
+            "max_tokens" | "max_completion_tokens" | "max_output_tokens" => {
                 req.params.max_tokens = value.as_u64().and_then(|v| u32::try_from(v).ok())
             }
             "seed" => req.params.seed = value.as_i64(),
@@ -1947,13 +1987,18 @@ fn build_upstream_body(
     }
 
     let raw = req.raw_body.as_deref().unwrap_or("{}");
-    let Some(rewritten) = passthrough::rewrite_model(
-        raw,
-        &ctx.model.upstream_id,
-        !req.stream,
-        true,
-        ctx.provider.wire(),
-    ) else {
+    let rewritten = if adapter.wire_format() == "openai-responses" {
+        passthrough::rewrite_responses_model(raw, &ctx.model.upstream_id, !req.stream)
+    } else {
+        passthrough::rewrite_model(
+            raw,
+            &ctx.model.upstream_id,
+            !req.stream,
+            true,
+            ctx.provider.wire(),
+        )
+    };
+    let Some(rewritten) = rewritten else {
         return adapter.build_body(ctx, req);
     };
     let mut body = serde_json::from_str(&rewritten).unwrap_or(Value::Null);
@@ -3078,10 +3123,12 @@ fn portability_warning(target: &ResolvedTarget, placed: usize) -> String {
 
 /// Check the admin's parameter policy; reject when a value is unsupported and
 /// the policy is `reject` (FR-10.6).
+#[cfg(test)]
 fn thinking_level_key(level: crate::types::ThinkingLevel) -> &'static str {
     level.as_key()
 }
 
+#[cfg(test)]
 fn check_thinking_translation_for_adapter(
     adapter: &dyn Adapter,
     target: &ResolvedTarget,
@@ -3093,6 +3140,40 @@ fn check_thinking_translation_for_adapter(
     check_thinking_translation(target, req)
 }
 
+fn check_resolved_thinking_translation(
+    adapter: &dyn Adapter,
+    target: &ResolvedTarget,
+    profile: &crate::adapters::ResolvedExecutionProfile,
+    req: &InternalRequest,
+) -> Result<(), ProxyError> {
+    if req.thinking.is_none() || adapter.handles_thinking_translation() {
+        return Ok(());
+    }
+    let level = req.thinking.expect("checked above");
+    let key = level.as_key();
+    let thinking = &profile.thinking_map;
+
+    if level == crate::types::ThinkingLevel::Default && thinking.is_adaptive() {
+        return Ok(());
+    }
+    if level == crate::types::ThinkingLevel::Off
+        && profile.transport == crate::adapters::TargetTransport::Anthropic
+        && thinking.is_adaptive()
+        && thinking.anthropic_adaptive_off_is_executable()
+    {
+        return Ok(());
+    }
+    if thinking.level_is_executable(key) {
+        return Ok(());
+    }
+    Err(ProxyError::unsupported(format!(
+        "thinking level '{key}' has no executable mapping for model '{}' on transport '{}'",
+        target.model.display_name,
+        profile.transport.as_str()
+    )))
+}
+
+#[cfg(test)]
 fn check_thinking_translation(
     target: &ResolvedTarget,
     req: &InternalRequest,
@@ -3128,8 +3209,32 @@ fn check_thinking_translation(
     )))
 }
 
-fn check_param_policy(target: &ResolvedTarget, req: &InternalRequest) -> Result<(), ProxyError> {
-    let params = target.model.params();
+fn target_profile_supports_request(
+    target: &ResolvedTarget,
+    needs: &crate::types::CapabilityNeeds,
+) -> bool {
+    crate::adapters::resolve_execution_profile(&target.provider, &target.model)
+        .map(|profile| {
+            !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
+        })
+        .unwrap_or(false)
+}
+
+fn profile_satisfies_needs(
+    capabilities: &crate::adapters::ModelCapabilityFlags,
+    needs: &crate::types::CapabilityNeeds,
+) -> bool {
+    (!needs.vision || capabilities.vision != Some(false))
+        && (!needs.tools || capabilities.tool_calling != Some(false))
+        && (!needs.reasoning || capabilities.reasoning != Some(false))
+}
+
+fn check_param_policy(
+    target: &ResolvedTarget,
+    profile: &crate::adapters::ResolvedExecutionProfile,
+    req: &InternalRequest,
+) -> Result<(), ProxyError> {
+    let params = &profile.parameters;
     let checks: [(&str, Option<f64>); 3] = [
         ("temperature", req.params.temperature),
         ("top_p", req.params.top_p),
@@ -3185,10 +3290,19 @@ async fn stream_response(
 
     let model_display = attempt.target.model.display_name.clone();
     let request_id = meta.request_id.clone();
+    let responses = if format == FrontendFormat::OpenAiResponses {
+        match frontends::responses::response_fields_from_request(&req) {
+            Ok(fields) => fields,
+            Err(error) => return crate::api::error_response(format, &request_id, error),
+        }
+    } else {
+        frontends::ResponsesResponseFields::default()
+    };
     let encoder_ctx = EncoderCtx {
         model_name: req.requested_model.clone(),
         request_id: request_id.clone(),
         created: chrono::Utc::now().timestamp(),
+        responses,
     };
 
     // Anthropic message_start usage is normally available during pre-commit
@@ -3359,6 +3473,10 @@ impl ToolStreamState {
                 StreamEvent::TextDelta(text) => {
                     self.pending_signature = None;
                     StreamEvent::TextDelta(text)
+                }
+                StreamEvent::RefusalDelta(text) => {
+                    self.pending_signature = None;
+                    StreamEvent::RefusalDelta(text)
                 }
                 StreamEvent::ToolCallStart {
                     index,
@@ -4305,7 +4423,14 @@ async fn drive_aggregate(
         };
     }
 
-    let body = frontends::aggregate(format, &model_name, &encoder_ctx.request_id, events, &usage);
+    let body = frontends::aggregate_with_responses_fields(
+        format,
+        &model_name,
+        &encoder_ctx.request_id,
+        events,
+        &usage,
+        &encoder_ctx.responses,
+    );
     if let Some(k) = &key {
         if k.body_logging != 0 {
             let _ = db::insert_body_log(
@@ -4646,7 +4771,7 @@ pub async fn dry_run(
             };
             let predicate_ok =
                 predicate::eligibility(&t.predicate, &request_facts, &tgt_facts).eligible;
-            let caps_ok = t.model.caps().satisfies(&needs) || !t.provider.strict();
+            let caps_ok = target_profile_supports_request(t, &needs);
             let ctx_ok = t
                 .model
                 .context_window
@@ -4692,7 +4817,7 @@ pub async fn dry_run(
         let half_open_probe =
             matches!(status, pool::AccountStatus::CircuitOpen) && pool::should_probe(&t.account);
         let account_eligible = matches!(status, pool::AccountStatus::Healthy) || half_open_probe;
-        let caps_ok = t.model.caps().satisfies(&needs) || !t.provider.strict();
+        let caps_ok = target_profile_supports_request(t, &needs);
         let ctx_ok = t
             .model
             .context_window
@@ -6230,6 +6355,30 @@ mod route_policy_tests {
     }
 
     #[test]
+    fn pending_signature_cleared_by_refusal_delta() {
+        let mut state = ToolStreamState::new("req_test");
+        state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: String::new(),
+            signature: Some("STALE".into()),
+        }]);
+        let refusal = state.normalize(vec![StreamEvent::RefusalDelta("no".into())]);
+        assert!(matches!(&refusal[0], StreamEvent::RefusalDelta(text) if text == "no"));
+        let out = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("later".into()),
+            name: "read".into(),
+            signature: None,
+        }]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart {
+                signature: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn pending_signature_cleared_by_real_thinking_delta() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
@@ -6772,6 +6921,72 @@ mod route_policy_tests {
     fn direct_target_error_does_not_rotate_credentials() {
         assert!(!route_allows_fallback(None, FailureKind::TargetError));
         assert!(route_allows_fallback(None, FailureKind::AuthError));
+    }
+
+    #[test]
+    fn same_format_chat_passthrough_preserves_max_completion_tokens() {
+        let p = provider(Value::Null);
+        let m = model(serde_json::json!({}));
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let mut req = request();
+        req.raw_body = Some(
+            serde_json::json!({
+                "model": "route",
+                "max_completion_tokens": 512
+            })
+            .to_string(),
+        );
+        req.params.max_tokens = Some(512);
+
+        let body =
+            build_upstream_body(&crate::adapters::openai::OpenAiAdapter, &ctx, &req, true).unwrap();
+
+        assert_eq!(body["max_completion_tokens"], 512);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn anthropic_passthrough_route_token_aliases_update_messages_max_tokens() {
+        let mut p = provider(Value::Null);
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({}));
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+
+        for alias in ["max_output_tokens", "max_completion_tokens"] {
+            let mut req = request();
+            req.raw_body = Some(
+                serde_json::json!({
+                    "model": "route",
+                    "messages": [{"role":"user","content":"hello"}],
+                    "max_tokens": 4096
+                })
+                .to_string(),
+            );
+            req.params.max_tokens = Some(4096);
+            apply_target_overrides(&mut req, &serde_json::json!({(alias): 512})).unwrap();
+
+            let body = build_upstream_body(
+                &crate::adapters::anthropic::AnthropicAdapter,
+                &ctx,
+                &req,
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(body["max_tokens"], 512, "override alias: {alias}");
+            assert!(body.get("max_output_tokens").is_none());
+            assert!(body.get("max_completion_tokens").is_none());
+        }
     }
 
     #[test]

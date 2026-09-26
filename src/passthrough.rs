@@ -15,6 +15,7 @@
 
 use serde_json::Value;
 
+use crate::adapters::TargetTransport;
 use crate::frontends::FrontendFormat;
 use crate::types::WireFormat;
 
@@ -24,6 +25,18 @@ pub fn is_passthrough(inbound: FrontendFormat, outbound: WireFormat) -> bool {
         FrontendFormat::OpenAi => outbound == WireFormat::Openai,
         FrontendFormat::Anthropic => outbound == WireFormat::Anthropic,
         FrontendFormat::OpenAiResponses => false,
+    }
+}
+
+/// Match inbound and target execution dialects without collapsing Chat
+/// Completions and Responses into one OpenAI transport.
+pub fn is_transport_passthrough(inbound: FrontendFormat, transport: &TargetTransport) -> bool {
+    match transport {
+        TargetTransport::OpenAiResponses => inbound == FrontendFormat::OpenAiResponses,
+        TargetTransport::Plugin(_) => false,
+        _ => transport
+            .provider_wire_format()
+            .is_some_and(|wire| is_passthrough(inbound, wire)),
     }
 }
 
@@ -66,6 +79,20 @@ pub fn rewrite_model(
     serde_json::to_string(&v).ok()
 }
 
+/// Responses same-format forwarding keeps the validated supported request
+/// fields, rewrites only the selected model and required streaming policy, and
+/// explicitly disables upstream response-object storage.
+pub fn rewrite_responses_model(raw: &str, upstream_id: &str, force_stream: bool) -> Option<String> {
+    let mut value: Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object_mut()?;
+    object.insert("model".to_string(), Value::String(upstream_id.to_string()));
+    if force_stream {
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+    object.insert("store".to_string(), Value::Bool(false));
+    serde_json::to_string(&value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +111,14 @@ mod tests {
             FrontendFormat::OpenAiResponses,
             WireFormat::Openai
         ));
+        assert!(is_transport_passthrough(
+            FrontendFormat::OpenAiResponses,
+            &TargetTransport::OpenAiResponses
+        ));
+        assert!(!is_transport_passthrough(
+            FrontendFormat::OpenAi,
+            &TargetTransport::OpenAiResponses
+        ));
     }
 
     #[test]
@@ -100,6 +135,26 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["model"], "gemini-3.6-flash");
         assert_eq!(v["vendor_extension"]["keep"][2], 3);
+    }
+
+    #[test]
+    fn responses_rewrite_preserves_supported_fields_and_disables_storage() {
+        let raw = json!({
+            "model": "client-model",
+            "stream": false,
+            "store": false,
+            "input": "hello",
+            "prompt_cache_key": "cache-key",
+            "vendor_extension": {"keep": true}
+        })
+        .to_string();
+        let out = rewrite_responses_model(&raw, "upstream-model", true).unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["model"], "upstream-model");
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["store"], false);
+        assert_eq!(value["prompt_cache_key"], "cache-key");
+        assert_eq!(value["vendor_extension"]["keep"], true);
     }
 
     #[test]

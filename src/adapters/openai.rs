@@ -178,7 +178,7 @@ impl OpenAiAdapter {
     }
 }
 
-fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
+pub(super) fn insert_dotted(obj: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
     let parts: Vec<&str> = path.split('.').collect();
     insert_dotted_rec(obj, &parts, value);
 }
@@ -340,6 +340,51 @@ impl Adapter for OpenAiAdapter {
         }
 
         Ok(Value::Object(body))
+    }
+
+    fn normalize_passthrough_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+        body: &mut Value,
+    ) -> Result<(), UpstreamFailure> {
+        let Some(body) = body.as_object_mut() else {
+            return Err(UpstreamFailure {
+                kind: FailureKind::BadRequest,
+                status: None,
+                retry_after_secs: None,
+                message: "OpenAI passthrough body must be a JSON object".into(),
+                quota_reset_at: None,
+            });
+        };
+
+        if let Some(max_tokens) = req.params.max_tokens {
+            let requested = u64::from(max_tokens);
+            // Preserve the caller's Chat token-limit spelling when it carries
+            // the canonical value. Route overrides may add a conflicting alias;
+            // in that case, prefer the field carrying the override, then fall
+            // back to an existing Chat field before using this adapter's default.
+            let field =
+                if body.get("max_completion_tokens").and_then(Value::as_u64) == Some(requested) {
+                    "max_completion_tokens"
+                } else if body.get("max_tokens").and_then(Value::as_u64) == Some(requested) {
+                    "max_tokens"
+                } else if body.contains_key("max_completion_tokens") {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+
+            for alias in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                body.remove(alias);
+            }
+            let mut max_tokens = max_tokens as i64;
+            if let Some(max) = ctx.model.max_output_tokens {
+                max_tokens = max_tokens.min(max);
+            }
+            body.insert(field.into(), json!(max_tokens));
+        }
+        Ok(())
     }
 
     fn classify_error(
@@ -648,6 +693,63 @@ mod tests {
             extra: Default::default(),
             raw_body: None,
         }
+    }
+
+    #[test]
+    fn chat_passthrough_preserves_token_limit_spelling_and_normalizes_route_aliases() {
+        let p = provider();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let adapter = OpenAiAdapter;
+        let mut req = base_request();
+        req.params.max_tokens = Some(512);
+
+        // OpenAI documents max_completion_tokens as the Chat Completions
+        // output-limit field; preserve it on native passthrough:
+        // https://developers.openai.com/api/docs/guides/token-counting.
+        let mut completion_tokens = serde_json::json!({"max_completion_tokens": 512});
+        adapter
+            .normalize_passthrough_body(&ctx, &req, &mut completion_tokens)
+            .unwrap();
+        assert_eq!(completion_tokens["max_completion_tokens"], 512);
+        assert!(completion_tokens.get("max_tokens").is_none());
+        assert!(completion_tokens.get("max_output_tokens").is_none());
+
+        // A route-level Responses alias overrides the original Chat limit, then
+        // is serialized using the Chat field already present in the request.
+        let mut route_override = serde_json::json!({"max_tokens": 4096, "max_output_tokens": 512});
+        adapter
+            .normalize_passthrough_body(&ctx, &req, &mut route_override)
+            .unwrap();
+        assert_eq!(route_override["max_tokens"], 512);
+        assert!(route_override.get("max_output_tokens").is_none());
+
+        let mut capped_model = model();
+        capped_model.max_output_tokens = Some(300);
+        let capped_ctx = UpstreamContext {
+            provider: &p,
+            model: &capped_model,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let mut capped = serde_json::json!({"max_completion_tokens": 512});
+        adapter
+            .normalize_passthrough_body(&capped_ctx, &req, &mut capped)
+            .unwrap();
+        assert_eq!(capped["max_completion_tokens"], 300);
+        assert!(capped.get("max_tokens").is_none());
+
+        req.params.max_tokens = None;
+        let mut untouched = serde_json::json!({"max_output_tokens": "unknown"});
+        adapter
+            .normalize_passthrough_body(&ctx, &req, &mut untouched)
+            .unwrap();
+        assert_eq!(untouched["max_output_tokens"], "unknown");
     }
 
     #[test]

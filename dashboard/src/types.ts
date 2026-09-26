@@ -115,6 +115,7 @@ export interface ModelConfig {
     budgetField?: string;
     levelField?: string;
   };
+  transportOverride?: string | null;
   discovery?: Record<string, unknown>;
 }
 
