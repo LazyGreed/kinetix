@@ -742,6 +742,48 @@ fn decode_tool_choice(tc: Option<&Value>) -> (Option<ToolChoice>, Option<String>
     }
 }
 
+pub fn response_fields_from_request(
+    request: &InternalRequest,
+) -> Result<crate::frontends::ResponsesResponseFields, ProxyError> {
+    let tool_choice = match request.tool_choice.unwrap_or(ToolChoice::Auto) {
+        ToolChoice::Auto => Value::String("auto".into()),
+        ToolChoice::None => Value::String("none".into()),
+        ToolChoice::Required => Value::String("required".into()),
+        ToolChoice::Specific => {
+            let name = request
+                .tool_choice_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    ProxyError::bad_request(
+                        "named Responses tool_choice is missing its function name",
+                    )
+                })?;
+            json!({ "type": "function", "name": name })
+        }
+    };
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            let mut value = json!({
+                "type": "function",
+                "name": tool.name,
+                "parameters": tool.parameters,
+            });
+            if let Some(description) = &tool.description {
+                value["description"] = json!(description);
+            }
+            value
+        })
+        .collect();
+    Ok(crate::frontends::ResponsesResponseFields {
+        parallel_tool_calls: true,
+        tool_choice,
+        tools,
+    })
+}
+
 fn map_reasoning_effort(s: &str) -> Option<ThinkingLevel> {
     match s {
         "none" | "off" => Some(ThinkingLevel::Off),
@@ -815,17 +857,17 @@ impl ResponsesEncoder {
     fn ensure_created(&mut self, out: &mut Vec<Bytes>) {
         if !self.created_sent {
             self.created_sent = true;
-            let resp_obj = json!({
-                "id": self.response_id,
-                "object": "response",
-                "created_at": self.ctx.created,
-                "model": self.ctx.model_name,
-                "status": "in_progress",
-                "error": null,
-                "incomplete_details": null,
-                "output": [],
-                "usage": null
-            });
+            let resp_obj = response_object(
+                &self.ctx.responses,
+                &self.response_id,
+                self.ctx.created,
+                &self.ctx.model_name,
+                "in_progress",
+                None,
+                None,
+                json!([]),
+                Value::Null,
+            );
             out.push(self.frame("response.created", json!({ "response": resp_obj.clone() })));
             out.push(self.frame("response.in_progress", json!({ "response": resp_obj })));
         }
@@ -914,7 +956,8 @@ impl ResponsesEncoder {
                         "output_index": 0,
                         "content_index": 0,
                         "item_id": self.text_item_id,
-                        "text": self.accumulated_text
+                        "text": self.accumulated_text,
+                        "logprobs": []
                     }),
                 ));
                 out.push(self.frame(
@@ -970,7 +1013,8 @@ impl ResponsesEncoder {
                         "output_index": 0,
                         "content_index": 0,
                         "item_id": self.text_item_id,
-                        "delta": t
+                        "delta": t,
+                        "logprobs": []
                     }),
                 ));
             }
@@ -1058,6 +1102,7 @@ impl ResponsesEncoder {
                 {
                     self.ensure_created(&mut out);
                     let response = failed_terminal_response(
+                        &self.ctx.responses,
                         &self.response_id,
                         self.ctx.created,
                         &self.ctx.model_name,
@@ -1130,6 +1175,7 @@ impl ResponsesEncoder {
             responses_stream_failure(finish, !self.accumulated_refusal.is_empty())
         {
             return failed_terminal_response(
+                &self.ctx.responses,
                 &self.response_id,
                 self.ctx.created,
                 &self.ctx.model_name,
@@ -1184,16 +1230,17 @@ impl ResponsesEncoder {
 
         let usage_obj = responses_usage(self.usage.as_ref());
 
-        json!({
-            "id": self.response_id,
-            "object": "response",
-            "created_at": self.ctx.created,
-            "model": self.ctx.model_name,
-            "status": response_status,
-            "incomplete_details": incomplete_reason.map(|reason| json!({"reason": reason})),
-            "output": output,
-            "usage": usage_obj
-        })
+        response_object(
+            &self.ctx.responses,
+            &self.response_id,
+            self.ctx.created,
+            &self.ctx.model_name,
+            response_status,
+            None,
+            incomplete_reason.map(|reason| json!({ "reason": reason })),
+            json!(output),
+            usage_obj,
+        )
     }
 
     pub fn finalize(&mut self) -> Vec<Bytes> {
@@ -1205,20 +1252,13 @@ impl ResponsesEncoder {
     }
 
     pub fn error_frame(&mut self, message: &str) -> Vec<Bytes> {
-        let response = json!({
-            "id": self.response_id,
-            "object": "response",
-            "created_at": self.ctx.created,
-            "model": self.ctx.model_name,
-            "status": "failed",
-            "error": {
-                "message": message,
-                "code": "stream_error"
-            },
-            "incomplete_details": null,
-            "output": [],
-            "usage": null
-        });
+        let response = failed_response(
+            &self.ctx.responses,
+            &self.response_id,
+            self.ctx.created,
+            &self.ctx.model_name,
+            message,
+        );
         vec![self.frame("response.failed", json!({ "response": response }))]
     }
 }
@@ -1227,30 +1267,24 @@ impl ResponsesEncoder {
 // Non-streaming Aggregation
 // ---------------------------------------------------------------------------
 
+// Responses requires both usage detail objects; emit their documented counters as
+// zero when upstream usage omitted them so every synthesized usage has one shape.
+// https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_usage.py
 fn responses_usage(usage: Option<&crate::types::TokenUsage>) -> Value {
     let input = usage.and_then(|usage| usage.input).unwrap_or(0);
     let output = usage.and_then(|usage| usage.output).unwrap_or(0);
-    let mut usage_obj = json!({
-        "total_tokens": input + output,
+    json!({
+        "total_tokens": input.saturating_add(output),
         "input_tokens": input,
+        "input_tokens_details": {
+            "cached_tokens": usage.and_then(|usage| usage.cached).unwrap_or(0),
+            "cache_write_tokens": usage.and_then(|usage| usage.cache_write).unwrap_or(0)
+        },
         "output_tokens": output,
-    });
-
-    let mut input_details = serde_json::Map::new();
-    if let Some(cached) = usage.and_then(|usage| usage.cached) {
-        input_details.insert("cached_tokens".into(), json!(cached));
-    }
-    if let Some(cache_write) = usage.and_then(|usage| usage.cache_write) {
-        input_details.insert("cache_write_tokens".into(), json!(cache_write));
-    }
-    if !input_details.is_empty() {
-        usage_obj["input_tokens_details"] = Value::Object(input_details);
-    }
-    if let Some(reasoning) = usage.and_then(|usage| usage.thinking) {
-        usage_obj["output_tokens_details"] = json!({ "reasoning_tokens": reasoning });
-    }
-
-    usage_obj
+        "output_tokens_details": {
+            "reasoning_tokens": usage.and_then(|usage| usage.thinking).unwrap_or(0)
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1325,7 +1359,55 @@ fn responses_incomplete_reason(finish: &FinishReason) -> Option<&'static str> {
 // terminal event, not incomplete_details.reason:
 // https://developers.openai.com/api/reference/cli/resources/responses/methods/retrieve
 // https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses
+fn response_object(
+    fields: &crate::frontends::ResponsesResponseFields,
+    response_id: &str,
+    created_at: i64,
+    model: &str,
+    status: &str,
+    error: Option<Value>,
+    incomplete_details: Option<Value>,
+    output: Value,
+    usage: Value,
+) -> Value {
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model,
+        "status": status,
+        "error": error,
+        "incomplete_details": incomplete_details,
+        "output": output,
+        "usage": usage,
+        "parallel_tool_calls": fields.parallel_tool_calls,
+        "tool_choice": fields.tool_choice,
+        "tools": fields.tools
+    })
+}
+
+fn failed_response(
+    fields: &crate::frontends::ResponsesResponseFields,
+    response_id: &str,
+    created_at: i64,
+    model: &str,
+    message: &str,
+) -> Value {
+    response_object(
+        fields,
+        response_id,
+        created_at,
+        model,
+        "failed",
+        Some(json!({ "message": message, "code": "server_error" })),
+        None,
+        json!([]),
+        Value::Null,
+    )
+}
+
 fn failed_terminal_response(
+    fields: &crate::frontends::ResponsesResponseFields,
     response_id: &str,
     created_at: i64,
     model: &str,
@@ -1339,20 +1421,7 @@ fn failed_terminal_response(
             "The upstream refusal cannot be represented as typed refusal content on this streaming path."
         }
     };
-    json!({
-        "id": response_id,
-        "object": "response",
-        "created_at": created_at,
-        "model": model,
-        "status": "failed",
-        "error": {
-            "message": message,
-            "code": "server_error"
-        },
-        "incomplete_details": null,
-        "output": [],
-        "usage": null
-    })
+    failed_response(fields, response_id, created_at, model, message)
 }
 
 pub fn aggregate_responses(
@@ -1360,6 +1429,22 @@ pub fn aggregate_responses(
     request_id: &str,
     events: Vec<StreamEvent>,
     usage: &crate::types::TokenUsage,
+) -> Value {
+    aggregate_responses_with_fields(
+        model_name,
+        request_id,
+        events,
+        usage,
+        &crate::frontends::ResponsesResponseFields::default(),
+    )
+}
+
+pub fn aggregate_responses_with_fields(
+    model_name: &str,
+    request_id: &str,
+    events: Vec<StreamEvent>,
+    usage: &crate::types::TokenUsage,
+    fields: &crate::frontends::ResponsesResponseFields,
 ) -> Value {
     let mut text = String::new();
     let mut refusal = String::new();
@@ -1390,6 +1475,7 @@ pub fn aggregate_responses(
     if let ResponsesTerminal::Failed(failure) = terminal {
         let response_id = format!("resp_{}", request_id.replace(['-', '_'], ""));
         return failed_terminal_response(
+            fields,
             &response_id,
             chrono::Utc::now().timestamp(),
             model_name,
@@ -1443,20 +1529,23 @@ pub fn aggregate_responses(
 
     let usage_obj = responses_usage(Some(usage));
 
-    json!({
-        "id": format!("resp_{}", request_id.replace(['-', '_'], "")),
-        "object": "response",
-        "created_at": chrono::Utc::now().timestamp(),
-        "model": model_name,
-        "status": response_status,
-        "incomplete_details": incomplete_reason.map(|reason| json!({"reason": reason})),
-        "output": output,
-        "usage": usage_obj
-    })
+    response_object(
+        fields,
+        &format!("resp_{}", request_id.replace(['-', '_'], "")),
+        chrono::Utc::now().timestamp(),
+        model_name,
+        response_status,
+        None,
+        incomplete_reason.map(|reason| json!({ "reason": reason })),
+        json!(output),
+        usage_obj,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(dead_code)]
+
     use super::*;
 
     // ResponseError.code from OpenAI's current generated Python API types:
@@ -1482,7 +1571,525 @@ mod tests {
         "unsupported_image_media_type",
         "empty_image_file",
         "failed_to_download_image",
+        "image_file_not_found",
     ];
+
+    // Test-only mirrors of required fields in OpenAI's generated Responses types.
+    // These catch schema drift in synthesized responses/events rather than only
+    // asserting individual JSON keys.
+    // https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response.py
+    // https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_usage.py
+    // https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_error.py
+    // https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_text_delta_event.py
+    // https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_text_done_event.py
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum ResponseToolChoiceSchema {
+        Option(ResponseToolChoiceOptionSchema),
+        Function(ResponseFunctionToolChoiceSchema),
+    }
+
+    #[derive(serde::Deserialize)]
+    enum ResponseToolChoiceOptionSchema {
+        #[serde(rename = "auto")]
+        Auto,
+        #[serde(rename = "none")]
+        NoneChoice,
+        #[serde(rename = "required")]
+        Required,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ResponseFunctionToolChoiceSchema {
+        #[serde(rename = "type")]
+        kind: ResponseFunctionKindSchema,
+        name: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    enum ResponseFunctionKindSchema {
+        #[serde(rename = "function")]
+        Function,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum ResponseToolSchema {
+        #[serde(rename = "function")]
+        Function {
+            name: String,
+            parameters: Option<Value>,
+            description: Option<String>,
+            defer_loading: Option<bool>,
+        },
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ResponseUsageSchema {
+        input_tokens: u64,
+        input_tokens_details: InputTokenDetailsSchema,
+        output_tokens: u64,
+        output_tokens_details: OutputTokenDetailsSchema,
+        total_tokens: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct InputTokenDetailsSchema {
+        cached_tokens: u64,
+        cache_write_tokens: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OutputTokenDetailsSchema {
+        reasoning_tokens: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ResponseErrorSchema {
+        code: String,
+        message: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum ResponseContentSchema {
+        #[serde(rename = "output_text")]
+        OutputText {
+            annotations: Vec<Value>,
+            text: String,
+        },
+        #[serde(rename = "refusal")]
+        Refusal { refusal: String },
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum ResponseOutputItemSchema {
+        #[serde(rename = "message")]
+        Message {
+            id: String,
+            role: String,
+            status: String,
+            content: Vec<ResponseContentSchema>,
+        },
+        #[serde(rename = "function_call")]
+        FunctionCall {
+            id: String,
+            call_id: String,
+            name: String,
+            arguments: String,
+            status: String,
+        },
+    }
+
+    #[derive(serde::Deserialize)]
+    enum ResponseObjectSchema {
+        #[serde(rename = "response")]
+        Response,
+    }
+
+    #[derive(serde::Deserialize)]
+    enum ResponseStatusSchema {
+        #[serde(rename = "completed")]
+        Completed,
+        #[serde(rename = "failed")]
+        Failed,
+        #[serde(rename = "in_progress")]
+        InProgress,
+        #[serde(rename = "cancelled")]
+        Cancelled,
+        #[serde(rename = "queued")]
+        Queued,
+        #[serde(rename = "incomplete")]
+        Incomplete,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ResponseSchema {
+        id: String,
+        object: ResponseObjectSchema,
+        created_at: f64,
+        model: String,
+        status: ResponseStatusSchema,
+        error: Option<ResponseErrorSchema>,
+        incomplete_details: Option<Value>,
+        output: Vec<ResponseOutputItemSchema>,
+        usage: Option<ResponseUsageSchema>,
+        parallel_tool_calls: bool,
+        tool_choice: ResponseToolChoiceSchema,
+        tools: Vec<ResponseToolSchema>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum ResponseLifecycleEventSchema {
+        #[serde(rename = "response.created")]
+        Created {
+            sequence_number: u64,
+            response: ResponseSchema,
+        },
+        #[serde(rename = "response.in_progress")]
+        InProgress {
+            sequence_number: u64,
+            response: ResponseSchema,
+        },
+        #[serde(rename = "response.completed")]
+        Completed {
+            sequence_number: u64,
+            response: ResponseSchema,
+        },
+        #[serde(rename = "response.incomplete")]
+        Incomplete {
+            sequence_number: u64,
+            response: ResponseSchema,
+        },
+        #[serde(rename = "response.failed")]
+        Failed {
+            sequence_number: u64,
+            response: ResponseSchema,
+        },
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum ResponseOutputItemEventSchema {
+        #[serde(rename = "response.output_item.added")]
+        Added {
+            sequence_number: u64,
+            output_index: u64,
+            item: ResponseOutputItemSchema,
+        },
+        #[serde(rename = "response.output_item.done")]
+        Done {
+            sequence_number: u64,
+            output_index: u64,
+            item: ResponseOutputItemSchema,
+        },
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type")]
+    enum ResponseContentPartEventSchema {
+        #[serde(rename = "response.content_part.added")]
+        Added {
+            sequence_number: u64,
+            content_index: u64,
+            item_id: String,
+            output_index: u64,
+            part: ResponseContentSchema,
+        },
+        #[serde(rename = "response.content_part.done")]
+        Done {
+            sequence_number: u64,
+            content_index: u64,
+            item_id: String,
+            output_index: u64,
+            part: ResponseContentSchema,
+        },
+    }
+
+    #[derive(serde::Deserialize)]
+    enum ResponseTextDeltaEventTypeSchema {
+        #[serde(rename = "response.output_text.delta")]
+        Delta,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ResponseTextDeltaEventSchema {
+        #[serde(rename = "type")]
+        kind: ResponseTextDeltaEventTypeSchema,
+        sequence_number: u64,
+        content_index: u64,
+        delta: String,
+        item_id: String,
+        logprobs: Vec<Value>,
+        output_index: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    enum ResponseTextDoneEventTypeSchema {
+        #[serde(rename = "response.output_text.done")]
+        Done,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ResponseTextDoneEventSchema {
+        #[serde(rename = "type")]
+        kind: ResponseTextDoneEventTypeSchema,
+        sequence_number: u64,
+        content_index: u64,
+        item_id: String,
+        logprobs: Vec<Value>,
+        output_index: u64,
+        text: String,
+    }
+
+    fn validate_current_responses_event(event: Value) {
+        let event_type = event["type"].as_str().expect("event type");
+        match event_type {
+            "response.created"
+            | "response.in_progress"
+            | "response.completed"
+            | "response.incomplete"
+            | "response.failed" => {
+                let _: ResponseLifecycleEventSchema = serde_json::from_value(event).unwrap();
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let _: ResponseOutputItemEventSchema = serde_json::from_value(event).unwrap();
+            }
+            "response.content_part.added" | "response.content_part.done" => {
+                let _: ResponseContentPartEventSchema = serde_json::from_value(event).unwrap();
+            }
+            "response.output_text.delta" => {
+                let _: ResponseTextDeltaEventSchema = serde_json::from_value(event).unwrap();
+            }
+            "response.output_text.done" => {
+                let _: ResponseTextDoneEventSchema = serde_json::from_value(event).unwrap();
+            }
+            unexpected => panic!("uncovered Responses event schema: {unexpected}"),
+        }
+    }
+
+    fn validate_current_responses_response(response: Value) -> ResponseSchema {
+        serde_json::from_value(response).unwrap()
+    }
+
+    #[test]
+    fn synthesized_responses_stream_and_aggregation_match_current_wire_schemas() {
+        let request = decode_request(json!({
+            "model": "example",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "weather"},
+            "tools": [{
+                "type": "function",
+                "name": "weather",
+                "description": "Get the weather",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+        let fields = response_fields_from_request(&request).unwrap();
+        let usage = crate::types::TokenUsage {
+            input: Some(3),
+            output: Some(2),
+            cached: None,
+            cache_write: None,
+            thinking: None,
+        };
+        let mut encoder = ResponsesEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "schema-test".into(),
+            created: 1,
+            responses: fields.clone(),
+        });
+        let mut frames = Vec::new();
+        for event in [
+            StreamEvent::Start {
+                upstream_request_id: None,
+            },
+            StreamEvent::TextDelta("hello".into()),
+            StreamEvent::Usage(usage.clone()),
+            StreamEvent::Finish(FinishReason::Stop),
+        ] {
+            frames.extend(encoder.encode(event));
+        }
+
+        let mut wire_events = Vec::new();
+        for frame in frames {
+            let frame = String::from_utf8(frame.to_vec()).unwrap();
+            let payload = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("SSE data payload");
+            let event: Value = serde_json::from_str(payload).unwrap();
+            validate_current_responses_event(event.clone());
+            wire_events.push(event);
+        }
+        for required_event in [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ] {
+            assert!(
+                wire_events
+                    .iter()
+                    .any(|event| event["type"] == required_event),
+                "missing schema-validated event {required_event}"
+            );
+        }
+        let completed = wire_events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap()["response"]
+            .clone();
+        let response = validate_current_responses_response(completed);
+        assert!(matches!(response.object, ResponseObjectSchema::Response));
+        assert!(matches!(response.status, ResponseStatusSchema::Completed));
+        assert!(response.parallel_tool_calls);
+        assert_eq!(response.tools.len(), 1);
+        match response.tool_choice {
+            ResponseToolChoiceSchema::Function(choice) => {
+                assert!(matches!(choice.kind, ResponseFunctionKindSchema::Function));
+                assert_eq!(choice.name, "weather");
+            }
+            ResponseToolChoiceSchema::Option(_) => panic!("function tool choice was not preserved"),
+        }
+        match response.tools.into_iter().next().unwrap() {
+            ResponseToolSchema::Function { name, .. } => assert_eq!(name, "weather"),
+        }
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens_details.cached_tokens, 0);
+        assert_eq!(usage.input_tokens_details.cache_write_tokens, 0);
+        assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
+        assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
+
+        let mut incomplete_encoder = ResponsesEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "schema-test-incomplete".into(),
+            created: 1,
+            responses: fields.clone(),
+        });
+        let incomplete_frames = incomplete_encoder
+            .encode(StreamEvent::TextDelta("partial".into()))
+            .into_iter()
+            .chain(incomplete_encoder.encode(StreamEvent::Finish(FinishReason::Length)));
+        let mut incomplete_response = None;
+        for frame in incomplete_frames {
+            let frame = String::from_utf8(frame.to_vec()).unwrap();
+            let payload = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("incomplete SSE data payload");
+            let event: Value = serde_json::from_str(payload).unwrap();
+            validate_current_responses_event(event.clone());
+            if event["type"] == "response.incomplete" {
+                incomplete_response = Some(event["response"].clone());
+            }
+        }
+        let incomplete = validate_current_responses_response(
+            incomplete_response.expect("incomplete terminal response"),
+        );
+        assert!(matches!(
+            incomplete.status,
+            ResponseStatusSchema::Incomplete
+        ));
+        assert_eq!(
+            incomplete.incomplete_details.unwrap()["reason"],
+            "max_output_tokens"
+        );
+
+        let nonstream = aggregate_responses_with_fields(
+            "example",
+            "schema-test-nonstream",
+            vec![
+                StreamEvent::TextDelta("hello".into()),
+                StreamEvent::Finish(FinishReason::Stop),
+            ],
+            &usage_for_schema_test(),
+            &fields,
+        );
+        let nonstream = validate_current_responses_response(nonstream);
+        assert!(matches!(nonstream.status, ResponseStatusSchema::Completed));
+        assert!(nonstream.parallel_tool_calls);
+        assert_eq!(nonstream.tools.len(), 1);
+
+        let failed_aggregate = aggregate_responses_with_fields(
+            "example",
+            "schema-test-terminal-failure",
+            vec![StreamEvent::Finish(FinishReason::Other(
+                "pause_turn".into(),
+            ))],
+            &usage_for_schema_test(),
+            &fields,
+        );
+        let failed_aggregate = validate_current_responses_response(failed_aggregate);
+        assert!(matches!(
+            failed_aggregate.status,
+            ResponseStatusSchema::Failed
+        ));
+        let failed_error = failed_aggregate.error.unwrap();
+        assert_eq!(failed_error.code, "server_error");
+        assert!(OPENAI_RESPONSE_ERROR_CODES.contains(&failed_error.code.as_str()));
+
+        let mut failed_encoder = ResponsesEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "schema-test-failure".into(),
+            created: 1,
+            responses: fields.clone(),
+        });
+        let failed_frames = failed_encoder.error_frame("upstream stream ended early");
+        let failed_payload = String::from_utf8(failed_frames[0].to_vec()).unwrap();
+        let failed_payload = failed_payload
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("failed SSE data payload");
+        let failed_event: Value = serde_json::from_str(failed_payload).unwrap();
+        validate_current_responses_event(failed_event.clone());
+        assert_eq!(failed_event["response"]["error"]["code"], "server_error");
+        assert!(OPENAI_RESPONSE_ERROR_CODES
+            .contains(&failed_event["response"]["error"]["code"].as_str().unwrap()));
+    }
+
+    fn usage_for_schema_test() -> crate::types::TokenUsage {
+        crate::types::TokenUsage {
+            input: Some(3),
+            output: Some(2),
+            cached: None,
+            cache_write: None,
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn response_fields_preserve_tool_choice_and_function_tools() {
+        let request = decode_request(json!({
+            "model": "example",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "weather"},
+            "tools": [{
+                "type": "function",
+                "name": "weather",
+                "description": "Get the weather",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+        let fields = response_fields_from_request(&request).unwrap();
+
+        assert!(fields.parallel_tool_calls);
+        assert_eq!(
+            fields.tool_choice,
+            json!({"type": "function", "name": "weather"})
+        );
+        assert_eq!(
+            fields.tools,
+            vec![json!({
+                "type": "function",
+                "name": "weather",
+                "description": "Get the weather",
+                "parameters": {"type": "object"}
+            })]
+        );
+    }
+
+    #[test]
+    fn response_fields_reject_a_named_tool_choice_without_its_name() {
+        let mut request = decode_request(json!({
+            "model": "example",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "weather"}
+        }))
+        .unwrap();
+        request.tool_choice_name = None;
+
+        assert!(response_fields_from_request(&request).is_err());
+    }
 
     #[test]
     fn validated_responses_body_is_retained_for_native_passthrough() {
@@ -1621,6 +2228,7 @@ mod tests {
             model_name: "example".into(),
             request_id: "request-id".into(),
             created: 1,
+            responses: crate::frontends::ResponsesResponseFields::default(),
         });
         let mut frames = encoder.encode(StreamEvent::RefusalDelta("not allowed".into()));
         frames.extend(encoder.encode(StreamEvent::Usage(crate::types::TokenUsage {
@@ -1657,6 +2265,7 @@ mod tests {
             model_name: "example".into(),
             request_id: "request-id".into(),
             created: 1,
+            responses: crate::frontends::ResponsesResponseFields::default(),
         });
         let mut frames = encoder.encode(StreamEvent::TextDelta("I cannot help with that.".into()));
         for event in events {
@@ -1685,6 +2294,7 @@ mod tests {
             model_name: "example".into(),
             request_id: "request-id".into(),
             created: 1,
+            responses: crate::frontends::ResponsesResponseFields::default(),
         });
         let mut frames = encoder.encode(StreamEvent::TextDelta("partial".into()));
         for event in events {

@@ -99,6 +99,16 @@
       "summary": "Native response.incomplete events preserve usage and aggregate status=incomplete with incomplete_details.reason"
     },
     {
+      "id": "responses.synthetic.wire_schema",
+      "runner": "cargo",
+      "summary": "Synthesized Responses lifecycle/output-text events and aggregates deserialize against current SDK types, including required request fields, logprobs and usage details"
+    },
+    {
+      "id": "responses.translate.stream_failure",
+      "runner": "cargo",
+      "summary": "Translated Responses streams ending before a terminal event emit schema-valid response.failed with ResponseError.code=server_error"
+    },
+    {
       "id": "responses.native.unsupported_parameters",
       "runner": "cargo",
       "summary": "Unsupported Responses transport parameters fail closed rather than being dropped"
@@ -786,6 +796,16 @@
           ]
         ],
         [
+          "Response object / output_text event required fields",
+          "parallel_tool_calls, tool_choice, tools; logprobs on output_text delta/done; usage details always present",
+          "synthesized Responses objects use request tool metadata and required fields",
+          "Schema regressions deserialize created, in-progress, completed, incomplete, and failed Responses plus text events; absent usage breakdown counts default to zero.",
+          [
+            "responses.synthetic.wire_schema",
+            "responses.translate.stream_failure"
+          ]
+        ],
+        [
           "tool_choice auto/none/required/named function",
           "n/a",
           "translated",
@@ -870,10 +890,11 @@
           "usage input_tokens_details / output_tokens_details",
           "known cached, cache-write and reasoning token breakdowns preserved",
           "canonical usage",
-          "Responses aggregation emits the documented plural detail fields, includes cache_write_tokens when supplied, and omits unknown breakdown metadata.",
+          "Responses aggregation always emits the documented plural detail objects, defaults missing breakdown counts to zero, and preserves cached, cache-write, and reasoning counts when supplied.",
           [
             "responses.native.openai.sync",
-            "responses.native.openai.passthrough"
+            "responses.native.openai.passthrough",
+            "responses.synthetic.wire_schema"
           ]
         ],
         [

@@ -20,6 +20,7 @@ fn ctx() -> EncoderCtx {
         model_name: "test-model".into(),
         request_id: "req_fixture".into(),
         created: 1_700_000_000,
+        responses: frontends::ResponsesResponseFields::default(),
     }
 }
 

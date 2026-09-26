@@ -612,6 +612,7 @@ mod tests {
             model_name: "example".into(),
             request_id: "request-id".into(),
             created: 1,
+            responses: crate::frontends::ResponsesResponseFields::default(),
         });
         let frames = encoder.encode(StreamEvent::RefusalDelta("not allowed".into()));
         let wire = frames

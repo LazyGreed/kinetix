@@ -56,6 +56,16 @@ async fn upstream(
                 .and_then(Value::as_str)
                 .and_then(|input| input.strip_prefix("case:"))
         })
+        .or_else(|| {
+            body.pointer("/messages/0/content/0/text")
+                .and_then(Value::as_str)
+                .and_then(|input| input.strip_prefix("case:"))
+        })
+        .or_else(|| {
+            body.pointer("/messages/0/content")
+                .and_then(Value::as_str)
+                .and_then(|input| input.strip_prefix("case:"))
+        })
         .unwrap_or_default()
         .to_string();
     mock.requests.lock().await.push(CapturedRequest {
@@ -71,6 +81,22 @@ async fn upstream(
             .body(Body::from(concat!(
                 "data: {\"type\":\"response.refusal.delta\",\"delta\":\"I cannot help with that.\"}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":6}}}\n\n"
+            )))
+            .unwrap(),
+        "translated_midstream_failure" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial translated answer\"}}\n\n",
+            ))
+            .unwrap(),
+        "translated_full" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(concat!(
+                "{\"id\":\"msg_translated\",\"type\":\"message\",\"role\":\"assistant\",",
+                "\"model\":\"upstream-anthropic-model\",\"content\":[{\"type\":\"text\",\"text\":\"translated answer\"}],",
+                "\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}"
             )))
             .unwrap(),
         "incomplete" | "incomplete_native" => Response::builder()
@@ -331,6 +357,53 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         .await
         .unwrap();
     }
+    let translated_model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "upstream-anthropic-model",
+            display_name: "Translated Anthropic model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: Some(1024),
+            capabilities: json!({"text": true}),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({"configured_transport": "anthropic"}),
+        },
+    )
+    .await
+    .unwrap();
+    let translated_route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "responses-translated-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &pool,
+        &translated_route_id,
+        None,
+        &translated_model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+
     db::insert_virtual_key(
         &pool,
         &db::VirtualKeyRow {
@@ -540,8 +613,68 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected_parameter}");
 
+    let (status, translated_failure) = call_responses(
+        &state,
+        "responses-translated-route",
+        "translated_midstream_failure",
+        true,
+        json!({
+            "tool_choice": {"type": "function", "name": "weather"},
+            "tools": [{
+                "type": "function",
+                "name": "weather",
+                "parameters": {"type": "object"}
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{translated_failure}");
+    assert!(translated_failure.contains("partial translated answer"));
+    let failed_event = translated_failure
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+        .find(|event| event["type"] == "response.failed")
+        .expect("translated mid-stream failure event");
+    assert_eq!(failed_event["type"], "response.failed");
+    assert_eq!(failed_event["response"]["status"], "failed");
+    assert_eq!(failed_event["response"]["error"]["code"], "server_error");
+    assert!(failed_event["response"]["parallel_tool_calls"]
+        .as_bool()
+        .unwrap());
+    assert_eq!(
+        failed_event["response"]["tool_choice"],
+        json!({"type": "function", "name": "weather"})
+    );
+    assert_eq!(failed_event["response"]["tools"][0]["name"], "weather");
+
+    let (status, translated_full) = call_responses(
+        &state,
+        "responses-translated-route",
+        "translated_full",
+        false,
+        json!({
+            "tool_choice": {"type": "function", "name": "weather"},
+            "tools": [{
+                "type": "function",
+                "name": "weather",
+                "parameters": {"type": "object"}
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{translated_full}");
+    let translated_full: Value = serde_json::from_str(&translated_full).unwrap();
+    assert_eq!(translated_full["status"], "completed");
+    assert!(translated_full["parallel_tool_calls"].as_bool().unwrap());
+    assert_eq!(
+        translated_full["tool_choice"],
+        json!({"type": "function", "name": "weather"})
+    );
+    assert_eq!(translated_full["tools"][0]["name"], "weather");
+
     let requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 9);
+    assert_eq!(requests.len(), 11);
     for (request, test_case) in requests
         .iter()
         .take(2)
@@ -587,6 +720,19 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     }
     assert_eq!(requests[7].body["input"], "case:completion_override");
     assert_eq!(requests[8].body["input"], "case:output_override");
+    assert_eq!(requests[9].method, Method::POST);
+    assert_eq!(requests[9].path, "/v1/messages");
+    assert_eq!(
+        requests[9].body.pointer("/messages/0/content/0/text"),
+        Some(&json!("case:translated_midstream_failure"))
+    );
+    assert!(requests[9].body.get("input").is_none());
+    assert_eq!(requests[10].method, Method::POST);
+    assert_eq!(requests[10].path, "/v1/messages");
+    assert_eq!(
+        requests[10].body.pointer("/messages/0/content/0/text"),
+        Some(&json!("case:translated_full"))
+    );
 
     server.abort();
     let _ = std::fs::remove_dir_all(&root);

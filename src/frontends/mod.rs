@@ -85,11 +85,32 @@ impl FrontendFormat {
     }
 }
 
+/// Fields echoed into synthesized Responses API response objects.
+#[derive(Clone)]
+pub struct ResponsesResponseFields {
+    pub parallel_tool_calls: bool,
+    pub tool_choice: Value,
+    pub tools: Vec<Value>,
+}
+
+impl Default for ResponsesResponseFields {
+    fn default() -> Self {
+        // OpenAI's Responses create API documents these defaults.
+        // https://developers.openai.com/api/reference/cli/resources/responses/methods/create
+        Self {
+            parallel_tool_calls: true,
+            tool_choice: Value::String("auto".into()),
+            tools: Vec::new(),
+        }
+    }
+}
+
 /// Context passed to an encoder for a single response.
 pub struct EncoderCtx {
     pub model_name: String,
     pub request_id: String,
     pub created: i64,
+    pub responses: ResponsesResponseFields,
 }
 
 /// Decode a client request body into the internal request model.
@@ -184,6 +205,24 @@ pub fn aggregate(
     request_id: &str,
     events: Vec<StreamEvent>,
     usage: &crate::types::TokenUsage,
+) -> Value {
+    aggregate_with_responses_fields(
+        format,
+        model_name,
+        request_id,
+        events,
+        usage,
+        &ResponsesResponseFields::default(),
+    )
+}
+
+pub fn aggregate_with_responses_fields(
+    format: FrontendFormat,
+    model_name: &str,
+    request_id: &str,
+    events: Vec<StreamEvent>,
+    usage: &crate::types::TokenUsage,
+    responses_fields: &ResponsesResponseFields,
 ) -> Value {
     match format {
         FrontendFormat::OpenAi => {
@@ -341,9 +380,13 @@ pub fn aggregate(
                 "usage": usage_obj
             })
         }
-        FrontendFormat::OpenAiResponses => {
-            responses::aggregate_responses(model_name, request_id, events, usage)
-        }
+        FrontendFormat::OpenAiResponses => responses::aggregate_responses_with_fields(
+            model_name,
+            request_id,
+            events,
+            usage,
+            responses_fields,
+        ),
     }
 }
 

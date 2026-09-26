@@ -3290,10 +3290,19 @@ async fn stream_response(
 
     let model_display = attempt.target.model.display_name.clone();
     let request_id = meta.request_id.clone();
+    let responses = if format == FrontendFormat::OpenAiResponses {
+        match frontends::responses::response_fields_from_request(&req) {
+            Ok(fields) => fields,
+            Err(error) => return crate::api::error_response(format, &request_id, error),
+        }
+    } else {
+        frontends::ResponsesResponseFields::default()
+    };
     let encoder_ctx = EncoderCtx {
         model_name: req.requested_model.clone(),
         request_id: request_id.clone(),
         created: chrono::Utc::now().timestamp(),
+        responses,
     };
 
     // Anthropic message_start usage is normally available during pre-commit
@@ -4414,7 +4423,14 @@ async fn drive_aggregate(
         };
     }
 
-    let body = frontends::aggregate(format, &model_name, &encoder_ctx.request_id, events, &usage);
+    let body = frontends::aggregate_with_responses_fields(
+        format,
+        &model_name,
+        &encoder_ctx.request_id,
+        events,
+        &usage,
+        &encoder_ctx.responses,
+    );
     if let Some(k) = &key {
         if k.body_logging != 0 {
             let _ = db::insert_body_log(
