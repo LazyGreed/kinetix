@@ -206,9 +206,7 @@ impl CredentialStrategy for ResolveRefreshingCredential {
         let now = chrono::Utc::now();
         Ok(ResolvedCredential {
             secret: self.secret.lock().await.clone(),
-            expires_at: Some(
-                (now.to_owned() + chrono::Duration::hours(2)).to_rfc3339(),
-            ),
+            expires_at: Some((now.to_owned() + chrono::Duration::hours(2)).to_rfc3339()),
             refresh_after: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
             rotated: stale,
         })
@@ -731,12 +729,8 @@ async fn request_resolve_and_scheduled_refresh_share_one_refresh_singleflight() 
         &account.id,
         &ResolvedCredential {
             secret: "stale-token".into(),
-            expires_at: Some(
-                (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            ),
-            refresh_after: Some(
-                (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
-            ),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
             rotated: false,
         },
     );
@@ -776,12 +770,8 @@ async fn terminal_credential_expired_from_scheduled_resolve_disables_account() {
         &harness.account_id,
         &ResolvedCredential {
             secret: "stale-token".into(),
-            expires_at: Some(
-                (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            ),
-            refresh_after: Some(
-                (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
-            ),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
             rotated: false,
         },
     );
@@ -813,12 +803,8 @@ async fn confirmed_missing_account_forgets_refresh_schedule() {
         missing_account,
         &ResolvedCredential {
             secret: "stale-token".into(),
-            expires_at: Some(
-                (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            ),
-            refresh_after: Some(
-                (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
-            ),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
             rotated: false,
         },
     );
@@ -827,7 +813,11 @@ async fn confirmed_missing_account_forgets_refresh_schedule() {
 
     let future = chrono::Utc::now() + chrono::Duration::minutes(2);
     assert!(
-        harness.state.credential_refresh.claim_due(future).is_empty(),
+        harness
+            .state
+            .credential_refresh
+            .claim_due(future)
+            .is_empty(),
         "confirmed missing account must permanently forget its refresh schedule"
     );
 
@@ -845,12 +835,8 @@ async fn confirmed_missing_provider_forgets_refresh_schedule() {
         &harness.account_id,
         &ResolvedCredential {
             secret: "stale-token".into(),
-            expires_at: Some(
-                (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            ),
-            refresh_after: Some(
-                (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
-            ),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
             rotated: false,
         },
     );
@@ -859,7 +845,11 @@ async fn confirmed_missing_provider_forgets_refresh_schedule() {
 
     let future = chrono::Utc::now() + chrono::Duration::minutes(2);
     assert!(
-        harness.state.credential_refresh.claim_due(future).is_empty(),
+        harness
+            .state
+            .credential_refresh
+            .claim_due(future)
+            .is_empty(),
         "confirmed missing provider must permanently forget its refresh schedule"
     );
 
@@ -876,12 +866,8 @@ async fn transient_account_lookup_failure_keeps_refresh_schedule() {
         &harness.account_id,
         &ResolvedCredential {
             secret: "stale-token".into(),
-            expires_at: Some(
-                (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            ),
-            refresh_after: Some(
-                (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
-            ),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
             rotated: false,
         },
     );
