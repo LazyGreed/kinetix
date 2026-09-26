@@ -314,8 +314,10 @@ auth-error renewal. This is required because API v1 credential plugins are allow
 being downgraded to a retryable host error. Failure to persist or reload that state propagates to the
 caller; it is never represented as a successful disable. After a successful rotation, Kinetix also
 applies a one-minute anti-spin floor only when the returned refresh deadline is already due or
-stale, capped at a known expiry. Future explicit `refresh_after` and expiry-derived deadlines remain
-authoritative, so short valid leases are not pushed past their refresh time or expiry. API v1 `credential-lease` has no `rotated` field, so the refresh coordinator uses the resolved
+stale. The floor is bounded by a future known expiry; once expiry is already past, the next attempt
+is rescheduled after the anti-spin interval rather than repeatedly reusing the expired deadline.
+Future explicit `refresh_after` and expiry-derived deadlines remain authoritative for short valid
+leases. API v1 `credential-lease` has no `rotated` field, so the refresh coordinator uses the resolved
 secret and lease timing hints (`expires_at` and `refresh_after`) as its generation identity. The opaque
 lease handle only locates the encrypted KV entry; it is not part of that identity. This adds no WIT
 field and remains compatible with existing guest SDKs and `.kxp` packages. Only a SHA-256 digest of the

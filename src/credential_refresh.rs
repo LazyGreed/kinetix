@@ -217,6 +217,7 @@ impl RefreshCoordinator {
             .lease_identity
             .expires_at
             .as_ref()
+            .filter(|expires_at| **expires_at > now)
             .map_or(floor, |expires_at| floor.min(*expires_at));
         schedule.next_attempt_at = schedule.next_attempt_at.max(floor);
     }
@@ -872,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_rotation_floor_never_pushes_past_expiry() {
+    async fn unchanged_lease_retries_at_bounded_intervals_after_expiry() {
         let coordinator = RefreshCoordinator::default();
         let account = account();
         let observed_at = Utc::now();
@@ -887,25 +888,38 @@ mod tests {
         coordinator.observe("p1", &account.id, &initial);
         let mut due_at = coordinator.next_attempt_at("p1", &account.id).unwrap();
 
-        for _ in 0..2 {
+        for _ in 0..6 {
             assert_eq!(coordinator.claim_due(due_at).len(), 1);
+            assert!(
+                coordinator
+                    .claim_due(due_at + ChronoDuration::seconds(1))
+                    .is_empty(),
+                "the active claim must prevent another scheduler tick from duplicating work"
+            );
             assert!(coordinator
                 .rotate_scheduled_at("p1", strategy.clone(), &account, due_at)
                 .await
                 .unwrap());
 
             let next_attempt = coordinator.next_attempt_at("p1", &account.id).unwrap();
-            assert!(next_attempt >= (due_at + ChronoDuration::seconds(60)).min(expires_at));
-            assert!(next_attempt <= expires_at);
+            if due_at < expires_at {
+                assert!(next_attempt >= (due_at + ChronoDuration::seconds(60)).min(expires_at));
+                assert!(next_attempt <= expires_at);
+            } else {
+                assert!(next_attempt >= due_at + ChronoDuration::seconds(60));
+                assert!(next_attempt > expires_at);
+            }
+            assert!(
+                coordinator
+                    .claim_due(next_attempt - ChronoDuration::seconds(1))
+                    .is_empty(),
+                "an unchanged expired lease must not be reclaimed on the next scheduler tick"
+            );
             due_at = next_attempt;
         }
 
-        assert_eq!(strategy.rotations.load(Ordering::Relaxed), 2);
-        assert_eq!(due_at, expires_at);
-        assert!(coordinator
-            .claim_due(due_at - ChronoDuration::seconds(1))
-            .is_empty());
-        assert_eq!(coordinator.claim_due(due_at).len(), 1);
+        assert_eq!(strategy.rotations.load(Ordering::Relaxed), 6);
+        assert!(due_at > expires_at + ChronoDuration::minutes(3));
     }
 
     #[tokio::test]
