@@ -489,6 +489,16 @@ impl Adapter for AnthropicAdapter {
         req: &InternalRequest,
         body: &mut Value,
     ) -> Result<(), UpstreamFailure> {
+        let Some(body) = body.as_object_mut() else {
+            return Ok(());
+        };
+        if let Some(max_tokens) = req.params.max_tokens {
+            for alias in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                body.remove(alias);
+            }
+            body.insert("max_tokens".into(), json!(max_tokens));
+        }
+
         let tmap = ctx.model.thinking();
         if !tmap.is_adaptive() {
             return Ok(());
@@ -507,9 +517,6 @@ impl Adapter for AnthropicAdapter {
                 quota_reset_at: None,
             });
         }
-        let Some(body) = body.as_object_mut() else {
-            return Ok(());
-        };
         Self::apply_thinking_map(body, ctx, req);
         Ok(())
     }
@@ -1022,6 +1029,38 @@ mod tests {
         let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
         assert!(body["system"].is_string());
         assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    // Anthropic's Create a Message API requires `max_tokens` as its output
+    // limit field: https://platform.claude.com/docs/en/api/messages/create.
+    #[test]
+    fn passthrough_normalization_maps_route_token_aliases_to_messages_field() {
+        let p = provider();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let mut req = base_request();
+        req.params.max_tokens = Some(512);
+
+        for alias in ["max_completion_tokens", "max_output_tokens"] {
+            let mut body = json!({
+                "max_tokens": 4096,
+                "messages": [{"role":"user","content":"hello"}]
+            });
+            body[alias] = json!(512);
+
+            AnthropicAdapter::new()
+                .normalize_passthrough_body(&ctx, &req, &mut body)
+                .unwrap();
+
+            assert_eq!(body["max_tokens"], 512);
+            assert!(body.get("max_completion_tokens").is_none());
+            assert!(body.get("max_output_tokens").is_none());
+        }
     }
 
     #[test]

@@ -6908,6 +6908,72 @@ mod route_policy_tests {
     }
 
     #[test]
+    fn same_format_chat_passthrough_preserves_max_completion_tokens() {
+        let p = provider(Value::Null);
+        let m = model(serde_json::json!({}));
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let mut req = request();
+        req.raw_body = Some(
+            serde_json::json!({
+                "model": "route",
+                "max_completion_tokens": 512
+            })
+            .to_string(),
+        );
+        req.params.max_tokens = Some(512);
+
+        let body =
+            build_upstream_body(&crate::adapters::openai::OpenAiAdapter, &ctx, &req, true).unwrap();
+
+        assert_eq!(body["max_completion_tokens"], 512);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn anthropic_passthrough_route_token_aliases_update_messages_max_tokens() {
+        let mut p = provider(Value::Null);
+        p.wire_format = "anthropic".into();
+        let m = model(serde_json::json!({}));
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+
+        for alias in ["max_output_tokens", "max_completion_tokens"] {
+            let mut req = request();
+            req.raw_body = Some(
+                serde_json::json!({
+                    "model": "route",
+                    "messages": [{"role":"user","content":"hello"}],
+                    "max_tokens": 4096
+                })
+                .to_string(),
+            );
+            req.params.max_tokens = Some(4096);
+            apply_target_overrides(&mut req, &serde_json::json!({(alias): 512})).unwrap();
+
+            let body = build_upstream_body(
+                &crate::adapters::anthropic::AnthropicAdapter,
+                &ctx,
+                &req,
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(body["max_tokens"], 512, "override alias: {alias}");
+            assert!(body.get("max_output_tokens").is_none());
+            assert!(body.get("max_completion_tokens").is_none());
+        }
+    }
+
+    #[test]
     fn target_parameter_overrides_update_canonical_and_passthrough_request() {
         let mut req = request();
         apply_target_overrides(
