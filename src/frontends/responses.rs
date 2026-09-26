@@ -1053,12 +1053,15 @@ impl ResponsesEncoder {
             }
             StreamEvent::Finish(finish) => {
                 self.finish_sent = true;
-                if matches!(responses_terminal(&finish), ResponsesTerminal::Failed) {
+                if let Some(failure) =
+                    responses_stream_failure(&finish, !self.accumulated_refusal.is_empty())
+                {
                     self.ensure_created(&mut out);
-                    let response = unsupported_terminal_response(
+                    let response = failed_terminal_response(
                         &self.response_id,
                         self.ctx.created,
                         &self.ctx.model_name,
+                        failure,
                     );
                     out.push(self.frame("response.failed", json!({ "response": response })));
                     return out;
@@ -1123,11 +1126,14 @@ impl ResponsesEncoder {
     }
 
     fn build_response_object(&self, finish: &FinishReason) -> Value {
-        if matches!(responses_terminal(finish), ResponsesTerminal::Failed) {
-            return unsupported_terminal_response(
+        if let Some(failure) =
+            responses_stream_failure(finish, !self.accumulated_refusal.is_empty())
+        {
+            return failed_terminal_response(
                 &self.response_id,
                 self.ctx.created,
                 &self.ctx.model_name,
+                failure,
             );
         }
         let incomplete_reason = responses_incomplete_reason(finish);
@@ -1248,10 +1254,17 @@ fn responses_usage(usage: Option<&crate::types::TokenUsage>) -> Value {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponsesTerminalFailure {
+    UnsupportedProviderReason,
+    UnstreamableRefusal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponsesTerminal {
     Completed,
     Incomplete(&'static str),
-    Failed,
+    Refusal,
+    Failed(ResponsesTerminalFailure),
 }
 
 fn responses_terminal(finish: &FinishReason) -> ResponsesTerminal {
@@ -1262,36 +1275,70 @@ fn responses_terminal(finish: &FinishReason) -> ResponsesTerminal {
         FinishReason::Length => ResponsesTerminal::Incomplete("max_output_tokens"),
         FinishReason::ContentFilter => ResponsesTerminal::Incomplete("content_filter"),
         FinishReason::Other(reason) => match reason.as_str() {
-            // Anthropic documents `refusal` as a successful stop reason, and
-            // OpenAI's Responses docs represent refusals on completed response
-            // objects rather than as incomplete reasons:
+            // Anthropic refusals are successful stops; Responses represents
+            // them as completed messages with typed refusal content. Non-stream
+            // aggregation can translate this terminal marker, but streaming
+            // text may already have been committed.
             // https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
             // https://developers.openai.com/api/docs/guides/structured-outputs
-            // Keep the refusal text as response content and preserve completion.
-            "refusal" => ResponsesTerminal::Completed,
+            "refusal" => ResponsesTerminal::Refusal,
             // OpenAI documents `steered` as a Responses incomplete reason:
             // https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses
             "steered" => ResponsesTerminal::Incomplete("steered"),
             // Provider-specific or unknown values must not be copied into
-            // incomplete_details.reason; fail with a valid Responses error.
-            _ => ResponsesTerminal::Failed,
+            // incomplete_details.reason.
+            _ => ResponsesTerminal::Failed(ResponsesTerminalFailure::UnsupportedProviderReason),
         },
         FinishReason::Stop | FinishReason::ToolCalls => ResponsesTerminal::Completed,
+    }
+}
+
+fn responses_stream_failure(
+    finish: &FinishReason,
+    has_typed_refusal: bool,
+) -> Option<ResponsesTerminalFailure> {
+    match responses_terminal(finish) {
+        ResponsesTerminal::Failed(failure) => Some(failure),
+        ResponsesTerminal::Refusal if !has_typed_refusal => {
+            Some(ResponsesTerminalFailure::UnstreamableRefusal)
+        }
+        ResponsesTerminal::Completed
+        | ResponsesTerminal::Incomplete(_)
+        | ResponsesTerminal::Refusal => None,
     }
 }
 
 fn responses_incomplete_reason(finish: &FinishReason) -> Option<&'static str> {
     match responses_terminal(finish) {
         ResponsesTerminal::Incomplete(reason) => Some(reason),
-        ResponsesTerminal::Completed | ResponsesTerminal::Failed => None,
+        ResponsesTerminal::Completed
+        | ResponsesTerminal::Refusal
+        | ResponsesTerminal::Failed(_) => None,
     }
 }
 
+// OpenAI's ResponseError.code is a closed enum; use server_error for Kinetix's
+// internal terminal-mapping failures. Keep the Kinetix classification in the
+// Rust enum rather than inventing a wire-level error code.
+// https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_error.py
 // OpenAI represents failed generations with status=failed and a response.failed
 // terminal event, not incomplete_details.reason:
 // https://developers.openai.com/api/reference/cli/resources/responses/methods/retrieve
 // https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses
-fn unsupported_terminal_response(response_id: &str, created_at: i64, model: &str) -> Value {
+fn failed_terminal_response(
+    response_id: &str,
+    created_at: i64,
+    model: &str,
+    failure: ResponsesTerminalFailure,
+) -> Value {
+    let message = match failure {
+        ResponsesTerminalFailure::UnsupportedProviderReason => {
+            "The upstream response used a terminal reason that cannot be represented by the Responses API."
+        }
+        ResponsesTerminalFailure::UnstreamableRefusal => {
+            "The upstream refusal cannot be represented as typed refusal content on this streaming path."
+        }
+    };
     json!({
         "id": response_id,
         "object": "response",
@@ -1299,8 +1346,8 @@ fn unsupported_terminal_response(response_id: &str, created_at: i64, model: &str
         "model": model,
         "status": "failed",
         "error": {
-            "message": "The upstream response used a terminal reason that cannot be represented by the Responses API.",
-            "code": "unsupported_terminal_reason"
+            "message": message,
+            "code": "server_error"
         },
         "incomplete_details": null,
         "output": [],
@@ -1339,13 +1386,19 @@ pub fn aggregate_responses(
         }
     }
 
-    if matches!(responses_terminal(&finish), ResponsesTerminal::Failed) {
+    let terminal = responses_terminal(&finish);
+    if let ResponsesTerminal::Failed(failure) = terminal {
         let response_id = format!("resp_{}", request_id.replace(['-', '_'], ""));
-        return unsupported_terminal_response(
+        return failed_terminal_response(
             &response_id,
             chrono::Utc::now().timestamp(),
             model_name,
+            failure,
         );
+    }
+    if terminal == ResponsesTerminal::Refusal {
+        refusal.push_str(&text);
+        text.clear();
     }
     let incomplete_reason = responses_incomplete_reason(&finish);
     let response_status = if incomplete_reason.is_some() {
@@ -1405,6 +1458,31 @@ pub fn aggregate_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ResponseError.code from OpenAI's current generated Python API types:
+    // https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_error.py
+    const OPENAI_RESPONSE_ERROR_CODES: &[&str] = &[
+        "server_error",
+        "rate_limit_exceeded",
+        "invalid_prompt",
+        "data_residency_mismatch",
+        "bio_policy",
+        "misalignment_policy_violation",
+        "vector_store_timeout",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_base64_image",
+        "invalid_image_url",
+        "image_too_large",
+        "image_too_small",
+        "image_parse_error",
+        "image_content_policy_violation",
+        "invalid_image_mode",
+        "image_file_too_large",
+        "unsupported_image_media_type",
+        "empty_image_file",
+        "failed_to_download_image",
+    ];
 
     #[test]
     fn validated_responses_body_is_retained_for_native_passthrough() {
@@ -1490,9 +1568,18 @@ mod tests {
                 &usage,
             );
             assert_eq!(response["status"], "failed");
+            let code = response
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap();
+            assert!(
+                OPENAI_RESPONSE_ERROR_CODES.contains(&code),
+                "Responses error code {code:?} is outside the current OpenAI ResponseError enum"
+            );
+            assert_eq!(code, "server_error");
             assert_eq!(
-                response.pointer("/error/code"),
-                Some(&json!("unsupported_terminal_reason"))
+                responses_terminal(&FinishReason::Other(reason.into())),
+                ResponsesTerminal::Failed(ResponsesTerminalFailure::UnsupportedProviderReason)
             );
             assert_eq!(response["incomplete_details"], Value::Null);
             assert!(!response.to_string().contains(reason));
@@ -1519,12 +1606,12 @@ mod tests {
         assert_eq!(response["status"], "completed");
         assert_eq!(response["incomplete_details"], Value::Null);
         assert_eq!(
-            response.pointer("/output/0/content/0/text"),
-            Some(&json!("I cannot help with that."))
-        );
-        assert_ne!(
-            response.pointer("/incomplete_details/reason"),
+            response.pointer("/output/0/content/0/type"),
             Some(&json!("refusal"))
+        );
+        assert_eq!(
+            response.pointer("/output/0/content/0/refusal"),
+            Some(&json!("I cannot help with that."))
         );
     }
 
@@ -1560,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_anthropic_refusal_completes_without_incomplete_reason() {
+    fn streaming_anthropic_refusal_fails_closed_after_text_was_streamed() {
         use crate::adapters::{anthropic::AnthropicAdapter, Adapter};
 
         let events = AnthropicAdapter::new()
@@ -1580,7 +1667,9 @@ mod tests {
             .map(|frame| String::from_utf8_lossy(frame).into_owned())
             .collect::<String>();
 
-        assert!(wire.contains("response.completed"));
+        assert!(wire.contains("response.failed"));
+        assert!(wire.contains("\"code\":\"server_error\""));
+        assert!(!wire.contains("response.completed"));
         assert!(!wire.contains("response.incomplete"));
         assert!(!wire.contains("\"reason\":\"refusal\""));
     }
@@ -1607,6 +1696,7 @@ mod tests {
             .collect::<String>();
 
         assert!(wire.contains("response.failed"));
+        assert!(wire.contains("\"code\":\"server_error\""));
         assert!(!wire.contains("response.incomplete"));
         assert!(!wire.contains("pause_turn"));
         assert!(!wire.contains("\"reason\":"));

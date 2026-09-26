@@ -288,6 +288,20 @@ fn anthropic_reset_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .min()
 }
 
+// Anthropic documents context-window exhaustion as a truncated response; the
+// Responses API represents output/context-window token exhaustion with
+// max_output_tokens:
+// https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+// https://developers.openai.com/api/docs/guides/reasoning
+fn map_anthropic_stop_reason(reason: &str) -> FinishReason {
+    match reason {
+        "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
+        "tool_use" => FinishReason::ToolCalls,
+        other => FinishReason::Other(other.to_string()),
+    }
+}
+
 fn parse_anthropic_usage(usage: &Value) -> TokenUsage {
     let ordinary = usage.get("input_tokens").and_then(Value::as_u64);
     let cached = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
@@ -653,12 +667,7 @@ impl Adapter for AnthropicAdapter {
                     events.push(StreamEvent::Usage(parse_anthropic_usage(usage)));
                 }
                 if let Some(reason) = v.pointer("/delta/stop_reason").and_then(|r| r.as_str()) {
-                    events.push(StreamEvent::Finish(match reason {
-                        "end_turn" | "stop_sequence" => FinishReason::Stop,
-                        "max_tokens" => FinishReason::Length,
-                        "tool_use" => FinishReason::ToolCalls,
-                        other => FinishReason::Other(other.to_string()),
-                    }));
+                    events.push(StreamEvent::Finish(map_anthropic_stop_reason(reason)));
                 }
             }
             "message_start" => {
@@ -721,12 +730,7 @@ impl Adapter for AnthropicAdapter {
             events.push(StreamEvent::Usage(parse_anthropic_usage(usage)));
         }
         if let Some(reason) = body.get("stop_reason").and_then(|r| r.as_str()) {
-            events.push(StreamEvent::Finish(match reason {
-                "end_turn" | "stop_sequence" => FinishReason::Stop,
-                "max_tokens" => FinishReason::Length,
-                "tool_use" => FinishReason::ToolCalls,
-                other => FinishReason::Other(other.to_string()),
-            }));
+            events.push(StreamEvent::Finish(map_anthropic_stop_reason(reason)));
         }
         Ok(events)
     }
@@ -759,6 +763,33 @@ impl Adapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_context_window_exceeded_maps_to_length_in_full_and_streaming() {
+        let adapter = AnthropicAdapter::new();
+        for stop_reason in ["max_tokens", "model_context_window_exceeded"] {
+            let full = adapter
+                .parse_full_response(&serde_json::json!({
+                    "content": [{"type": "text", "text": "partial"}],
+                    "stop_reason": stop_reason
+                }))
+                .unwrap();
+            assert!(matches!(
+                full.last(),
+                Some(StreamEvent::Finish(FinishReason::Length))
+            ));
+
+            let streaming = adapter
+                .parse_stream_chunk(&format!(
+                    r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}"}}}}"#
+                ))
+                .unwrap();
+            assert!(matches!(
+                streaming.last(),
+                Some(StreamEvent::Finish(FinishReason::Length))
+            ));
+        }
+    }
 
     #[test]
     fn usage_normalizes_cache_read_and_creation_into_total_input() {
