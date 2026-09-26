@@ -313,9 +313,9 @@ auth-error renewal. This is required because API v1 credential plugins are allow
 `credential_expired` evidence triggers a persisted account disable and registry reload instead of
 being downgraded to a retryable host error. Failure to persist or reload that state propagates to the
 caller; it is never represented as a successful disable. After a successful rotation, Kinetix also
-requires at least a one-minute delay before another attempt. This bounds retries when a plugin reports
-success without advancing its expiry or refresh hint, including after that unchanged lease reaches
-expiry. API v1 `credential-lease` has no `rotated` field, so the refresh coordinator uses the resolved
+applies a one-minute anti-spin floor only when the returned refresh deadline is already due or
+stale, capped at a known expiry. Future explicit `refresh_after` and expiry-derived deadlines remain
+authoritative, so short valid leases are not pushed past their refresh time or expiry. API v1 `credential-lease` has no `rotated` field, so the refresh coordinator uses the resolved
 secret and lease timing hints (`expires_at` and `refresh_after`) as its generation identity. The opaque
 lease handle only locates the encrypted KV entry; it is not part of that identity. This adds no WIT
 field and remains compatible with existing guest SDKs and `.kxp` packages. Only a SHA-256 digest of the

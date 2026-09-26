@@ -160,37 +160,65 @@ impl RefreshCoordinator {
             self.schedules.remove(&key);
             return;
         };
-        if let Some(not_before) = not_before {
-            schedule.next_attempt_at = schedule.next_attempt_at.max(not_before);
-        }
-
-        if !reset_failures {
-            if let Some(existing) = self.schedules.get(&key) {
-                if existing.lease_identity == schedule.lease_identity {
-                    // Expiry-derived deadlines depend on the time of first
-                    // observation. Preserve that deadline while the provider
-                    // continues returning the same lease, rather than sliding
-                    // it forward on every request or scheduler re-resolve.
-                    schedule.next_attempt_at = existing.next_attempt_at;
+        let mut identity_changed = false;
+        if let Some(existing) = self.schedules.get(&key) {
+            let same_timing = existing.lease_identity.expires_at
+                == schedule.lease_identity.expires_at
+                && existing.lease_identity.refresh_after == schedule.lease_identity.refresh_after;
+            let same_secret = existing.lease_identity.secret_fingerprint
+                == schedule.lease_identity.secret_fingerprint;
+            if same_timing {
+                // Keep the deadline anchored to the first observation of these
+                // timing hints, even when successful resolution changes only
+                // the secret. Reset failures after success, but clear any
+                // outstanding claim when the secret generation changed.
+                schedule.next_attempt_at = existing.next_attempt_at;
+                if !reset_failures {
                     schedule.failures = existing.failures;
-                    schedule.claim_until = existing.claim_until;
+                }
+                schedule.claim_until = if !reset_failures && same_secret {
+                    existing.claim_until
                 } else {
-                    // A changed secret/timing identity makes this claim stale.
-                    // Invalidate it and impose a short delay before rechecking.
-                    schedule.claim_until = None;
-                    schedule.next_attempt_at = schedule
-                        .next_attempt_at
-                        .max(now + ChronoDuration::seconds(MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS));
-                    if existing.failures > 0 {
-                        schedule.failures = existing.failures;
-                        schedule.next_attempt_at =
-                            schedule.next_attempt_at.max(existing.next_attempt_at);
-                    }
+                    None
+                };
+                identity_changed = !same_secret;
+            } else {
+                // A changed timing identity makes the prior claim stale.
+                schedule.claim_until = None;
+                identity_changed = true;
+                if !reset_failures && existing.failures > 0 {
+                    schedule.failures = existing.failures;
+                    schedule.next_attempt_at =
+                        schedule.next_attempt_at.max(existing.next_attempt_at);
                 }
             }
         }
 
+        if identity_changed || not_before.is_some() {
+            let retry_floor = not_before.unwrap_or_else(|| {
+                now + ChronoDuration::seconds(MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS)
+            });
+            Self::apply_minimum_retry_floor(&mut schedule, now, retry_floor);
+        }
+
         self.schedules.insert(key, schedule);
+    }
+
+    fn apply_minimum_retry_floor(
+        schedule: &mut LeaseSchedule,
+        now: DateTime<Utc>,
+        floor: DateTime<Utc>,
+    ) {
+        if schedule.next_attempt_at > now {
+            return;
+        }
+
+        let floor = schedule
+            .lease_identity
+            .expires_at
+            .as_ref()
+            .map_or(floor, |expires_at| floor.min(*expires_at));
+        schedule.next_attempt_at = schedule.next_attempt_at.max(floor);
     }
 
     /// Forget all proactive state for an account. Used when an account is
@@ -563,6 +591,7 @@ mod tests {
 
     struct FixedShortLeaseStrategy {
         expires_at: String,
+        refresh_after: Option<String>,
         rotated_on_resolve: bool,
         rotations: AtomicUsize,
     }
@@ -580,7 +609,7 @@ mod tests {
             Ok(ResolvedCredential {
                 secret: "fixed-lease-token".into(),
                 expires_at: Some(self.expires_at.clone()),
-                refresh_after: None,
+                refresh_after: self.refresh_after.clone(),
                 rotated: self.rotated_on_resolve,
             })
         }
@@ -738,6 +767,7 @@ mod tests {
         let observed_at = Utc::now();
         let strategy = Arc::new(FixedShortLeaseStrategy {
             expires_at: (observed_at.to_owned() + ChronoDuration::minutes(4)).to_rfc3339(),
+            refresh_after: None,
             rotated_on_resolve: false,
             rotations: AtomicUsize::new(0),
         });
@@ -761,8 +791,10 @@ mod tests {
     async fn rotated_lease_returned_by_resolve_gets_a_safe_retry_delay() {
         let coordinator = RefreshCoordinator::default();
         let account = account();
+        let now = Utc::now();
         let strategy = Arc::new(FixedShortLeaseStrategy {
-            expires_at: (Utc::now() - ChronoDuration::seconds(1)).to_rfc3339(),
+            expires_at: (now.to_owned() + ChronoDuration::minutes(5)).to_rfc3339(),
+            refresh_after: Some((now - ChronoDuration::seconds(1)).to_rfc3339()),
             rotated_on_resolve: true,
             rotations: AtomicUsize::new(0),
         });
@@ -777,13 +809,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_timing_hints_cannot_spin_after_successful_rotations() {
+    async fn successful_rotation_preserves_future_explicit_refresh_after() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let now = Utc::now();
+        let refresh_after = now + ChronoDuration::seconds(10);
+        let strategy = Arc::new(FixedShortLeaseStrategy {
+            expires_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+            refresh_after: Some(refresh_after.to_rfc3339()),
+            rotated_on_resolve: true,
+            rotations: AtomicUsize::new(0),
+        });
+
+        coordinator.resolve("p1", strategy, &account).await.unwrap();
+
+        assert_eq!(
+            coordinator.next_attempt_at("p1", &account.id).unwrap(),
+            refresh_after
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_rotation_preserves_future_expiry_derived_deadline() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let now = Utc::now();
+        let expires_at = now + ChronoDuration::seconds(30);
+        let strategy = Arc::new(FixedShortLeaseStrategy {
+            expires_at: expires_at.to_rfc3339(),
+            refresh_after: None,
+            rotated_on_resolve: true,
+            rotations: AtomicUsize::new(0),
+        });
+
+        coordinator.resolve("p1", strategy, &account).await.unwrap();
+
+        let next_attempt = coordinator.next_attempt_at("p1", &account.id).unwrap();
+        assert!(next_attempt > now);
+        assert!(next_attempt <= now + ChronoDuration::seconds(20));
+        assert!(next_attempt < expires_at);
+    }
+
+    #[tokio::test]
+    async fn due_retry_floor_is_capped_at_known_expiry() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let now = Utc::now();
+        let expires_at = now + ChronoDuration::seconds(30);
+        let strategy = Arc::new(FixedShortLeaseStrategy {
+            expires_at: expires_at.to_rfc3339(),
+            refresh_after: Some((now - ChronoDuration::seconds(1)).to_rfc3339()),
+            rotated_on_resolve: true,
+            rotations: AtomicUsize::new(0),
+        });
+
+        coordinator.resolve("p1", strategy, &account).await.unwrap();
+
+        assert_eq!(
+            coordinator.next_attempt_at("p1", &account.id).unwrap(),
+            expires_at
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_rotation_floor_never_pushes_past_expiry() {
         let coordinator = RefreshCoordinator::default();
         let account = account();
         let observed_at = Utc::now();
         let expires_at = observed_at.to_owned() + ChronoDuration::minutes(4);
         let strategy = Arc::new(FixedShortLeaseStrategy {
             expires_at: expires_at.to_rfc3339(),
+            refresh_after: None,
             rotated_on_resolve: false,
             rotations: AtomicUsize::new(0),
         });
@@ -791,7 +887,7 @@ mod tests {
         coordinator.observe("p1", &account.id, &initial);
         let mut due_at = coordinator.next_attempt_at("p1", &account.id).unwrap();
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             assert_eq!(coordinator.claim_due(due_at).len(), 1);
             assert!(coordinator
                 .rotate_scheduled_at("p1", strategy.clone(), &account, due_at)
@@ -799,18 +895,17 @@ mod tests {
                 .unwrap());
 
             let next_attempt = coordinator.next_attempt_at("p1", &account.id).unwrap();
-            assert!(
-                next_attempt >= due_at + ChronoDuration::seconds(60),
-                "unchanged timing hints must impose a post-success delay, including at expiry"
-            );
+            assert!(next_attempt >= (due_at + ChronoDuration::seconds(60)).min(expires_at));
+            assert!(next_attempt <= expires_at);
             due_at = next_attempt;
         }
 
-        assert_eq!(strategy.rotations.load(Ordering::Relaxed), 3);
+        assert_eq!(strategy.rotations.load(Ordering::Relaxed), 2);
+        assert_eq!(due_at, expires_at);
         assert!(coordinator
             .claim_due(due_at - ChronoDuration::seconds(1))
             .is_empty());
-        assert!(due_at > expires_at);
+        assert_eq!(coordinator.claim_due(due_at).len(), 1);
     }
 
     #[tokio::test]
