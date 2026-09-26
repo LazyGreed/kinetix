@@ -1053,6 +1053,16 @@ impl ResponsesEncoder {
             }
             StreamEvent::Finish(finish) => {
                 self.finish_sent = true;
+                if matches!(responses_terminal(&finish), ResponsesTerminal::Failed) {
+                    self.ensure_created(&mut out);
+                    let response = unsupported_terminal_response(
+                        &self.response_id,
+                        self.ctx.created,
+                        &self.ctx.model_name,
+                    );
+                    out.push(self.frame("response.failed", json!({ "response": response })));
+                    return out;
+                }
                 let incomplete_reason = responses_incomplete_reason(&finish);
                 let response_status = if incomplete_reason.is_some() {
                     "incomplete"
@@ -1113,6 +1123,13 @@ impl ResponsesEncoder {
     }
 
     fn build_response_object(&self, finish: &FinishReason) -> Value {
+        if matches!(responses_terminal(finish), ResponsesTerminal::Failed) {
+            return unsupported_terminal_response(
+                &self.response_id,
+                self.ctx.created,
+                &self.ctx.model_name,
+            );
+        }
         let incomplete_reason = responses_incomplete_reason(finish);
         let response_status = if incomplete_reason.is_some() {
             "incomplete"
@@ -1230,13 +1247,65 @@ fn responses_usage(usage: Option<&crate::types::TokenUsage>) -> Value {
     usage_obj
 }
 
-fn responses_incomplete_reason(finish: &FinishReason) -> Option<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponsesTerminal {
+    Completed,
+    Incomplete(&'static str),
+    Failed,
+}
+
+fn responses_terminal(finish: &FinishReason) -> ResponsesTerminal {
     match finish {
-        FinishReason::Length => Some("max_output_tokens".into()),
-        FinishReason::ContentFilter => Some("content_filter".into()),
-        FinishReason::Other(reason) => Some(reason.clone()),
-        FinishReason::Stop | FinishReason::ToolCalls => None,
+        // OpenAI documents these incomplete reasons for Responses:
+        // https://developers.openai.com/api/docs/guides/reasoning
+        // https://developers.openai.com/api/docs/guides/structured-outputs
+        FinishReason::Length => ResponsesTerminal::Incomplete("max_output_tokens"),
+        FinishReason::ContentFilter => ResponsesTerminal::Incomplete("content_filter"),
+        FinishReason::Other(reason) => match reason.as_str() {
+            // Anthropic documents `refusal` as a successful stop reason, and
+            // OpenAI's Responses docs represent refusals on completed response
+            // objects rather than as incomplete reasons:
+            // https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+            // https://developers.openai.com/api/docs/guides/structured-outputs
+            // Keep the refusal text as response content and preserve completion.
+            "refusal" => ResponsesTerminal::Completed,
+            // OpenAI documents `steered` as a Responses incomplete reason:
+            // https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses
+            "steered" => ResponsesTerminal::Incomplete("steered"),
+            // Provider-specific or unknown values must not be copied into
+            // incomplete_details.reason; fail with a valid Responses error.
+            _ => ResponsesTerminal::Failed,
+        },
+        FinishReason::Stop | FinishReason::ToolCalls => ResponsesTerminal::Completed,
     }
+}
+
+fn responses_incomplete_reason(finish: &FinishReason) -> Option<&'static str> {
+    match responses_terminal(finish) {
+        ResponsesTerminal::Incomplete(reason) => Some(reason),
+        ResponsesTerminal::Completed | ResponsesTerminal::Failed => None,
+    }
+}
+
+// OpenAI represents failed generations with status=failed and a response.failed
+// terminal event, not incomplete_details.reason:
+// https://developers.openai.com/api/reference/cli/resources/responses/methods/retrieve
+// https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses
+fn unsupported_terminal_response(response_id: &str, created_at: i64, model: &str) -> Value {
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model,
+        "status": "failed",
+        "error": {
+            "message": "The upstream response used a terminal reason that cannot be represented by the Responses API.",
+            "code": "unsupported_terminal_reason"
+        },
+        "incomplete_details": null,
+        "output": [],
+        "usage": null
+    })
 }
 
 pub fn aggregate_responses(
@@ -1270,6 +1339,14 @@ pub fn aggregate_responses(
         }
     }
 
+    if matches!(responses_terminal(&finish), ResponsesTerminal::Failed) {
+        let response_id = format!("resp_{}", request_id.replace(['-', '_'], ""));
+        return unsupported_terminal_response(
+            &response_id,
+            chrono::Utc::now().timestamp(),
+            model_name,
+        );
+    }
     let incomplete_reason = responses_incomplete_reason(&finish);
     let response_status = if incomplete_reason.is_some() {
         "incomplete"
@@ -1380,10 +1457,7 @@ mod tests {
         for (finish, reason) in [
             (FinishReason::Length, "max_output_tokens"),
             (FinishReason::ContentFilter, "content_filter"),
-            (
-                FinishReason::Other("provider_reason".into()),
-                "provider_reason",
-            ),
+            (FinishReason::Other("steered".into()), "steered"),
         ] {
             let response = aggregate_responses(
                 "example",
@@ -1404,6 +1478,54 @@ mod tests {
                 Some(&json!("incomplete"))
             );
         }
+
+        for reason in ["pause_turn", "GEMINI_FUTURE_REASON", "provider_reason"] {
+            let response = aggregate_responses(
+                "example",
+                "request-id",
+                vec![
+                    StreamEvent::TextDelta("partial".into()),
+                    StreamEvent::Finish(FinishReason::Other(reason.into())),
+                ],
+                &usage,
+            );
+            assert_eq!(response["status"], "failed");
+            assert_eq!(
+                response.pointer("/error/code"),
+                Some(&json!("unsupported_terminal_reason"))
+            );
+            assert_eq!(response["incomplete_details"], Value::Null);
+            assert!(!response.to_string().contains(reason));
+        }
+    }
+
+    #[test]
+    fn anthropic_refusal_stop_reason_completes_without_invalid_incomplete_reason() {
+        use crate::adapters::{anthropic::AnthropicAdapter, Adapter};
+
+        let events = AnthropicAdapter::new()
+            .parse_full_response(&json!({
+                "content": [{"type": "text", "text": "I cannot help with that."}],
+                "stop_reason": "refusal"
+            }))
+            .unwrap();
+        let response = aggregate_responses(
+            "example",
+            "request-id",
+            events,
+            &crate::types::TokenUsage::default(),
+        );
+
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["incomplete_details"], Value::Null);
+        assert_eq!(
+            response.pointer("/output/0/content/0/text"),
+            Some(&json!("I cannot help with that."))
+        );
+        assert_ne!(
+            response.pointer("/incomplete_details/reason"),
+            Some(&json!("refusal"))
+        );
     }
 
     #[test]
@@ -1435,5 +1557,58 @@ mod tests {
         assert!(wire.contains("\"cache_write_tokens\":3"));
         assert!(wire.contains("\"output_tokens_details\""));
         assert!(wire.contains("\"reasoning_tokens\":4"));
+    }
+
+    #[test]
+    fn streaming_anthropic_refusal_completes_without_incomplete_reason() {
+        use crate::adapters::{anthropic::AnthropicAdapter, Adapter};
+
+        let events = AnthropicAdapter::new()
+            .parse_stream_chunk(r#"{"type":"message_delta","delta":{"stop_reason":"refusal"}}"#)
+            .unwrap();
+        let mut encoder = ResponsesEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "request-id".into(),
+            created: 1,
+        });
+        let mut frames = encoder.encode(StreamEvent::TextDelta("I cannot help with that.".into()));
+        for event in events {
+            frames.extend(encoder.encode(event));
+        }
+        let wire = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect::<String>();
+
+        assert!(wire.contains("response.completed"));
+        assert!(!wire.contains("response.incomplete"));
+        assert!(!wire.contains("\"reason\":\"refusal\""));
+    }
+
+    #[test]
+    fn streaming_anthropic_pause_turn_fails_without_echoing_provider_reason() {
+        use crate::adapters::{anthropic::AnthropicAdapter, Adapter};
+
+        let events = AnthropicAdapter::new()
+            .parse_stream_chunk(r#"{"type":"message_delta","delta":{"stop_reason":"pause_turn"}}"#)
+            .unwrap();
+        let mut encoder = ResponsesEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "request-id".into(),
+            created: 1,
+        });
+        let mut frames = encoder.encode(StreamEvent::TextDelta("partial".into()));
+        for event in events {
+            frames.extend(encoder.encode(event));
+        }
+        let wire = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect::<String>();
+
+        assert!(wire.contains("response.failed"));
+        assert!(!wire.contains("response.incomplete"));
+        assert!(!wire.contains("pause_turn"));
+        assert!(!wire.contains("\"reason\":"));
     }
 }

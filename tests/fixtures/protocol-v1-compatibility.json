@@ -124,6 +124,11 @@
       "summary": "responses translated Anthropic streaming path preserves terminal, usage and tool identity semantics"
     },
     {
+      "id": "responses.translate.provider_terminal_reasons",
+      "runner": "cargo",
+      "summary": "Anthropic refusals map to completed Responses; unsupported provider terminal reasons return status=failed without exposing the provider reason"
+    },
+    {
       "id": "chat.translate.gemini.parallel_tools",
       "runner": "http",
       "summary": "Parallel Chat tool identities survive OpenAI-to-Gemini translation"
@@ -847,7 +852,7 @@
           "stream false / true",
           "native Responses SSE + canonical aggregation",
           "translated",
-          "Streaming preserves native terminal events; aggregation reconstructs completed vs incomplete status and incomplete_details from canonical FinishReason. No Chat [DONE].",
+          "Aggregation emits only recognized Responses incomplete reasons. Refusals remain completed; unknown provider-specific terminal reasons produce a valid Responses error. Chat [DONE] is not emitted.",
           [
             "responses.native.openai.sync",
             "responses.native.openai.stream",
@@ -857,7 +862,8 @@
             "responses.translate.gemini.sync",
             "responses.translate.gemini.stream",
             "responses.translate.anthropic.sync",
-            "responses.translate.anthropic.stream"
+            "responses.translate.anthropic.stream",
+            "responses.translate.provider_terminal_reasons"
           ]
         ],
         [
