@@ -36,15 +36,15 @@ after the first run.
 | `KINETIX_ADMIN_TOKEN` | generated | Pre-set the admin password (≥8 chars). If unset, one is generated and printed once. |
 | `KINETIX_BOOTSTRAP_FILE` | unset | TOML seeded into an empty database (see below). |
 | `KINETIX_DATA_DIR` | XDG | Data directory (also where backups/exports live). |
-| `KINETIX_SHUTDOWN_GRACE_SECS` | `30` | Graceful-shutdown drain window (NFR-2.3). |
+| `KINETIX_SHUTDOWN_GRACE_SECS` | `30` | Graceful-shutdown drain window. |
 | `KINETIX_IP_RATE_LIMIT_PER_MIN` | `600` | Per-IP abuse limit applied before virtual-key auth (`0` disables). |
 | `KINETIX_SESSION_TTL_MINUTES` | `720` | Admin session lifetime; sessions are in-memory, so a restart forces re-login. |
 | `KINETIX_EXPORT_RETENTION_DAYS` | `30` | How long per-day usage exports are kept. |
 | `KINETIX_LOG_JSON` | `false` | Emit JSON logs. |
 | `KINETIX_ALLOW_PRIVATE_UPSTREAMS` | `false` | Allow private/internal upstream endpoints (SSRF bypass). **Dev only.** |
-| `KINETIX_ALLOW_INSECURE_TLS` | `false` | Allow plain-HTTP upstreams. **Dev only** (NFR-3.12). |
+| `KINETIX_ALLOW_INSECURE_TLS` | `false` | Allow plain-HTTP upstreams. **Dev only.** |
 | `KINETIX_CF_ACCESS_AUD` / `KINETIX_CF_ACCESS_TEAM_DOMAIN` | unset | Cloudflare Access JWT validation for the admin surface. |
-| `KINETIX_ALERT_WEBHOOK_URL` | unset | Webhook for alerts (FR-6.6). Unset disables alerting. |
+| `KINETIX_ALERT_WEBHOOK_URL` | unset | Webhook for alerts. Unset disables alerting. |
 | `KINETIX_ALERT_FALLBACK_RATE` | `0.25` | Fallback-rate alert threshold. |
 | `KINETIX_ALERT_ERROR_RATE` | `0.10` | Error-rate alert threshold. |
 | `KINETIX_ALERT_MIN_REQUESTS` | `20` | Minimum requests before rate alerts fire. |
@@ -114,7 +114,7 @@ targets = [
 
 ## Moving configuration between installs
 
-Use the admin API's user-authored export/import (FR-10.12):
+Use the admin API's user-authored export/import:
 
 ```bash
 curl -b cookie.txt http://127.0.0.1:8080/admin/api/config/export            # secret-free

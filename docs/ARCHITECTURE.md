@@ -1,6 +1,3 @@
-<!-- GENERATED from docs/ARCHITECTURE.md by scripts/render-doc-pages.py.
-     Edit the canonical docs file instead. -->
-
 # Kinetix architecture
 
 ## Overview
@@ -77,18 +74,18 @@ Kinetix does not retry or fail over to another target.
 - **Plugin ABI:** `wit/`.
 - **Database history:** `migrations/`.
 - **Current executable behavior:** implementation and tests.
-- **Domain terminology:** [Glossary](Glossary).
-- **Contributor invariants:** [`AGENTS.md`](https://github.com/PrightCord/kinetix/blob/main/AGENTS.md).
-- **Agent enforcement:** [`pi-warden.md`](https://github.com/PrightCord/kinetix/blob/main/pi-warden.md).
+- **Domain terminology:** [Glossary](GLOSSARY.md).
+- **Contributor invariants:** [`AGENTS.md`](../AGENTS.md).
+- **Agent enforcement:** [`pi-warden.md`](../pi-warden.md).
 
 ## Further reading
 
-- [Protocol compatibility](https://github.com/PrightCord/kinetix/blob/main/docs/protocol-v1-compatibility.md)
-- [Pi compatibility](https://github.com/PrightCord/kinetix/blob/main/docs/pi-compatibility.md)
-- [Plugins](Plugins)
-- [Routing and Fallback](Routing-and-Fallback)
-- [Security](https://github.com/PrightCord/kinetix/blob/main/SECURITY.md)
-- [Deployment](https://github.com/PrightCord/kinetix/blob/main/deploy/README.md)
+- [Protocol compatibility](protocol-v1-compatibility.md)
+- [Pi compatibility](pi-compatibility.md)
+- [Plugins](wiki/Plugins.md)
+- [Routing and Fallback](wiki/Routing-and-Fallback.md)
+- [Security](../SECURITY.md)
+- [Deployment](../deploy/README.md)
 
-Historical designs are preserved in [the archive](https://github.com/PrightCord/kinetix/blob/main/docs/archive/README.md); they do
+Historical designs are preserved in [the archive](archive/README.md); they do
 not define current behavior.

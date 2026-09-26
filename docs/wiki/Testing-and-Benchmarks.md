@@ -14,11 +14,11 @@ cargo test                 # unit + integration
   passthrough, predicates, trace, sse, adapters, types, limits, ratelimit, …).
 - **Golden wire fixtures** (`tests/wire_fixtures.rs`) lock the exact encoded bytes
   of streaming/non-streaming responses and error frames for both formats, so any
-  supported wire-output change fails CI (NFR-5.5).
+  supported wire-output change fails CI.
 - **Inbound decode fixtures** (`tests/decode_fixtures.rs`) lock request decoding
   for both formats (system hoisting, parallel tool calls, images, reasoning
   effort, unknown-extra capture, thinking signatures).
-- **Protocol torture + fuzz** (`src/torture.rs`, FR-9.4/9.5): 1-byte chunks,
+- **Protocol torture + fuzz** (`src/torture.rs`): 1-byte chunks,
   UTF-8/JSON splits, char-by-char tool arguments, interleaved parallel tools,
   reasoning/text interleaving, usage-only-in-final-event, zero-token responses,
   unknown fields, malformed SSE, large tool calls, error classification
@@ -122,7 +122,7 @@ Two rigs, both in `scripts/`:
   optional `CPUSET` (1 vCPU) and `ALLOC_STATS=1` (allocations/request).
 
 Cancellation latency: `scripts/cancel_bench.py` measures how long the upstream
-keeps being written after a client disconnect (NFR-1.10).
+keeps being written after a client disconnect.
 
 Measured results, methodology, and caveats are documented in
 [`docs/benchmarks.md`](https://github.com/PrightCord/kinetix/blob/main/docs/benchmarks.md).

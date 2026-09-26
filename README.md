@@ -163,7 +163,7 @@ GET  /healthz
 
 Inference endpoints support streaming and non-streaming operation.
 
-Protocol compatibility and known deviations are documented in [docs/compatibility.md](docs/compatibility.md).
+Protocol compatibility and known limitations are documented in [docs/compatibility.md](docs/compatibility.md).
 
 ## Pi
 
@@ -258,11 +258,10 @@ Plugins run without ambient authority and interact with Kinetix through the vers
 
 Plugin packages use the `.kxp` format.
 
-Official plugin development, packaging, and catalog sources live in:
+Operator documentation is available in [docs/wiki/Plugins.md](docs/wiki/Plugins.md) and the [GitHub Wiki Plugins page](https://github.com/PrightCord/kinetix/wiki/Plugins).
 
-[github.com/PrightCord/kinetix-plugins](https://github.com/PrightCord/kinetix-plugins)
-
-See [docs/KINETIX-PLUGIN-ARCHITECTURE.md](docs/KINETIX-PLUGIN-ARCHITECTURE.md) for the plugin architecture.
+Plugin developers can start with the public contract in [`wit/`](wit/) and the
+[plugin SDK, packages, and catalog](https://github.com/PrightCord/kinetix-plugins).
 
 ## Dashboard
 
@@ -332,12 +331,12 @@ See the [CLI Reference](https://github.com/PrightCord/kinetix/wiki/CLI-Reference
 
 The [Kinetix Wiki](https://github.com/PrightCord/kinetix/wiki) contains the main user and operator documentation.
 
-Additional technical documentation:
+Additional documentation:
 
-- [Design](docs/DESIGN.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Glossary](docs/GLOSSARY.md)
 - [Protocol compatibility](docs/compatibility.md)
 - [Pi compatibility](docs/pi-compatibility.md)
-- [Plugin architecture](docs/KINETIX-PLUGIN-ARCHITECTURE.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Deployment](deploy/README.md)
 - [Contributing](CONTRIBUTING.md)

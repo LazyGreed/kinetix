@@ -1,8 +1,8 @@
-# Pi compatibility notes (FR-9.3, FR-9.2)
+# Pi compatibility notes
 
 This document records Kinetix's compatibility with **Pi** (the coding agent this
 proxy targets), based on direct observation of Pi's real wire behavior rather
-than specification reading (NFR-7.2). It is internal documentation, not a public
+than specification reading. It is internal documentation, not a public
 certification claim.
 
 ## Configuring Pi against Kinetix
@@ -29,24 +29,24 @@ Pi is configured as an OpenAI-compatible provider. Add this to Pi's
 }
 ```
 
-## Verified acceptance (FR-9.2)
+## Verified acceptance
 
 All of the following were exercised end to end with the real `pi` binary
 (`pi -p`, non-interactive) pointed at a running Kinetix:
 
 - **Plain streaming chat.** `pi -p --provider kinetix --model free "…"`
   returns the model's answer. Streaming OpenAI Chat Completions is the primary
-  path (FR-1.1).
+  path.
 - **Tool use.** `pi -p "Read the file /tmp/pitest.txt and tell me the secret
   word."` caused Pi to emit a tool call (`read`), Kinetix streamed the tool
   call back in OpenAI format, Pi executed the tool, sent the tool result in a
-  follow-up turn, and the model produced a grounded answer. This is the
-  multi-turn streaming session with tool use required by FR-9.2.
+  follow-up turn, and the model produced a grounded answer. This is a
+  multi-turn streaming session with tool use.
 - **Multi-turn conversation.** Two turns against the same Pi session id
   (`--session-id`) preserved conversation state (turn 1 stated a fact; turn 2
   recalled it), confirming multi-turn streaming history round-trips.
 - **GET /v1/models.** Pi's model picker sees the models Kinetix exposes to the
-  key (FR-1.2).
+  key.
 
 ## Headers Pi sends (observed)
 
@@ -54,16 +54,16 @@ A capture against a local HTTP listener showed Pi's OpenAI-compatible client
 sends:
 
 - `authorization: Bearer sk-kinetix-…` — the virtual key in the OpenAI-native
-  style (FR-3.5).
+  style.
 - `user-agent: pi (<os>; <arch>)`.
 - `x-session-id: <pi session id>` — **only** when the model entry sets
   `compat.sendSessionAffinityHeaders: true`. By default Pi sends no session
   header.
 
-## Cache-aware sticky routing with Pi (FR-7.3/7.5)
+## Cache-aware sticky routing with Pi
 
 Kinetix requires an **explicit** session header (it never guesses a
-conversation identity — FR-7.5) and accepts `x-kinetix-session`,
+conversation identity) and accepts `x-kinetix-session`,
 `x-session-id`, or `x-conversation-id`. Pi's `x-session-id` is therefore a
 direct, documented match. To keep a Pi session pinned to the same Route target
 (so a provider's prompt cache keeps paying off), set
@@ -76,11 +76,3 @@ The Anthropic inbound encoder reports `message_start.usage.input_tokens: 0`
 because Gemini reports usage only at the end of the stream; the final
 `message_delta` carries the output tokens and the full counts are in the
 usage log. This is documented in `docs/compatibility.md`.
-
-## Deviation notes
-
-- The embedded dashboard is React 19, not the SvelteKit line in the
-  requirements (a documented deviation).
-- Admin API paths are under `/admin/api/*` rather than the bare paths listed in
-  the requirements.
-- Virtual keys use the `sk-kinetix-` prefix.

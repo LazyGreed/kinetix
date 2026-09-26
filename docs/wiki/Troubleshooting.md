@@ -46,7 +46,7 @@ disablement, circuit-open, predicate/capability, context, or soft-quota skips.
 
 ## A disabled model is still served / a config change didn't apply
 
-The registry snapshot reloads every **1 second** (NFR-2.8). Wait ~1–2s after a
+The registry snapshot reloads every **1 second**. Wait ~1–2s after a
 config change. If you edited the DB out-of-band, the serving snapshot is refreshed
 by the same loop.
 

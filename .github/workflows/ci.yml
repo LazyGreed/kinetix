@@ -28,6 +28,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
 
+      - name: Documentation checks
+        run: bash scripts/check-docs.sh
+
   dashboard:
     name: dashboard
     runs-on: ubuntu-latest

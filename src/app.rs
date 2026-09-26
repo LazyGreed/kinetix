@@ -77,7 +77,7 @@ pub struct AppState {
     pub sessions: Arc<crate::auth::Sessions>,
     /// One-time browser sessions for plugin-provided account authorization.
     pub plugin_auth_sessions: Arc<crate::auth::PluginAuthSessions>,
-    /// Post-v1 plugin host (docs/KINETIX-PLUGIN-ARCHITECTURE.md).
+    /// Plugin host.
     pub plugins: Option<Arc<crate::plugins::PluginManager>>,
     /// Bounded fire-and-forget queue for plugin hook side effects (§6.6). Hooks
     /// run off the request path; if the queue is full a hook is dropped rather

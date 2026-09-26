@@ -5,11 +5,6 @@ A self-hosted, single-binary proxy that speaks OpenAI and Anthropic wire formats
 in front of admin-configured upstream LLM APIs, adding virtual keys, account
 pools, executable Routes with fallback, cost tracking, and an embedded dashboard.
 
-**Is it "Prism"?**
-Prism was the earlier working name; the product is **Kinetix**. The two original
-requirement drafts have been merged into a single design document,
-`docs/DESIGN.md`.
-
 **Do I need `.env` or a config file?**
 No. A normal install is configured with the CLI and stored under XDG directories.
 A `.env` and a bootstrap TOML file are optional overrides.
@@ -63,8 +58,8 @@ preemptive epoch interruption, encrypted namespaced storage) and can contribute
 custom provider wire adapters (`wire_plugin`), dynamic credential strategies
 (`credential_plugin`), routing facts (`plugin.<id>.<name>`), health probes, and
 model discovery. Native providers remain zero-overhead and completely unaffected
-by installed plugins. See [Plugins](Plugins) and
-[docs/KINETIX-PLUGIN-ARCHITECTURE.md](https://github.com/PrightCord/kinetix/blob/main/docs/KINETIX-PLUGIN-ARCHITECTURE.md).
+by installed plugins. See [Plugins](Plugins) for operator documentation and
+[the current plugin contract](https://github.com/PrightCord/kinetix/blob/main/wit/kinetix-plugin.wit).
 
 **Is it multi-tenant / highly available?**
 No. It's a single-machine, small-team gateway. Multi-tenant SaaS and HA are

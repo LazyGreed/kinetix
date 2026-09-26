@@ -14,10 +14,10 @@ WorkingDirectory=/var/lib/kinetix
 User=kinetix
 Group=kinetix
 
-# NFR-2.2: supervisor auto-restart with recovery <= 10s.
+# The supervisor restarts the process automatically.
 Restart=always
 RestartSec=2
-# NFR-2.3: allow in-flight streams to drain on SIGTERM (Kinetix honours
+# Allow in-flight streams to drain on SIGTERM (Kinetix honours
 # KINETIX_SHUTDOWN_GRACE_SECS, default 30s) before the supervisor escalates.
 TimeoutStopSec=45
 
@@ -27,7 +27,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/kinetix
-# Kinetix listens on localhost only; cloudflared is the sole ingress (NFR-3.1).
+# Kinetix listens on localhost only; cloudflared is the sole ingress.
 # No ambient capabilities are required.
 
 [Install]

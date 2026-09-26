@@ -1,9 +1,9 @@
-# Client compatibility notes (FR-9.3)
+# Client compatibility notes
 
 Checked-in notes for the clients Kinetix is actually exercised against by
-maintainers. This is documentation, **not** a public certification claim
-(FR-9.3/NFR-7.2: wire compatibility is defined by fixtures, adversarial tests,
-and real acceptance sessions, not by reading specifications).
+maintainers. This is documentation, **not** a public certification claim.
+Protocol behavior is evidenced by fixtures, adversarial tests, and real
+acceptance sessions.
 
 ## Pi (coding agent) — OpenAI Chat Completions
 
@@ -20,7 +20,7 @@ provider pointed at Kinetix. Nothing Pi-specific is required on the Kinetix side
 }
 ```
 
-Verified acceptance behaviour (Milestone 1 / FR-9.2):
+Verified acceptance behaviour:
 
 - A multi-turn streaming conversation, including a tool call, completes through
   OpenAI format. The tool call arrives as an assistant `tool_calls` delta with a
@@ -33,12 +33,12 @@ Verified acceptance behaviour (Milestone 1 / FR-9.2):
   a `strip_with_warning` portability action affected the request. The fallback
   header is a presence flag (the hop count is internal routing detail and is not
   exposed); resolve the opaque route id for the full trace. Serving
-  account/provider names are **not** exposed to clients (FR-12.15).
+  account/provider names are **not** exposed to clients.
 
 ### Session identity for cache affinity
 
-Kinetix does not guess a conversation identity (FR-7.5). To use cache-aware
-sticky routing (FR-7.3), the client must send an explicit session header:
+Kinetix does not guess a conversation identity. To use cache-aware sticky
+routing, the client must send an explicit session header:
 `X-Kinetix-Session`, `X-Session-Id`, `Session-Id` (underscore spelling),
 `X-Conversation-Id`, or `X-Session-Affinity`. Without one, each request is
 routed independently. Pi sends `X-Session-Id` when configured with
@@ -250,33 +250,22 @@ state.
 ## Reasoning / thinking models
 
 Kinetix passes reasoning through the portable-extension layer and never invents
-reasoning fields for models without configuration (FR-2.5). Consequence: with a
+reasoning fields for models without configuration. Consequence: with a
 small `max_tokens`, a reasoning model may spend the entire budget on thinking and
 return empty content with `finish_reason: "length"` — this is upstream behaviour,
 not a Kinetix bug. Raise `max_tokens` or lower the thinking level.
 
-## Documented deviations from r4
-
-- **Dashboard:** r4 specifies an embedded **Svelte/SvelteKit** dashboard
-  (FR-8.1). Kinetix ships the vendored **React 19 + Vite** dashboard, embedded
-  the same way (rust-embed). This is a deliberate, documented deviation.
-- **Admin API path:** the admin API is mounted under `/admin/api/*` so it does
-  not collide with the dashboard's `/admin/<tab>` page routes; the design
-  document lists the paths without the `/api` segment.
-- **Virtual-key prefix:** `sk-kinetix-…` (an early draft said `sk-prism-`; the
-  product was renamed to Kinetix).
-
 ## Provider wire-format notes
 
 - **Gemini:** `streamGenerateContent?alt=sse`; SSE frames are CRLF-separated and
-  are normalized to LF by the byte-robust framer (FR-2.12). `thoughtSignature`
+  are normalized to LF by the byte-robust framer. `thoughtSignature`
   values are round-tripped through the internal model's signature slots. Because a
   translated client (OpenAI Chat Completions, Responses, Anthropic Messages) cannot
   represent a `thoughtSignature`, Kinetix also persists each function-call signature
   server-side keyed by the client-visible tool-call id and replays it on the next
   turn; see [Opaque provider state](#opaque-provider-state) below.
 - **OpenAI-compatible:** same-format passthrough forwards the upstream's frames
-  verbatim, preserving unknown/vendor fields (FR-2.10) — e.g. vendor `cost` or
+  verbatim, preserving unknown/vendor fields — e.g. vendor `cost` or
   `reasoning_details` fields Kinetix itself never produces.
 - **Anthropic:** inbound `anthropic-version` and `anthropic-beta` are forwarded
   to Anthropic upstreams; Kinetix does not invent hidden version/beta defaults.

@@ -28,25 +28,25 @@ policy. It listens on localhost only, with cloudflared as the sole ingress.
 Out of scope: hostile insiders with shell/root, upstream-provider compromise, and
 hard multi-tenant isolation.
 
-## Hardening highlights (NFR-3)
+## Hardening highlights
 
 - **TLS mandatory** for upstreams; plain HTTP requires an explicit dev flag
-  (`KINETIX_ALLOW_INSECURE_TLS` or per-provider `allow_insecure_tls`) (NFR-3.12).
+  (`KINETIX_ALLOW_INSECURE_TLS` or per-provider `allow_insecure_tls`).
 - **Zero-redirect default**; redirects must be enabled per provider and are
-  revalidated (NFR-3.10).
-- **Credential host binding** (NFR-3.11).
+  revalidated.
+- **Credential host binding**.
 - **Connect-time DNS re-check** against policy for native provider traffic
-  (NFR-3.9), with its documented residual TOCTOU window.
+  with its documented residual TOCTOU window.
 - **Plugin HTTP DNS pinning**: host-mediated plugin requests reject mixed
   public/private DNS answers and pin the actual reqwest connection to the
   validated addresses; system proxies and redirects are disabled.
 - **Write-only admin credentials**: a raw admin password is accepted only from the
-  header, never the cookie (NFR-3.14).
-- **Per-IP abuse limit** before virtual-key auth (NFR-3.6).
+  header, never the cookie.
+- **Per-IP abuse limit** before virtual-key auth.
 - **No hidden defaults**: no auto-added headers (e.g. `anthropic-version`), no
   bundled provider presets, no guessed capabilities.
 
-## Privacy (FR-6)
+## Privacy
 
 Coding-agent prompts/completions may contain proprietary source and secrets, so:
 

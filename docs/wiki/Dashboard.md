@@ -3,11 +3,6 @@
 Kinetix embeds a React dashboard into the same binary (via `rust-embed`), served
 at `/admin`. It is fully data-backed — there is no mock data in the shipped app.
 
-> r4 specifies an embedded **Svelte/SvelteKit** dashboard. Kinetix keeps the
-> vendored **React** dashboard as a documented deviation. A standalone UI
-> workbench that keeps demo/mock data lives in the sibling
-> `kinetix-frontend` repo for iterating on the UI without a backend.
-
 ## Layout
 
 A grouped sidebar (with a mobile drawer) plus a slim top bar:

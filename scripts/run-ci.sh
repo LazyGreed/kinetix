@@ -23,7 +23,7 @@ for arg in "$@"; do
     -h|--help)
       printf 'Usage: %s [--skip-deps]\n\n' "$0"
       printf 'Mirrors .github/workflows/ci.yml locally:\n'
-      printf '  format             cargo fmt --all -- --check\n'
+      printf '  format             cargo fmt --all -- --check + documentation checks\n'
       printf '  dashboard          npm ci + tsc --noEmit + npm run build\n'
       printf '  rust               clippy + test + build + compat-matrix (needs format, dashboard)\n'
       printf '  dependency-policy  cargo-deny --all-features check (push-only in CI)\n\n'
@@ -82,7 +82,8 @@ run_step() {
 }
 
 format_job() {
-  run_step "cargo fmt --check" cargo fmt --all -- --check
+  run_step "cargo fmt --check" cargo fmt --all -- --check &&
+    run_step "documentation checks" bash scripts/check-docs.sh
 }
 
 dashboard_job() {

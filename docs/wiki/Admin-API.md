@@ -4,9 +4,6 @@ The admin API lives under `/admin/api/*` on the same host as the proxy. It is
 guarded by admin auth (see [Authentication](Authentication)). In production,
 expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 
-> r4 lists admin paths without the `/api` segment; Kinetix uses `/admin/api/*` as
-> a documented deviation (so the SPA's `/admin/<tab>` routes never collide).
-
 ## Auth & session
 
 | Method & path | Purpose |
@@ -72,7 +69,7 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | `POST /admin/api/routes` | Create (name, strategy, fallback triggers, `portability_policy`, `cache_affinity`, `max_attempts`, targets). |
 | `PUT /admin/api/routes/{id}` | Update (replaces targets). |
 | `DELETE /admin/api/routes/{id}` | Delete. |
-| `POST /admin/api/routes/dry-run` | Route Dry Run (FR-8.7): returns candidate ordering, predicate outcomes, eligibility, and the would-be selection **without** touching production. |
+| `POST /admin/api/routes/dry-run` | Route Dry Run: returns candidate ordering, predicate outcomes, eligibility, and the would-be selection **without** touching production. |
 
 ## Aliases
 
@@ -91,7 +88,7 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | `POST /admin/api/validate/model` | Model metadata; unknown prices/capabilities reported as `unknown` (never assumed). |
 | `POST /admin/api/validate/account` | Account label/credential/quota validation. |
 
-## Config export / import (FR-10.12)
+## Config export / import
 
 | Method & path | Purpose |
 | --- | --- |
