@@ -480,7 +480,7 @@ impl OpenAiEncoder {
         let mut out = Vec::new();
         match event {
             StreamEvent::Start { .. } => {}
-            StreamEvent::TextDelta(t) => {
+            StreamEvent::TextDelta(t) | StreamEvent::RefusalDelta(t) => {
                 self.ensure_role(&mut out);
                 out.push(self.chunk(json!({ "content": t }), None));
             }
@@ -599,5 +599,26 @@ fn openai_finish(f: &FinishReason) -> &str {
         FinishReason::ToolCalls => "tool_calls",
         FinishReason::ContentFilter => "content_filter",
         FinishReason::Other(s) => s.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streams_canonical_refusals_as_assistant_text() {
+        let mut encoder = OpenAiEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "request-id".into(),
+            created: 1,
+        });
+        let frames = encoder.encode(StreamEvent::RefusalDelta("not allowed".into()));
+        let wire = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect::<String>();
+        assert!(wire.contains("not allowed"));
+        assert!(wire.contains("\"content\""));
     }
 }

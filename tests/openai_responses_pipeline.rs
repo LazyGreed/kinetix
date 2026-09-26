@@ -73,13 +73,20 @@ async fn upstream(
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":6}}}\n\n"
             )))
             .unwrap(),
-        "incomplete" => Response::builder()
+        "incomplete" | "incomplete_native" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
             .body(Body::from(concat!(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial answer\"}\n\n",
                 "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":12}}}\n\n"
             )))
+            .unwrap(),
+        "temp_clamp" | "drop_presence_penalty" | "route_override" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            ))
             .unwrap(),
         "full_refusal" => Json(json!({
             "id": "resp_full_refusal",
@@ -95,15 +102,26 @@ async fn upstream(
     }
 }
 
-async fn call_responses(state: &AppState, test_case: &str, stream: bool) -> (StatusCode, String) {
-    let raw_body = json!({
-        "model": "responses-route",
+async fn call_responses(
+    state: &AppState,
+    model: &str,
+    test_case: &str,
+    stream: bool,
+    fields: Value,
+) -> (StatusCode, String) {
+    let mut body = json!({
+        "model": model,
         "input": format!("case:{test_case}"),
         "stream": stream,
         "stream_options": {"include_obfuscation": false},
         "text": {"format": {"type": "text"}}
-    })
-    .to_string();
+    });
+    if let Some(fields) = fields.as_object() {
+        for (key, value) in fields {
+            body[key] = value.clone();
+        }
+    }
+    let raw_body = body.to_string();
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
@@ -134,7 +152,7 @@ async fn call_chat(state: &AppState) -> (StatusCode, String) {
 }
 
 #[tokio::test]
-async fn responses_passthrough_and_cross_format_incomplete_events_work_end_to_end() {
+async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_end_to_end() {
     let mock = MockUpstream::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -214,11 +232,17 @@ async fn responses_passthrough_and_cross_format_incomplete_events_work_end_to_en
             display_name: "Responses model",
             enabled: true,
             context_window: None,
-            max_output_tokens: None,
+            max_output_tokens: Some(1024),
             capabilities: json!({"text": true}),
             prices: json!({}),
-            parameters: json!({}),
-            thinking_map: json!({}),
+            parameters: json!({
+                "temperature": {"supported": true, "min": 0.0, "max": 1.0, "default": 0.25, "policy": "clamp"},
+                "top_p": {"supported": true, "min": 0.0, "max": 1.0, "default": 0.8, "policy": "clamp"},
+                "top_k": {"supported": false, "policy": "reject"},
+                "presence_penalty": {"supported": false, "policy": "drop"},
+                "frequency_penalty": {"supported": false, "policy": "reject"}
+            }),
+            thinking_map: json!({"levels": {"high": {"reasoning.effort": "high"}}}),
             extra_request: json!({}),
             discovery: json!({"configured_transport": "openai-responses"}),
         },
@@ -243,6 +267,33 @@ async fn responses_passthrough_and_cross_format_incomplete_events_work_end_to_en
     db::insert_route_target(&pool, &route_id, None, &model_id, 1, 1, "{}", "{}")
         .await
         .unwrap();
+    let override_route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "responses-override-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &pool,
+        &override_route_id,
+        None,
+        &model_id,
+        1,
+        1,
+        "{}",
+        r#"{"max_tokens":512}"#,
+    )
+    .await
+    .unwrap();
     db::insert_virtual_key(
         &pool,
         &db::VirtualKeyRow {
@@ -305,18 +356,55 @@ async fn responses_passthrough_and_cross_format_incomplete_events_work_end_to_en
         0,
     );
 
-    let (status, streamed_refusal) = call_responses(&state, "stream_refusal", true).await;
+    let (status, streamed_refusal) = call_responses(
+        &state,
+        "responses-route",
+        "stream_refusal",
+        true,
+        json!({"max_tokens": 2048, "reasoning_effort": "high"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{streamed_refusal}");
     assert!(streamed_refusal.contains("I cannot help with that."));
     assert!(streamed_refusal.contains("response.completed"));
     assert!(!streamed_refusal.contains("response.failed"));
 
-    let (status, full_refusal) = call_responses(&state, "full_refusal", false).await;
+    let (status, full_refusal) =
+        call_responses(&state, "responses-route", "full_refusal", false, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{full_refusal}");
     let full_refusal: Value = serde_json::from_str(&full_refusal).unwrap();
+    assert_eq!(full_refusal["status"], "completed");
     assert_eq!(
-        full_refusal.pointer("/output/0/content/0/text"),
+        full_refusal.pointer("/output/0/content/0/type"),
+        Some(&json!("refusal"))
+    );
+    assert_eq!(
+        full_refusal.pointer("/output/0/content/0/refusal"),
         Some(&json!("I cannot help with that."))
+    );
+
+    let (status, incomplete_responses) = call_responses(
+        &state,
+        "responses-route",
+        "incomplete_native",
+        false,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{incomplete_responses}");
+    let incomplete_responses: Value = serde_json::from_str(&incomplete_responses).unwrap();
+    assert_eq!(incomplete_responses["status"], "incomplete");
+    assert_eq!(
+        incomplete_responses.pointer("/incomplete_details/reason"),
+        Some(&json!("max_output_tokens"))
+    );
+    assert_eq!(
+        incomplete_responses.pointer("/usage/input_tokens"),
+        Some(&json!(11))
+    );
+    assert_eq!(
+        incomplete_responses.pointer("/usage/output_tokens"),
+        Some(&json!(12))
     );
 
     let (status, incomplete) = call_chat(&state).await;
@@ -329,8 +417,58 @@ async fn responses_passthrough_and_cross_format_incomplete_events_work_end_to_en
     assert!(incomplete.contains("[DONE]"));
     assert!(!incomplete.contains("response.failed"));
 
+    let (status, clamped_temperature) = call_responses(
+        &state,
+        "responses-route",
+        "temp_clamp",
+        true,
+        json!({"temperature": 2.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{clamped_temperature}");
+
+    let (status, dropped_presence_penalty) = call_responses(
+        &state,
+        "responses-route",
+        "drop_presence_penalty",
+        true,
+        json!({"presence_penalty": 0.25}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dropped_presence_penalty}");
+
+    let (status, rejected_top_k) = call_responses(
+        &state,
+        "responses-route",
+        "rejected_top_k",
+        true,
+        json!({"top_k": 23}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected_top_k}");
+
+    let (status, route_override) = call_responses(
+        &state,
+        "responses-override-route",
+        "route_override",
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{route_override}");
+
+    let (status, rejected_parameter) = call_responses(
+        &state,
+        "responses-route",
+        "rejected_presence_penalty",
+        true,
+        json!({"frequency_penalty": 0.5}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected_parameter}");
+
     let requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 7);
     for (request, test_case) in requests
         .iter()
         .take(2)
@@ -351,15 +489,26 @@ async fn responses_passthrough_and_cross_format_incomplete_events_work_end_to_en
             Some(&json!("text"))
         );
     }
-    let incomplete_request = &requests[2];
-    assert_eq!(incomplete_request.method, Method::POST);
-    assert_eq!(incomplete_request.path, "/v1/responses");
-    assert_eq!(incomplete_request.body["model"], UPSTREAM_MODEL);
-    assert_eq!(incomplete_request.body["store"], false);
+    let normalized_request = &requests[0].body;
+    assert_eq!(normalized_request["max_output_tokens"], 1024);
+    assert!(normalized_request.get("max_tokens").is_none());
+    assert_eq!(normalized_request["temperature"], 0.25);
+    assert_eq!(normalized_request["top_p"], 0.8);
     assert_eq!(
-        incomplete_request.body.pointer("/input/0/content/0/text"),
+        normalized_request.pointer("/reasoning/effort"),
+        Some(&json!("high"))
+    );
+    assert!(normalized_request.get("reasoning_effort").is_none());
+
+    assert_eq!(requests[2].body["input"], "case:incomplete_native");
+    assert_eq!(
+        requests[3].body.pointer("/input/0/content/0/text"),
         Some(&json!("case:incomplete"))
     );
+    assert_eq!(requests[4].body["temperature"], 1.0);
+    assert!(requests[5].body.get("presence_penalty").is_none());
+    assert_eq!(requests[6].body["max_output_tokens"], 512);
+    assert!(requests[6].body.get("max_tokens").is_none());
 
     server.abort();
     let _ = std::fs::remove_dir_all(&root);

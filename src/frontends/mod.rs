@@ -193,7 +193,7 @@ pub fn aggregate(
             let mut finish = FinishReason::Stop;
             for ev in events {
                 match ev {
-                    StreamEvent::TextDelta(t) => text.push_str(&t),
+                    StreamEvent::TextDelta(t) | StreamEvent::RefusalDelta(t) => text.push_str(&t),
                     StreamEvent::ThinkingDelta { text: t, .. } => reasoning.push_str(&t),
                     StreamEvent::ToolCallStart {
                         index, id, name, ..
@@ -274,7 +274,7 @@ pub fn aggregate(
             };
             for ev in events {
                 match ev {
-                    StreamEvent::TextDelta(t) => {
+                    StreamEvent::TextDelta(t) | StreamEvent::RefusalDelta(t) => {
                         push_tool(&mut cur_tool, &mut blocks);
                         blocks.push(serde_json::json!({"type": "text", "text": t}));
                     }
@@ -408,4 +408,46 @@ pub fn translation_unsupported(
         return Some("'prediction' is not supported on a translating path".into());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_events_remain_visible_on_other_frontends() {
+        let events = vec![
+            StreamEvent::RefusalDelta("I cannot help with that.".into()),
+            StreamEvent::Finish(FinishReason::Stop),
+        ];
+        let usage = crate::types::TokenUsage::default();
+
+        let chat = aggregate(
+            FrontendFormat::OpenAi,
+            "model",
+            "request-id",
+            events.clone(),
+            &usage,
+        );
+        assert_eq!(
+            chat.pointer("/choices/0/message/content"),
+            Some(&Value::String("I cannot help with that.".into()))
+        );
+
+        let message = aggregate(
+            FrontendFormat::Anthropic,
+            "model",
+            "request-id",
+            events,
+            &usage,
+        );
+        assert_eq!(
+            message.pointer("/content/0/type"),
+            Some(&Value::String("text".into()))
+        );
+        assert_eq!(
+            message.pointer("/content/0/text"),
+            Some(&Value::String("I cannot help with that.".into()))
+        );
+    }
 }

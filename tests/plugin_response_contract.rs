@@ -55,6 +55,14 @@ fn serializer_matches_v1_golden_fixture() {
 }
 
 #[test]
+fn refusal_content_projects_to_text_for_the_v1_plugin_contract() {
+    let encoded = events_to_json(&[StreamEvent::RefusalDelta("not allowed".into())]);
+    let value: Value = serde_json::from_str(&encoded).expect("valid response envelope");
+    assert_eq!(value.pointer("/events/0/type"), Some(&json!("text_delta")));
+    assert_eq!(value.pointer("/events/0/text"), Some(&json!("not allowed")));
+}
+
+#[test]
 fn v1_golden_fixture_decodes() {
     let events = json_to_events(ALL_EVENTS).expect("valid v1 fixture");
     assert_eq!(events.len(), 7);

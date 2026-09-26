@@ -227,6 +227,118 @@ impl OpenAiResponsesAdapter {
         }
     }
 
+    fn apply_model_request_policy(
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+        body: &mut Map<String, Value>,
+    ) -> Result<(), UpstreamFailure> {
+        let params = ctx.model.params();
+        for (name, requested) in [
+            ("top_k", req.params.top_k.is_some()),
+            ("stop", !req.params.stop.is_empty()),
+            ("seed", req.params.seed.is_some()),
+            ("presence_penalty", req.params.presence_penalty.is_some()),
+            ("frequency_penalty", req.params.frequency_penalty.is_some()),
+        ] {
+            body.remove(name);
+            if requested
+                && !params
+                    .get(name)
+                    .is_some_and(|spec| spec.policy == crate::types::ParamPolicy::Drop)
+            {
+                return Err(Self::bad_request(format!(
+                    "requested parameter '{name}' is not supported by the OpenAI Responses transport"
+                )));
+            }
+        }
+
+        for key in ["temperature", "top_p"] {
+            body.remove(key);
+            if let Some(requested) = if key == "temperature" {
+                req.params.temperature
+            } else {
+                req.params.top_p
+            } {
+                let spec = params.get(key);
+                if spec.is_some_and(|spec| !spec.supported) {
+                    if spec.is_some_and(|spec| spec.policy == crate::types::ParamPolicy::Reject) {
+                        return Err(Self::bad_request(format!(
+                            "parameter '{key}' is not supported by this model"
+                        )));
+                    }
+                    if spec.is_some_and(|spec| spec.policy == crate::types::ParamPolicy::Drop) {
+                        continue;
+                    }
+                }
+                if let Some(spec) =
+                    spec.filter(|spec| spec.policy == crate::types::ParamPolicy::Reject)
+                {
+                    if spec.min.is_some_and(|min| requested < min) {
+                        return Err(Self::bad_request(format!(
+                            "parameter '{key}' below minimum {}",
+                            spec.min.unwrap()
+                        )));
+                    }
+                    if spec.max.is_some_and(|max| requested > max) {
+                        return Err(Self::bad_request(format!(
+                            "parameter '{key}' above maximum {}",
+                            spec.max.unwrap()
+                        )));
+                    }
+                }
+                let mut value = requested;
+                if let Some(spec) = spec {
+                    value = value.max(spec.min.unwrap_or(f64::NEG_INFINITY));
+                    value = value.min(spec.max.unwrap_or(f64::INFINITY));
+                }
+                body.insert(key.to_string(), json!(value));
+            } else if let Some(default) = params
+                .get(key)
+                .filter(|spec| spec.supported)
+                .and_then(|spec| spec.default)
+            {
+                body.insert(key.to_string(), json!(default));
+            }
+        }
+
+        body.remove("max_tokens");
+        body.remove("max_output_tokens");
+        if let Some(max_tokens) = req.params.max_tokens {
+            let max_tokens = ctx
+                .model
+                .max_output_tokens
+                .map(|max| max.max(0) as u32)
+                .map(|max| max_tokens.min(max))
+                .unwrap_or(max_tokens);
+            body.insert("max_output_tokens".into(), json!(max_tokens));
+        }
+
+        body.remove("reasoning_effort");
+        body.remove("reasoning");
+        if let Some(level) = req.thinking {
+            let thinking = ctx.model.thinking();
+            if let Some(value) = thinking.levels.get(level.as_key()) {
+                if let Some(fields) = value.as_object() {
+                    for (path, field_value) in fields {
+                        crate::adapters::openai::insert_dotted(body, path, field_value.clone());
+                    }
+                } else if let Some(field) = thinking.scalar_field() {
+                    crate::adapters::openai::insert_dotted(body, field, value.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_model_extra_request(ctx: &UpstreamContext<'_>, body: &mut Map<String, Value>) {
+        let extra = ctx.model.extra_request_value();
+        if let Some(extra) = extra.as_object() {
+            for (key, value) in extra {
+                body.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+
     fn usage(response: &Value) -> Option<TokenUsage> {
         let usage = response.get("usage")?;
         Some(TokenUsage {
@@ -249,13 +361,19 @@ impl OpenAiResponsesAdapter {
                 Some("message") => {
                     if let Some(content) = item.get("content").and_then(Value::as_array) {
                         for part in content {
-                            let text = match part.get("type").and_then(Value::as_str) {
+                            let part_type = part.get("type").and_then(Value::as_str);
+                            let text = match part_type {
                                 Some("output_text") => part.get("text").and_then(Value::as_str),
                                 Some("refusal") => part.get("refusal").and_then(Value::as_str),
                                 _ => None,
                             };
                             if let Some(text) = text.filter(|text| !text.is_empty()) {
-                                events.push(StreamEvent::TextDelta(text.to_string()));
+                                let event = if part_type == Some("refusal") {
+                                    StreamEvent::RefusalDelta(text.to_string())
+                                } else {
+                                    StreamEvent::TextDelta(text.to_string())
+                                };
+                                events.push(event);
                             }
                         }
                     }
@@ -410,25 +528,6 @@ impl Adapter for OpenAiResponsesAdapter {
         ctx: &UpstreamContext<'_>,
         req: &InternalRequest,
     ) -> Result<Value, UpstreamFailure> {
-        let params = ctx.model.params();
-        for (name, requested) in [
-            ("top_k", req.params.top_k.is_some()),
-            ("stop", !req.params.stop.is_empty()),
-            ("seed", req.params.seed.is_some()),
-            ("presence_penalty", req.params.presence_penalty.is_some()),
-            ("frequency_penalty", req.params.frequency_penalty.is_some()),
-        ] {
-            if requested
-                && !params
-                    .get(name)
-                    .is_some_and(|spec| spec.policy == crate::types::ParamPolicy::Drop)
-            {
-                return Err(Self::bad_request(format!(
-                    "requested parameter '{name}' is not supported by the OpenAI Responses transport"
-                )));
-            }
-        }
-
         let mut body = Map::new();
         body.insert("model".into(), json!(ctx.model.upstream_id));
         body.insert("input".into(), json!(Self::input_items(req)?));
@@ -444,45 +543,6 @@ impl Adapter for OpenAiResponsesAdapter {
             body.insert("prompt_cache_key".into(), json!(key));
         }
 
-        for (key, value) in [
-            ("temperature", req.params.temperature),
-            ("top_p", req.params.top_p),
-        ] {
-            if let Some(value) = value {
-                let spec = params.get(key);
-                if spec.is_some_and(|spec| !spec.supported) {
-                    if spec.is_some_and(|spec| spec.policy == crate::types::ParamPolicy::Reject) {
-                        return Err(Self::bad_request(format!(
-                            "parameter '{key}' is not supported by this model"
-                        )));
-                    }
-                    if spec.is_some_and(|spec| spec.policy == crate::types::ParamPolicy::Drop) {
-                        continue;
-                    }
-                }
-                let mut value = value;
-                if let Some(spec) = spec {
-                    value = value.max(spec.min.unwrap_or(f64::NEG_INFINITY));
-                    value = value.min(spec.max.unwrap_or(f64::INFINITY));
-                }
-                body.insert(key.to_string(), json!(value));
-            } else if let Some(default) = params
-                .get(key)
-                .filter(|spec| spec.supported)
-                .and_then(|spec| spec.default)
-            {
-                body.insert(key.to_string(), json!(default));
-            }
-        }
-        if let Some(max_tokens) = req.params.max_tokens {
-            let max_tokens = ctx
-                .model
-                .max_output_tokens
-                .map(|max| max_tokens.min(max.max(0) as u32))
-                .unwrap_or(max_tokens);
-            body.insert("max_output_tokens".into(), json!(max_tokens));
-        }
-
         if let Some(tools) = Self::build_tools(req) {
             body.insert("tools".into(), tools);
         }
@@ -490,31 +550,26 @@ impl Adapter for OpenAiResponsesAdapter {
             body.insert("tool_choice".into(), choice);
         }
 
-        if let Some(level) = req.thinking {
-            let thinking = ctx.model.thinking();
-            let key = level.as_key();
-            if let Some(value) = thinking.levels.get(key) {
-                if let Some(fields) = value.as_object() {
-                    for (path, field_value) in fields {
-                        crate::adapters::openai::insert_dotted(
-                            &mut body,
-                            path,
-                            field_value.clone(),
-                        );
-                    }
-                } else if let Some(field) = thinking.scalar_field() {
-                    crate::adapters::openai::insert_dotted(&mut body, field, value.clone());
-                }
-            }
-        }
+        Self::apply_model_request_policy(ctx, req, &mut body)?;
+        Self::apply_model_extra_request(ctx, &mut body);
 
-        let extra = ctx.model.extra_request_value();
-        if let Some(extra) = extra.as_object() {
-            for (key, value) in extra {
-                body.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-        }
         Ok(Value::Object(body))
+    }
+
+    fn normalize_passthrough_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+        body: &mut Value,
+    ) -> Result<(), UpstreamFailure> {
+        let Some(body) = body.as_object_mut() else {
+            return Err(Self::bad_request(
+                "OpenAI Responses passthrough body must be a JSON object",
+            ));
+        };
+        Self::apply_model_request_policy(ctx, req, body)?;
+        Self::apply_model_extra_request(ctx, body);
+        Ok(())
     }
 
     fn classify_error(
@@ -552,7 +607,7 @@ impl Adapter for OpenAiResponsesAdapter {
                 .get("delta")
                 .and_then(Value::as_str)
                 .filter(|delta| !delta.is_empty())
-                .map(|delta| vec![StreamEvent::TextDelta(delta.to_string())])
+                .map(|delta| vec![StreamEvent::RefusalDelta(delta.to_string())])
                 .unwrap_or_default()),
             "response.reasoning_summary_text.delta" => Ok(value
                 .get("delta")
@@ -846,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn full_responses_refusal_content_is_emitted_as_text() {
+    fn full_responses_refusal_content_is_a_typed_refusal_event() {
         let events = OpenAiResponsesAdapter
             .parse_full_response(&json!({
                 "status": "completed",
@@ -858,12 +913,12 @@ mod tests {
             }))
             .unwrap();
         assert!(events.iter().any(
-            |event| matches!(event, StreamEvent::TextDelta(text) if text == "I cannot help with that.")
+            |event| matches!(event, StreamEvent::RefusalDelta(text) if text == "I cannot help with that.")
         ));
     }
 
     #[test]
-    fn streamed_responses_refusal_delta_is_emitted_as_text() {
+    fn streamed_responses_refusal_delta_is_a_typed_refusal_event() {
         let events = OpenAiResponsesAdapter
             .parse_stream_chunk(
                 r#"{"type":"response.refusal.delta","delta":"I cannot help with that."}"#,
@@ -871,7 +926,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             events.as_slice(),
-            [StreamEvent::TextDelta(text)] if text == "I cannot help with that."
+            [StreamEvent::RefusalDelta(text)] if text == "I cannot help with that."
         ));
     }
 

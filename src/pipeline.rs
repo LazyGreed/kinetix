@@ -3465,6 +3465,10 @@ impl ToolStreamState {
                     self.pending_signature = None;
                     StreamEvent::TextDelta(text)
                 }
+                StreamEvent::RefusalDelta(text) => {
+                    self.pending_signature = None;
+                    StreamEvent::RefusalDelta(text)
+                }
                 StreamEvent::ToolCallStart {
                     index,
                     id,
@@ -6319,6 +6323,30 @@ mod route_policy_tests {
             signature: Some("STALE".into()),
         }]);
         state.normalize(vec![StreamEvent::TextDelta("hello".into())]);
+        let out = state.normalize(vec![StreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("later".into()),
+            name: "read".into(),
+            signature: None,
+        }]);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::ToolCallStart {
+                signature: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pending_signature_cleared_by_refusal_delta() {
+        let mut state = ToolStreamState::new("req_test");
+        state.normalize(vec![StreamEvent::ThinkingDelta {
+            text: String::new(),
+            signature: Some("STALE".into()),
+        }]);
+        let refusal = state.normalize(vec![StreamEvent::RefusalDelta("no".into())]);
+        assert!(matches!(&refusal[0], StreamEvent::RefusalDelta(text) if text == "no"));
         let out = state.normalize(vec![StreamEvent::ToolCallStart {
             index: 0,
             id: Some("later".into()),

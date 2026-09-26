@@ -767,6 +767,8 @@ pub struct ResponsesEncoder {
     active_text_item: bool,
     text_item_id: String,
     accumulated_text: String,
+    accumulated_refusal: String,
+    message_is_refusal: bool,
     active_tools: Vec<ActiveTool>,
     finish_sent: bool,
     usage: Option<crate::types::TokenUsage>,
@@ -792,6 +794,8 @@ impl ResponsesEncoder {
             active_text_item: false,
             text_item_id,
             accumulated_text: String::new(),
+            accumulated_refusal: String::new(),
+            message_is_refusal: false,
             active_tools: Vec::new(),
             finish_sent: false,
             usage: None,
@@ -827,9 +831,10 @@ impl ResponsesEncoder {
         }
     }
 
-    fn ensure_text_item(&mut self, out: &mut Vec<Bytes>) {
+    fn ensure_message_item(&mut self, out: &mut Vec<Bytes>, refusal: bool) {
         if !self.active_text_item {
             self.active_text_item = true;
+            self.message_is_refusal = refusal;
             let item = json!({
                 "id": self.text_item_id,
                 "type": "message",
@@ -845,11 +850,11 @@ impl ResponsesEncoder {
                     "item": item
                 }),
             ));
-            let part = json!({
-                "type": "output_text",
-                "text": "",
-                "annotations": []
-            });
+            let part = if refusal {
+                json!({ "type": "refusal", "refusal": "" })
+            } else {
+                json!({ "type": "output_text", "text": "", "annotations": [] })
+            };
             out.push(self.frame(
                 "response.content_part.added",
                 json!({
@@ -863,51 +868,88 @@ impl ResponsesEncoder {
         }
     }
 
-    fn close_text_item(&mut self, out: &mut Vec<Bytes>) {
+    fn close_text_item(&mut self, out: &mut Vec<Bytes>, status: &str) {
         if self.active_text_item {
             self.active_text_item = false;
-            out.push(self.frame(
-                "response.output_text.done",
-                json!({
-                    "response_id": self.response_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "item_id": self.text_item_id,
-                    "text": self.accumulated_text
-                }),
-            ));
-            out.push(self.frame(
-                "response.content_part.done",
-                json!({
-                    "response_id": self.response_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "item_id": self.text_item_id,
-                    "part": {
-                        "type": "output_text",
-                        "text": self.accumulated_text,
-                        "annotations": []
-                    }
-                }),
-            ));
-            out.push(self.frame(
-                "response.output_item.done",
-                json!({
-                    "response_id": self.response_id,
-                    "output_index": 0,
-                    "item": {
-                        "id": self.text_item_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{
+            if self.message_is_refusal {
+                out.push(self.frame(
+                    "response.refusal.done",
+                    json!({
+                        "response_id": self.response_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "item_id": self.text_item_id,
+                        "refusal": self.accumulated_refusal
+                    }),
+                ));
+                out.push(self.frame(
+                    "response.content_part.done",
+                    json!({
+                        "response_id": self.response_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "item_id": self.text_item_id,
+                        "part": { "type": "refusal", "refusal": self.accumulated_refusal }
+                    }),
+                ));
+                out.push(self.frame(
+                    "response.output_item.done",
+                    json!({
+                        "response_id": self.response_id,
+                        "output_index": 0,
+                        "item": {
+                            "id": self.text_item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": status,
+                            "content": [{ "type": "refusal", "refusal": self.accumulated_refusal }]
+                        }
+                    }),
+                ));
+            } else {
+                out.push(self.frame(
+                    "response.output_text.done",
+                    json!({
+                        "response_id": self.response_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "item_id": self.text_item_id,
+                        "text": self.accumulated_text
+                    }),
+                ));
+                out.push(self.frame(
+                    "response.content_part.done",
+                    json!({
+                        "response_id": self.response_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "item_id": self.text_item_id,
+                        "part": {
                             "type": "output_text",
                             "text": self.accumulated_text,
                             "annotations": []
-                        }]
-                    }
-                }),
-            ));
+                        }
+                    }),
+                ));
+                out.push(self.frame(
+                    "response.output_item.done",
+                    json!({
+                        "response_id": self.response_id,
+                        "output_index": 0,
+                        "item": {
+                            "id": self.text_item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": status,
+                            "content": [{
+                                "type": "output_text",
+                                "text": self.accumulated_text,
+                                "annotations": []
+                            }]
+                        }
+                    }),
+                ));
+            }
         }
     }
 
@@ -919,10 +961,25 @@ impl ResponsesEncoder {
             }
             StreamEvent::TextDelta(t) => {
                 self.ensure_created(&mut out);
-                self.ensure_text_item(&mut out);
+                self.ensure_message_item(&mut out, false);
                 self.accumulated_text.push_str(&t);
                 out.push(self.frame(
                     "response.output_text.delta",
+                    json!({
+                        "response_id": self.response_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "item_id": self.text_item_id,
+                        "delta": t
+                    }),
+                ));
+            }
+            StreamEvent::RefusalDelta(t) => {
+                self.ensure_created(&mut out);
+                self.ensure_message_item(&mut out, true);
+                self.accumulated_refusal.push_str(&t);
+                out.push(self.frame(
+                    "response.refusal.delta",
                     json!({
                         "response_id": self.response_id,
                         "output_index": 0,
@@ -941,13 +998,14 @@ impl ResponsesEncoder {
                 index, id, name, ..
             } => {
                 self.ensure_created(&mut out);
-                self.close_text_item(&mut out);
+                self.close_text_item(&mut out, "completed");
                 let call_id = id.unwrap_or_else(|| format!("call_{}_{}", self.response_id, index));
-                let output_index = if self.accumulated_text.is_empty() {
-                    self.active_tools.len()
-                } else {
-                    1 + self.active_tools.len()
-                };
+                let output_index =
+                    if self.accumulated_text.is_empty() && self.accumulated_refusal.is_empty() {
+                        self.active_tools.len()
+                    } else {
+                        1 + self.active_tools.len()
+                    };
                 let tool = ActiveTool {
                     index,
                     call_id: call_id.clone(),
@@ -993,9 +1051,15 @@ impl ResponsesEncoder {
             StreamEvent::Usage(u) => {
                 self.usage = Some(u);
             }
-            StreamEvent::Finish(_finish) => {
+            StreamEvent::Finish(finish) => {
                 self.finish_sent = true;
-                self.close_text_item(&mut out);
+                let incomplete_reason = responses_incomplete_reason(&finish);
+                let response_status = if incomplete_reason.is_some() {
+                    "incomplete"
+                } else {
+                    "completed"
+                };
+                self.close_text_item(&mut out, response_status);
                 let finished_tools: Vec<(usize, String, String, String)> = self
                     .active_tools
                     .iter()
@@ -1031,36 +1095,57 @@ impl ResponsesEncoder {
                                 "call_id": tool_call_id,
                                 "name": tool_name,
                                 "arguments": tool_arguments,
-                                "status": "completed"
+                                "status": response_status
                             }
                         }),
                     ));
                 }
-                let final_resp = self.build_response_object();
-                out.push(self.frame(
-                    "response.completed",
-                    json!({
-                        "response": final_resp
-                    }),
-                ));
+                let final_resp = self.build_response_object(&finish);
+                let terminal_event = if incomplete_reason.is_some() {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                };
+                out.push(self.frame(terminal_event, json!({ "response": final_resp })));
             }
         }
         out
     }
 
-    fn build_response_object(&self) -> Value {
+    fn build_response_object(&self, finish: &FinishReason) -> Value {
+        let incomplete_reason = responses_incomplete_reason(finish);
+        let response_status = if incomplete_reason.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        };
         let mut output = Vec::new();
-        if !self.accumulated_text.is_empty() || self.active_tools.is_empty() {
+        if !self.accumulated_text.is_empty()
+            || !self.accumulated_refusal.is_empty()
+            || self.active_tools.is_empty()
+        {
+            let mut content = Vec::new();
+            if !self.accumulated_text.is_empty()
+                || (self.accumulated_refusal.is_empty() && self.active_tools.is_empty())
+            {
+                content.push(json!({
+                    "type": "output_text",
+                    "text": self.accumulated_text,
+                    "annotations": []
+                }));
+            }
+            if !self.accumulated_refusal.is_empty() {
+                content.push(json!({
+                    "type": "refusal",
+                    "refusal": self.accumulated_refusal
+                }));
+            }
             output.push(json!({
                 "id": self.text_item_id,
                 "type": "message",
                 "role": "assistant",
-                "status": "completed",
-                "content": [{
-                    "type": "output_text",
-                    "text": self.accumulated_text,
-                    "annotations": []
-                }]
+                "status": response_status,
+                "content": content
             }));
         }
         for tool in &self.active_tools {
@@ -1070,7 +1155,7 @@ impl ResponsesEncoder {
                 "call_id": tool.call_id,
                 "name": tool.name,
                 "arguments": tool.arguments,
-                "status": "completed"
+                "status": response_status
             }));
         }
 
@@ -1091,7 +1176,8 @@ impl ResponsesEncoder {
             "object": "response",
             "created_at": self.ctx.created,
             "model": self.ctx.model_name,
-            "status": "completed",
+            "status": response_status,
+            "incomplete_details": incomplete_reason.map(|reason| json!({"reason": reason})),
             "output": output,
             "usage": usage_obj
         })
@@ -1128,6 +1214,15 @@ impl ResponsesEncoder {
 // Non-streaming Aggregation
 // ---------------------------------------------------------------------------
 
+fn responses_incomplete_reason(finish: &FinishReason) -> Option<String> {
+    match finish {
+        FinishReason::Length => Some("max_output_tokens".into()),
+        FinishReason::ContentFilter => Some("content_filter".into()),
+        FinishReason::Other(reason) => Some(reason.clone()),
+        FinishReason::Stop | FinishReason::ToolCalls => None,
+    }
+}
+
 pub fn aggregate_responses(
     model_name: &str,
     request_id: &str,
@@ -1135,11 +1230,15 @@ pub fn aggregate_responses(
     usage: &crate::types::TokenUsage,
 ) -> Value {
     let mut text = String::new();
+    let mut refusal = String::new();
+    let mut finish = FinishReason::Stop;
     let mut tool_calls: Vec<(u32, String, String, String)> = Vec::new();
 
     for ev in events {
         match ev {
             StreamEvent::TextDelta(t) => text.push_str(&t),
+            StreamEvent::RefusalDelta(t) => refusal.push_str(&t),
+            StreamEvent::Finish(reason) => finish = reason,
             StreamEvent::ToolCallStart {
                 index, id, name, ..
             } => {
@@ -1155,20 +1254,33 @@ pub fn aggregate_responses(
         }
     }
 
+    let incomplete_reason = responses_incomplete_reason(&finish);
+    let response_status = if incomplete_reason.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
     let mut output = Vec::new();
     let text_item_id = format!("msg_{}_0", request_id.replace(['-', '_'], ""));
 
-    if !text.is_empty() || tool_calls.is_empty() {
+    if !text.is_empty() || !refusal.is_empty() || tool_calls.is_empty() {
+        let mut content = Vec::new();
+        if !text.is_empty() || refusal.is_empty() {
+            content.push(json!({
+                "type": "output_text",
+                "text": text,
+                "annotations": []
+            }));
+        }
+        if !refusal.is_empty() {
+            content.push(json!({ "type": "refusal", "refusal": refusal }));
+        }
         output.push(json!({
             "id": text_item_id,
             "type": "message",
             "role": "assistant",
-            "status": "completed",
-            "content": [{
-                "type": "output_text",
-                "text": text,
-                "annotations": []
-            }]
+            "status": response_status,
+            "content": content
         }));
     }
 
@@ -1179,7 +1291,7 @@ pub fn aggregate_responses(
             "call_id": call_id,
             "name": name,
             "arguments": if args.is_empty() { "{}".to_string() } else { args },
-            "status": "completed"
+            "status": response_status
         }));
     }
 
@@ -1200,7 +1312,8 @@ pub fn aggregate_responses(
         "object": "response",
         "created_at": chrono::Utc::now().timestamp(),
         "model": model_name,
-        "status": "completed",
+        "status": response_status,
+        "incomplete_details": incomplete_reason.map(|reason| json!({"reason": reason})),
         "output": output,
         "usage": usage_obj
     })
@@ -1234,5 +1347,76 @@ mod tests {
         assert!(error
             .to_string()
             .contains("response metadata storage is unsupported"));
+    }
+
+    #[test]
+    fn nonstream_aggregation_preserves_refusal_and_incomplete_semantics() {
+        let usage = crate::types::TokenUsage::default();
+        let refusal = aggregate_responses(
+            "example",
+            "request-id",
+            vec![
+                StreamEvent::RefusalDelta("not allowed".into()),
+                StreamEvent::Finish(FinishReason::Stop),
+            ],
+            &usage,
+        );
+        assert_eq!(
+            refusal.pointer("/output/0/content/0/type"),
+            Some(&json!("refusal"))
+        );
+        assert_eq!(
+            refusal.pointer("/output/0/content/0/refusal"),
+            Some(&json!("not allowed"))
+        );
+        assert_eq!(refusal["status"], "completed");
+
+        for (finish, reason) in [
+            (FinishReason::Length, "max_output_tokens"),
+            (FinishReason::ContentFilter, "content_filter"),
+            (
+                FinishReason::Other("provider_reason".into()),
+                "provider_reason",
+            ),
+        ] {
+            let response = aggregate_responses(
+                "example",
+                "request-id",
+                vec![
+                    StreamEvent::TextDelta("partial".into()),
+                    StreamEvent::Finish(finish),
+                ],
+                &usage,
+            );
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(
+                response.pointer("/incomplete_details/reason"),
+                Some(&json!(reason))
+            );
+            assert_eq!(
+                response.pointer("/output/0/status"),
+                Some(&json!("incomplete"))
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_encoder_emits_refusal_and_incomplete_terminal_events() {
+        let mut encoder = ResponsesEncoder::new(EncoderCtx {
+            model_name: "example".into(),
+            request_id: "request-id".into(),
+            created: 1,
+        });
+        let mut frames = encoder.encode(StreamEvent::RefusalDelta("not allowed".into()));
+        frames.extend(encoder.encode(StreamEvent::Finish(FinishReason::Length)));
+        let wire = frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect::<String>();
+        assert!(wire.contains("response.refusal.delta"));
+        assert!(wire.contains("response.refusal.done"));
+        assert!(wire.contains("response.incomplete"));
+        assert!(wire.contains("max_output_tokens"));
+        assert!(wire.contains("\"status\":\"incomplete\""));
     }
 }
