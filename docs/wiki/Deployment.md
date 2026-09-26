@@ -8,8 +8,8 @@ machine (or container) running `kinetix serve` bound to localhost, exposed by a
 
 `deploy/kinetix.service` runs Kinetix under systemd:
 
-- `Type=simple`, `Restart=always`, `RestartSec=2` (recovery ≤10s, NFR-2.2).
-- `TimeoutStopSec=45` so the graceful drain (default 30s, NFR-2.3) can finish.
+- `Type=simple`, `Restart=always`, `RestartSec=2` (recovery ≤10s).
+- `TimeoutStopSec=45` so the graceful drain (default 30s) can finish.
 - Secrets come from `EnvironmentFile=/etc/kinetix/kinetix.env` (never in the unit).
 - Hardening: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
   `ProtectHome=true`, `ReadWritePaths=/var/lib/kinetix`.

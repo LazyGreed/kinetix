@@ -32,8 +32,8 @@ kinetix serve --allow-private-upstreams --allow-insecure-tls   # local dev only
 | Flag | Effect |
 | --- | --- |
 | `--log-json` | Emit JSON logs. |
-| `--allow-private-upstreams` | Permit private/internal upstream endpoints (SSRF guard bypass, NFR-3.9). Dev only. |
-| `--allow-insecure-tls` | Permit plain-HTTP upstreams (NFR-3.12). Dev only. |
+| `--allow-private-upstreams` | Permit private/internal upstream endpoints (SSRF guard bypass). Dev only. |
+| `--allow-insecure-tls` | Permit plain-HTTP upstreams. Dev only. |
 
 > A boolean flag can only force the value **on**; leaving it off does not shadow
 > an enabling environment variable.

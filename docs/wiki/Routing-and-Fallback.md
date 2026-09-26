@@ -23,7 +23,7 @@ Each Route target names a model and may optionally pin one account. If the
 account is omitted, the target owns the provider's executable account pool:
 Kinetix applies account health, priority, and weight, then tries eligible sibling
 accounts before advancing to the next logical Route target. Targets may span
-providers and wire formats (FR-12.2/12.5/12.10).
+providers and wire formats.
 
 ## Selection strategies
 
@@ -65,7 +65,7 @@ Cache/sticky affinity is applied after adaptive ordering. An eligible affine
 target therefore stays preferred; if it is only concurrency-saturated Kinetix
 waits briefly (bounded to 300 ms) before spilling to another target.
 
-## Predicates (FR-12.3/12.4)
+## Predicates
 
 A target may carry a **typed, side-effect-free predicate** — an expression tree
 with **three-valued** evaluation (`true` / `false` / `unknown`) and a
@@ -124,7 +124,7 @@ Plugins implementing the `RoutingFactProvider` capability can export typed facts
 * **Failures and unknowns**: If a plugin fact provider times out, traps, or is disabled, the fact evaluates as `unknown`. The Route's `when_unknown` policy (`skip` or `allow`) then governs target eligibility.
 * **Traceability**: The Route Trace records the evaluated fact values along with their source plugin ID and version, or the exact failure reason (e.g. timeout or circuit open).
 
-## Fallback and the commit point (FR-4.5)
+## Fallback and the commit point
 
 - Retry/fallback is allowed **only before the first client byte** (the *commit
   point*). The state machine is
@@ -140,7 +140,7 @@ Plugins implementing the `RoutingFactProvider` capability can export typed facts
   bounded retry/Route fallback before commit, but do not cool down the credential
   or increment its account circuit breaker.
 
-## Portability policy (FR-2.11)
+## Portability policy
 
 When a fallback crosses providers, opaque provider state (e.g. reasoning
 signatures) cannot travel. The Route's `portability_policy` decides:
@@ -150,7 +150,7 @@ signatures) cannot travel. The Route's `portability_policy` decides:
   is forbidden.
 - `reject`: fail the request with a format-correct error rather than stripping.
 
-## Prompt-cache affinity (FR-7.3/7.5)
+## Prompt-cache affinity
 
 When a Route has `cache_affinity` or `sticky_routing` and the request carries
 an explicit session header, Kinetix remembers the last successful target for that
@@ -171,7 +171,7 @@ Session identity is taken **only** from an explicit header — never guessed:
 X-Kinetix-Session | X-Session-Id | X-Conversation-Id | X-Session-Affinity | Session-Id
 ```
 
-## Client-visible routing headers (FR-12.15)
+## Client-visible routing headers
 
 Clients see only opaque routing metadata:
 

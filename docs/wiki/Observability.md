@@ -53,7 +53,7 @@ before response commit.
 | `kinetix_ip_rate_limited_total` | Per-IP rejections. |
 | `kinetix_allocations_total` / `kinetix_alloc_bytes_total` | Allocations per request (only when built `--features alloc-stats`; `0` otherwise = honestly "not measured"). |
 
-## Route Trace (FR-12.14)
+## Route Trace
 
 Every request produces a Route Trace: candidate enumeration, predicate/capability
 results, skip reasons, the selected account/model (internally), attempt outcomes,
@@ -87,7 +87,7 @@ Plugin performance and reliability are monitored independently of core proxy tra
 * **Usage log attribution**: The `usage_logs` database table records `plugin_id` and `plugin_version` on every completed request that used a plugin, ensuring complete auditability and usage analytics.
 * **Plugin audit trail (`GET /admin/api/plugins/{id}/audit`)**: Dedicated view of lifecycle actions (install, enable, disable, permission approvals/revocations, removal).
 
-## Flight recorder (FR-13)
+## Flight recorder
 
 A bounded, metadata-only ring of lifecycle events (request accepted, auth
 complete, upstream connect/headers/first frame, tool/reasoning event classes,
@@ -95,7 +95,7 @@ commit, cancellation, usage finalized), correlated with the request id. Retrieve
 via `GET /admin/api/requests/{id}/diagnostics`. Bounded by count/bytes/time so it
 can never grow unbounded.
 
-## Live in-flight view (FR-8.3)
+## Live in-flight view
 
 `GET /admin/api/requests/live` returns in-flight requests (phase
 `selecting → committed → done`, commit state, fallback hops, retries, tokens,
@@ -106,7 +106,7 @@ latency, TTFT). Surfaced in the dashboard's Request Inspector and reflected in t
 > the pre-commit connect window is bounded only by the provider timeout (there is
 > no response body to observe yet).
 
-## Alerts (FR-6.6)
+## Alerts
 
 Set `KINETIX_ALERT_WEBHOOK_URL` to receive JSON webhooks (`{event: "alert"|"resolved", ...}`).
 Alerts are **edge-triggered** (fire once, resolve when clear) and are control-plane

@@ -1,7 +1,7 @@
 # Kinetix deployment runbook
 
 Kinetix is a single Rust binary plus a SQLite database, reachable only through a
-Cloudflare Tunnel (NFR-3.1). Nothing else needs to be installed.
+Cloudflare Tunnel. Nothing else needs to be installed.
 
 ## 1. Build
 
@@ -12,7 +12,7 @@ scripts/build-dashboard.sh
 # -> target/release/kinetix
 ```
 
-Reproducible builds: CI builds on Linux x86_64/aarch64 (NFR-7.1).
+Reproducible builds: CI builds on Linux x86_64/aarch64.
 
 ## 2. Install
 
@@ -40,7 +40,7 @@ cloudflared tunnel route dns kinetix admin.example.com   # separate admin hostna
 
 Ingress: the **API hostname** points at `http://127.0.0.1:8080`; the **admin
 hostname** also points at `127.0.0.1:8080` but is protected by a Cloudflare
-Access application (NFR-3.2). Set `KINETIX_CF_ACCESS_AUD` and
+Access application. Set `KINETIX_CF_ACCESS_AUD` and
 `KINETIX_CF_ACCESS_TEAM_DOMAIN` so Kinetix additionally validates the Access
 JWT; until then the admin API requires the admin-token session cookie.
 
@@ -56,7 +56,7 @@ ingress:
   - service: http_status:404
 ```
 
-## 4. Backups and restore (NFR-2.4)
+## 4. Backups and restore
 
 Backups are written to `$KINETIX_DATA_DIR/backups`:
 
@@ -81,10 +81,9 @@ copying the database.
 ## 5. Health and alerting
 
 - External uptime probe: `GET /healthz` returns 200 while the **data plane** is
-  serviceable and reports `control_plane: ok|degraded` in the body (NFR-2.7).
+  serviceable and reports `control_plane: ok|degraded` in the body.
 - Metrics: `GET /admin/api/metrics` (Prometheus, admin-only).
-- Alerts: set `KINETIX_ALERT_WEBHOOK_URL` to receive edge-triggered JSON alerts
-  (FR-6.6/FR-12.17).
+- Alerts: set `KINETIX_ALERT_WEBHOOK_URL` to receive edge-triggered JSON alerts.
 
 ## 6. Upgrades
 
@@ -101,4 +100,4 @@ restore a backup.
 
 `KINETIX_ALLOW_PRIVATE_UPSTREAMS=true` and `KINETIX_ALLOW_INSECURE_TLS=true`
 enable localhost/plain-HTTP upstreams. Both are visibly-marked development
-modes (NFR-3.9/3.12) and must not be enabled in production.
+modes and must not be enabled in production.

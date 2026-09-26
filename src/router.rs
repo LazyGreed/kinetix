@@ -137,7 +137,7 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/exports/{name}", delete(admin::delete_export))
         .route("/metrics", get(admin::metrics))
-        // plugins (post-v1; docs/KINETIX-PLUGIN-ARCHITECTURE.md §20)
+        // Plugins
         .route("/plugins", get(admin::list_plugins))
         .route("/plugins/catalog", get(admin::plugin_catalog))
         .route(

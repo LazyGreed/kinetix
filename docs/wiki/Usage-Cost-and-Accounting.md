@@ -2,8 +2,7 @@
 
 Kinetix records a usage row per request (asynchronously, never blocking the data
 plane) and computes cost from the model's configured prices. A guiding principle
-is **"unknown means unknown"** (FR-6.2/6.3/6.8/6.9): Kinetix never invents token
-counts or costs.
+is **"unknown means unknown"**: Kinetix never invents token counts or costs.
 
 ## What is recorded
 
@@ -58,8 +57,8 @@ If historical counters cannot be read during startup/first use, Kinetix starts
 that key's in-memory ledger from zero so a control-plane outage still does not
 take down the data plane.
 
-USD reservation remains unavailable when any possible target is unpriced, per
-FR-6.3; Kinetix does not invent vendor prices.
+USD reservation remains unavailable when any possible target is unpriced.
+Kinetix does not invent vendor prices.
 
 ## Usage views
 
@@ -81,10 +80,10 @@ An hourly task exports the last 40 days (skipping days already exported) and
 prunes files older than `KINETIX_EXPORT_RETENTION_DAYS` (default 30). You can also
 export on demand from the dashboard or with `kinetix export run [--day DATE]`.
 
-## Body logging (opt-in, FR-6.5)
+## Body logging (opt-in)
 
 Off by default. When a virtual key sets `body_logging`, Kinetix stores a
 **redacted** request body (every path) and, for non-streaming requests, a redacted
 response body, retained 7 days and purged hourly. Streaming responses are **not**
-buffered (NFR-1.3), so only their request is retained. Redaction replaces anything
+buffered, so only their request is retained. Redaction replaces anything
 that looks like a secret (`sk-`, `AIza`, `AQ.`, `gsk_`, `sk-ant`, `ya29.`).

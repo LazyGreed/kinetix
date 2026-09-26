@@ -101,8 +101,8 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         log_queue,
         config.ip_rate_limit_per_min,
     );
-    // Plugin host (post-v1, docs/KINETIX-PLUGIN-ARCHITECTURE.md). Built even
-    // when no plugins are installed so the registry participates in the runtime
+    // Build the plugin host even when no plugins are installed so the registry
+    // participates in the runtime
     // snapshot from the start. If the host cannot be constructed the server
     // still starts; plugin-backed capabilities simply stay unavailable.
     let state = match PluginManager::new(

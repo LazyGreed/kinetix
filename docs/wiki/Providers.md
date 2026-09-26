@@ -72,8 +72,8 @@ weight, an optional soft quota, and a quota type (`none` / `daily` / `monthly` /
 
 `POST /admin/api/providers/{id}/discover` (or the dashboard's **Fetch Models**)
 lists the upstream's models and flags already-imported and disappeared ones.
-Discovery **never overwrites admin edits** and never silently deletes a model
-(FR-10.5); it records a per-model observation in the `discovery` column. If a
+Discovery **never overwrites admin edits** and never silently deletes a model;
+it records a per-model observation in the `discovery` column. If a
 model-source plugin reports `{"transport":{"format":"openai-responses"}}`,
 that observed transport participates in per-target execution unless an operator
 `transport_override` is configured.
@@ -82,12 +82,12 @@ that observed transport participates in per-target execution unless an operator
 
 - Upstream URLs must be **HTTPS** by default; plain HTTP needs
   `KINETIX_ALLOW_INSECURE_TLS` (or the per-provider `allow_insecure_tls`), a
-  visibly-marked dev mode (NFR-3.12).
+  visibly-marked dev mode.
 - Blocked hosts (localhost/internal/metadata ranges, loopback/private/link-local
-  IPs) are refused unless `KINETIX_ALLOW_PRIVATE_UPSTREAMS` is set (NFR-3.9).
-- **Credential host binding** (NFR-3.11): a credential is only sent to the host(s)
+  IPs) are refused unless `KINETIX_ALLOW_PRIVATE_UPSTREAMS` is set.
+- **Credential host binding**: a credential is only sent to the host(s)
   it is authorized for (`base_url` host plus any `credential_hosts`).
-- **Zero-redirect default** (NFR-3.10): redirects are not followed unless the
+- **Zero-redirect default**: redirects are not followed unless the
   provider opts in via `follow_redirects`.
 - **Connect-time DNS re-check**: the host is re-resolved and re-validated against
   the policy just before connecting.

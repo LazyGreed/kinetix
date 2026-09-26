@@ -1,10 +1,7 @@
-//! Plugin subsystem (docs/KINETIX-PLUGIN-ARCHITECTURE.md).
+//! Plugin subsystem.
 //!
-//! This is the post-v1 plugin host: WebAssembly components hosted by Wasmtime
-//! with a versioned WIT API. The core rule is that **plugins extend integration
-//! behavior; Kinetix owns policy** — plugins supply typed evidence and
-//! translation at explicit seams and never select targets, own accounting, or
-//! move the commit point.
+//! Plugins extend integration behavior through the versioned WIT contract;
+//! routing policy and accounting remain owned by Kinetix core.
 
 pub mod adapter;
 pub mod catalog;

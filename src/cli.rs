@@ -70,7 +70,7 @@ pub enum Command {
     Route(RouteArgs),
     /// Manage model aliases.
     Alias(AliasArgs),
-    /// Manage plugins (post-v1; docs/KINETIX-PLUGIN-ARCHITECTURE.md).
+    /// Manage plugins.
     Plugin(PluginArgs),
     /// Export usage/logs to disk (JSONL + CSV).
     Export(ExportArgs),

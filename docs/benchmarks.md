@@ -1,13 +1,12 @@
 # Benchmarks
 
-Kinetix's performance requirements (NFR-1) are phase gates, and r4 requires the
-numbers to come from a reproducible harness rather than from vendor claims. Two
-harnesses ship in `scripts/`:
+Benchmark results come from reproducible harnesses rather than vendor claims.
+Two harnesses ship in `scripts/`:
 
 | Harness | Language | Use |
 |---|---|---|
 | `scripts/bench.sh` + `synthetic_upstream.py` | Python (stdlib) | Correctness-oriented path coverage; simple to read. |
-| `scripts/bench-rust.sh` + `bench_rust.rs` | Rust (std only) | Capacity/overhead at the NFR-1.4 reference load and beyond. |
+| `scripts/bench-rust.sh` + `bench_rust.rs` | Rust (std only) | Capacity and overhead under controlled load. |
 
 Both drive a **deterministic synthetic upstream** that emits a fixed token
 cadence (`SYN_TOKENS`/`SYN_DELAY_MS` or the Rust rig's `TOKENS`/`DELAY_US`), so
@@ -16,7 +15,7 @@ any measured variance is Kinetix overhead, not model inference.
 > The Python rig is GIL-bound: a Python client plus a Python synthetic upstream
 > saturate a single machine well before Kinetix does, so its high-concurrency
 > rows do **not** represent Kinetix capacity. Use `bench-rust.sh` for the
-> capacity gate.
+> capacity measurements.
 
 ## Method
 
@@ -28,7 +27,7 @@ scripts/bench-rust.sh "1 10 100 200 500 1000" 3000
 - Kinetix bound to `127.0.0.1:8180`; synthetic upstream on `9099`.
 - `DELAY_US` sets a per-token upstream delay so each stream lasts long enough to
   hold the target concurrency; `CPUSET=0` pins Kinetix to one core to
-  approximate the NFR-1.4 1-vCPU target.
+  approximate a single-CPU run.
 - The load generator issues streaming requests (`stream:true`) and records
   TTFT (first byte) and total latency per request.
 
@@ -56,36 +55,34 @@ scripts/bench-rust.sh "1 10 100 200 500 1000" 3000
 
 ## Reading the numbers
 
-- **Overhead (NFR-1.1/1.2).** Kinetix's *added* latency is the small p50 seen at
-  low concurrency: 0.09–0.17 ms TTFT and 0.09–0.18 ms total at concurrency 1,
-  and ~1 ms at concurrency 10. This is measured against a real socket round
-  trip, so it includes Kinetix's own accept/dispatch overhead. It is well inside
-  the NFR-1.1 (p50 ≤ 5 ms, p99 ≤ 25 ms) and NFR-1.2 (p50 ≤ 10 ms, p99 ≤ 50 ms)
-  targets.
-- **Capacity (NFR-1.4).** At concurrency 200 the rig sustains **3.6k–3.7k rps**
-  (far above the 50 rps target) with **zero errors** and bounded memory
-  (≤ 30 MB RSS). r4's reference load is "200 concurrent streams **and** 50 rps
-  sustained"; the p95 TTFT at 200 stays ~20 ms.
+- **Observed overhead.** Kinetix's *added* latency is the small p50 seen at low
+  concurrency: 0.09–0.17 ms TTFT and 0.09–0.18 ms total at concurrency 1, and
+  ~1 ms at concurrency 10. This is measured against a real socket round trip,
+  so it includes Kinetix's own accept/dispatch overhead.
+- **Observed capacity.** In the two displayed concurrency-200 runs, measured
+  throughput is 2,793 rps with no upstream delay and 3,629 rps with a 2 ms/token
+  upstream delay. Both runs report zero errors; RSS is 13.7 MB and 29.4 MB,
+  respectively.
 - **The p99 spikes are harness artifacts, not Kinetix.** The upstream is
   thread-per-connection: at 200+ simultaneous connections its thread-spawn cost
   shows up as a one-off latency spike in the slowest percentile while the median
   is unaffected. A native/async upstream would remove it.
-- **Bounded behavior at 500/1000 (NFR-1.8).** Higher levels show a bounded,
+- **Higher concurrency.** The 500/1000 runs show a bounded,
   linear latency rise with **no errors, no unbounded growth** (RSS 13→17 MB) and
-  **no corruption** — the required characterization for levels above the gate.
+  **no corruption** across the measured concurrency levels.
   The plateau near ~26 ms TTFT is Kinetix's own single-process connection setup.
 
-## Cold start and idle footprint (NFR-1.5/1.6)
+## Cold start and idle footprint
 
 Measured on the release binary with a fresh throwaway database:
 
-| Metric | Target | Measured |
-|---|---|---|
-| Cold start to `/healthz` ready | ≤ 2 s | ~75 ms |
-| Idle RSS | ≤ 50 MB | ~13 MB |
-| Idle CPU | negligible | ~1% |
+| Metric | Measured |
+|---|---|
+| Cold start to `/healthz` ready | ~75 ms |
+| Idle RSS | ~13 MB |
+| Idle CPU | ~1% |
 
-## Allocations per request (NFR-1.8)
+## Allocations per request
 
 The build optionally counts allocations (`--features alloc-stats`, a
 `#[global_allocator]` wrapper in `src/alloc.rs`). The default build reports the
@@ -107,17 +104,17 @@ flat across concurrency (no per-request amplification under load) and is
 dominated by JSON parsing/serialization of the request and the encoded stream
 frames.
 
-## Path coverage (NFR-1.9)
+## Path coverage
 
 The Python rig covers four paths plus a large-incremental-tool-argument path:
 
 | Path | What it exercises |
 |---|---|
-| `passthrough` | OpenAI -> OpenAI same-format byte forwarding (FR-2.7). |
+| `passthrough` | OpenAI -> OpenAI same-format byte forwarding. |
 | `translation` | OpenAI -> Gemini translation (canonical state). |
 | `tools` | A tool call with arguments split across three frames. |
 | `large` | A ~76 KB user message (context handling). |
-| `tools-large-fragments` | One tool argument (~660 B) split into ~200 fragments (NFR-1.9: incremental argument reassembly). |
+| `tools-large-fragments` | One tool argument (~660 B) split into ~200 fragments for incremental reassembly. |
 
 `scripts/bench.sh "1 10" 40` results (Python rig, so rps is rig-bound, not
 Kinetix-bound):
@@ -139,15 +136,15 @@ argument reassembly under concurrency.
 ## Reproduce
 
 ```sh
-# Rust rig, NFR-1.4 style (1 vCPU approximation, sustained streams)
+# Rust rig, single-CPU approximation with sustained streams
 DELAY_US=2000 TOKENS=100 CPUSET=0 scripts/bench-rust.sh "1 10 100 200" 4000
 
-# Rust rig with allocation accounting (NFR-1.8)
+# Rust rig with allocation accounting
 ALLOC_STATS=1 TOKENS=60 scripts/bench-rust.sh "1 10 100" 2000
 
 # Python rig, path coverage (passthrough, translation, tools, large, tool fragments)
 scripts/bench.sh "1 10 100" 80
 ```
 
-Cancellation latency (NFR-1.10) is measured separately by
+Cancellation latency is measured separately by
 `scripts/cancel_bench.py`; see the README.

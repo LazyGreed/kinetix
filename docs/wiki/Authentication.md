@@ -9,7 +9,7 @@ clients, and **admin auth** for the dashboard/API.
   is stored only as a SHA-256 hash.
 - Clients present it as `Authorization: Bearer <key>` (OpenAI clients) or
   `x-api-key: <key>` (Anthropic clients). Both are accepted on `/v1/*`.
-- Lookup is by hash with a constant-time comparison (NFR-3.3).
+- Lookup is by hash with a constant-time comparison.
 
 A key can carry optional limits (see [Usage, Cost and Accounting](Usage-Cost-and-Accounting)):
 
@@ -31,8 +31,7 @@ Client IP is taken from the trusted ingress headers `CF-Connecting-IP`, then the
 first `X-Forwarded-For` hop, then `X-Real-IP` (sound because cloudflared is the
 sole ingress).
 
-Revocation and limit changes take effect within a few seconds without a restart
-(FR-3.6).
+Revocation and limit changes take effect within a few seconds without a restart.
 
 ## Admin auth
 
@@ -48,7 +47,7 @@ The dashboard/API uses a **password + in-memory session** model:
   invalidates all sessions** — so the dashboard requires re-login after a restart.
 - For CLI/curl, the header `x-kinetix-admin-token` may carry either a live session
   token or the raw admin password. A raw password is **never** accepted from the
-  cookie (NFR-3.14).
+  cookie.
 
 ```bash
 # Log in and reuse the cookie

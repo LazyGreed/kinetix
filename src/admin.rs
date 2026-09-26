@@ -5164,7 +5164,7 @@ pub async fn import_config(
 }
 
 // ===========================================================================
-// Plugins (post-v1; docs/KINETIX-PLUGIN-ARCHITECTURE.md §11, §20, §21)
+// Plugins
 // ===========================================================================
 
 #[derive(Deserialize)]

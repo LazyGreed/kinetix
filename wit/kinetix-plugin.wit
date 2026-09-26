@@ -1,10 +1,10 @@
-// Kinetix plugin host API v1 (docs/KINETIX-PLUGIN-ARCHITECTURE.md §7).
+// Kinetix plugin host API v1. This WIT file is the public plugin contract.
 //
 // A plugin is a WebAssembly component that imports the host capabilities it is
 // granted and exports the capability interfaces it provides. The host never
 // hands a plugin ambient authority: every import is a controlled host call.
 //
-// The adapter/streaming surface described in §7.1 is intentionally kept in a
+// The adapter/streaming surface is intentionally kept in a
 // separate world (`plugin-adapter`) so that a buffered-only contract can never
 // be mistaken for the adapter contract.
 
@@ -12,9 +12,9 @@ package kinetix:plugin@1.0.0;
 
 /// Shared value types exchanged across the host boundary.
 interface types {
-  /// A structured, classified plugin failure (§17).
+  /// A structured, classified plugin failure.
   record plugin-error {
-    /// One of the §17 failure codes, e.g. "rate_limited", "plugin_internal".
+    /// One of the failure codes, e.g. "rate_limited", "plugin_internal".
     code: string,
     /// Redacted, client-safe message.
     message: string,
@@ -31,7 +31,7 @@ interface types {
   }
 
   /// A reference to a credential the host owns. The plugin never receives the
-  /// secret bytes when it uses this form (§8.1).
+  /// secret bytes when it uses this form.
   variant credential-ref {
     account(account-ref),
     named(string),
@@ -51,13 +51,13 @@ interface types {
     headers: list<tuple<string, string>>,
     body: list<u8>,
     /// True when the host truncated `body` at the plugin's response-size
-    /// budget (§9, §14). A truncated response is evidence the plugin must not
+    /// budget. A truncated response is evidence the plugin must not
     /// silently treat as complete.
     body-truncated: bool,
   }
 
   /// A discovery observation. Unknown fields stay `none`; the plugin never
-  /// overwrites explicit admin edits (§6.2).
+  /// overwrites explicit admin edits.
   record discovered-model {
     id: string,
     display-name: option<string>,
@@ -67,7 +67,7 @@ interface types {
     raw-metadata: option<string>,
   }
 
-  /// Health evidence. Core translates this into account state (§6.5).
+  /// Health evidence. Core translates this into account state.
   record health-observation {
     /// healthy | degraded | unavailable | unknown
     state: string,
@@ -77,7 +77,7 @@ interface types {
     detail-code: option<string>,
   }
 
-  /// An opaque credential lease (§6.1). The handle is meaningful only to the
+  /// An opaque credential lease. The handle is meaningful only to the
   /// host.
   record credential-lease {
     handle: string,
@@ -95,7 +95,7 @@ interface types {
     metadata-json: option<string>,
   }
 
-  /// A typed routing fact (§6.4). Never a target selection.
+  /// A typed routing fact. Never a target selection.
   record routing-fact {
     /// Fully-qualified fact name, e.g. "plugin.dev.example.foo.region".
     name: string,
@@ -106,17 +106,17 @@ interface types {
   }
 }
 
-/// Buffered outbound HTTP, for control-plane capabilities only (§7.1):
+/// Buffered outbound HTTP, for control-plane capabilities only:
 /// discovery, probes, and credential acquisition. Not the adapter contract.
 interface host-http {
   use types.{http-request, http-response, plugin-error};
   send: func(req: http-request) -> result<http-response, plugin-error>;
 }
 
-/// Host-managed plugin KV storage (§10). Scoped to the plugin id. Keys are
+/// Host-managed plugin KV storage. Scoped to the plugin id. Keys are
 /// ordinary plugin state. The reserved `_cache:` namespace is the only way a
 /// plugin may persist a fact the host will publish as a cached routing fact
-/// (§6.4): writes there are version-checked and time-bounded by the host.
+/// writes to this namespace are version-checked and time-bounded by the host.
 interface host-storage {
   get: func(key: string) -> option<list<u8>>;
   put: func(key: string, value: list<u8>) -> result<_, string>;
@@ -124,12 +124,12 @@ interface host-storage {
   /// Publish a cached routing fact during the core-owned background refresh.
   /// The value is buffered for the current invocation; only after the guest
   /// call succeeds does the host stamp `observed-at` and atomically replace
-  /// the complete reserved `_cache:<name>` snapshot (§6.4). Direct put/delete
+  /// the complete reserved `_cache:<name>` snapshot. Direct put/delete
   /// access to the `_cache:` namespace is rejected. `value-json` must be JSON.
   cache-set: func(name: string, value-json: string, max-age-ms: u64) -> result<_, string>;
 }
 
-/// Namespaced, redacted logging (§18).
+/// Namespaced, redacted logging.
 interface host-log {
   enum level {
     trace,
@@ -141,8 +141,8 @@ interface host-log {
   log: func(level: level, message: string);
 }
 
-/// Host-provided clock (§4: clock and randomness are host capabilities, never
-/// ambient). A plugin that caches anything time-bounded uses this rather than
+/// Host-provided clock. Clock and randomness are host capabilities, never
+/// ambient authority. A plugin that caches anything time-bounded uses this rather than
 /// guessing.
 interface host-clock {
   /// Seconds since the Unix epoch.
@@ -151,7 +151,7 @@ interface host-clock {
   now-unix-millis: func() -> u64;
 }
 
-/// Host-side credential use without plaintext exposure (§7.3, §8.1).
+/// Host-side credential use without plaintext exposure.
 interface host-credential {
   use types.{credential-ref, http-request, plugin-error};
   /// Sign/authorize a request with the scoped credential, returning the
@@ -161,7 +161,7 @@ interface host-credential {
   lease: func(credential: credential-ref) -> result<string, plugin-error>;
   /// Read the plaintext credential. Only available when the plugin's manifest
   /// declares the `credential_read` permission — a materially higher-risk grant
-  /// (§8.2), for protocols that place the secret in a request body rather than
+  /// grant for protocols that place the secret in a request body rather than
   /// an auth header (e.g. an OAuth refresh-token exchange). WASM linear memory
   /// cannot be reliably zeroized, so this grant is flagged in permission review.
   read: func(credential: credential-ref) -> result<string, plugin-error>;
@@ -174,7 +174,7 @@ world plugin {
   import host-credential;
   import host-clock;
 
-  /// Produce/refresh an account credential (§6.1).
+  /// Produce or refresh an account credential.
   export credential-strategy: interface {
     use types.{plugin-error, credential-lease};
     resolve: func(provider-id: string, account-id: string, account-label: string) -> result<credential-lease, plugin-error>;
@@ -182,26 +182,26 @@ world plugin {
     rotate: func(provider-id: string, account-id: string) -> result<_, plugin-error>;
   }
 
-  /// Provider-specific model discovery (§6.2).
+  /// Provider-specific model discovery.
   export model-source: interface {
     use types.{plugin-error, discovered-model};
     discover: func(provider-id: string, base-url: string, models-path: string) -> result<list<discovered-model>, plugin-error>;
   }
 
-  /// Bounded account/provider health probe (§6.5).
+  /// Bounded account/provider health probe.
   export health-probe: interface {
     use types.{plugin-error, health-observation};
     probe: func(provider-id: string, account-id: string) -> result<health-observation, plugin-error>;
   }
 
-  /// Typed routing facts (§6.4). Must be pure or cached; never a target pick.
+  /// Typed routing facts. Must be pure or cached; never a target pick.
   export routing-facts: interface {
     use types.{plugin-error, routing-fact};
     /// `request-json` carries only request/config facts core already knows.
     facts: func(request-json: string) -> result<list<routing-fact>, plugin-error>;
   }
 
-  /// Narrow read-only hooks (§6.6).
+  /// Narrow read-only hooks.
   export hooks: interface {
     use types.{plugin-error};
     on-request-normalized: func(request-json: string) -> result<_, plugin-error>;
@@ -258,7 +258,7 @@ world plugin-model-source {
   }
 }
 
-/// Adapter world (§6.3, §7.1): a separate world so the buffered host-http above
+/// Adapter world: a separate world so the buffered host-http above
 /// can never be used as the adapter transport. Streaming is a host capability
 /// added in a later revision without changing this world's exports.
 world plugin-adapter {

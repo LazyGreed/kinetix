@@ -1,8 +1,7 @@
 //! Plugin type definitions shared across the host, manifest, store, and manager.
 //!
-//! Mirrors docs/KINETIX-PLUGIN-ARCHITECTURE.md: a plugin declares the
-//! capabilities it *provides* and the permissions it *requests*; the host
-//! enforces everything else.
+//! A plugin declares the capabilities it provides and the permissions it
+//! requests; the host enforces everything else.
 
 use serde::{Deserialize, Serialize};
 

@@ -41,6 +41,6 @@ To help us investigate and resolve the issue quickly, include:
 Kinetix implements deliberate security boundaries:
 
 - **Credential Isolation**: Upstream provider API keys and tokens are stored encrypted at rest using AES-256-GCM keyed by the master key (`KINETIX_MASTER_KEY`). Client virtual keys cannot read or extract upstream credentials.
-- **Topology Hiding**: Internal upstream endpoints, provider names, and routing accounts are never exposed to clients. Responses include opaque, non-reversible route identifiers (`X-Kinetix-Route-Id`) that only administrators can resolve via authenticated admin APIs (FR-12.15).
+- **Topology Hiding**: Internal upstream endpoints, provider names, and routing accounts are never exposed to clients. Responses include opaque, non-reversible route identifiers (`X-Kinetix-Route-Id`) that only administrators can resolve via authenticated admin APIs.
 - **Control Plane Hardening**: The admin API and management dashboard require separate authentication (`KINETIX_ADMIN_TOKEN` or Cloudflare Access headers) and support dedicated host/port isolation.
 - **Supply Chain Integrity**: Dependency licenses, known advisories, and banned crates are verified on every commit via `cargo-deny`. Releases provide cryptographic SHA256 checksums and GitHub build provenance attestations.

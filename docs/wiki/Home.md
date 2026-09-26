@@ -17,7 +17,8 @@ This wiki is the detailed, task-oriented companion to the repo
 | [Getting Started](Getting-Started) | Install, first run, point a client at it |
 | [CLI Reference](CLI-Reference) | Every subcommand and flag |
 | [Configuration](Configuration) | XDG layout, env vars, precedence, bootstrap TOML |
-| [Architecture](Architecture) | Modules, request lifecycle, data/control plane |
+| [Architecture](Architecture) | Major boundaries and repository navigation |
+| [Glossary](Glossary) | Canonical Kinetix domain terminology |
 | [Routing and Fallback](Routing-and-Fallback) | Routes, predicates, strategies, continuity |
 | [Admin API](Admin-API) | Every `/admin/api/*` endpoint |
 | [Dashboard](Dashboard) | The embedded web UI |
@@ -38,8 +39,7 @@ This wiki is the detailed, task-oriented companion to the repo
 - **Is**: a private, single-binary gateway for coding agents; correctness of the
   wire protocol and routing decisions matters more than breadth.
 - **Isn't**: a general-purpose AI platform, a multi-tenant SaaS, or a bundled
-  provider-preset library. See the non-goals in
-  [docs/DESIGN.md](https://github.com/PrightCord/kinetix/blob/main/docs/DESIGN.md).
+  provider-preset library.
 
 ## Editing this wiki
 
