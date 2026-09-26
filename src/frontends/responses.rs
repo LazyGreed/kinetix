@@ -1159,17 +1159,7 @@ impl ResponsesEncoder {
             }));
         }
 
-        let mut usage_obj = json!({
-            "total_tokens": self.usage.as_ref().map(|u| u.input.unwrap_or(0) + u.output.unwrap_or(0)).unwrap_or(0),
-            "input_tokens": self.usage.as_ref().and_then(|u| u.input).unwrap_or(0),
-            "output_tokens": self.usage.as_ref().and_then(|u| u.output).unwrap_or(0),
-        });
-        if let Some(cached) = self.usage.as_ref().and_then(|u| u.cached) {
-            usage_obj["input_token_details"] = json!({ "cached_tokens": cached });
-        }
-        if let Some(t) = self.usage.as_ref().and_then(|u| u.thinking) {
-            usage_obj["output_token_details"] = json!({ "reasoning_tokens": t });
-        }
+        let usage_obj = responses_usage(self.usage.as_ref());
 
         json!({
             "id": self.response_id,
@@ -1213,6 +1203,32 @@ impl ResponsesEncoder {
 // ---------------------------------------------------------------------------
 // Non-streaming Aggregation
 // ---------------------------------------------------------------------------
+
+fn responses_usage(usage: Option<&crate::types::TokenUsage>) -> Value {
+    let input = usage.and_then(|usage| usage.input).unwrap_or(0);
+    let output = usage.and_then(|usage| usage.output).unwrap_or(0);
+    let mut usage_obj = json!({
+        "total_tokens": input + output,
+        "input_tokens": input,
+        "output_tokens": output,
+    });
+
+    let mut input_details = serde_json::Map::new();
+    if let Some(cached) = usage.and_then(|usage| usage.cached) {
+        input_details.insert("cached_tokens".into(), json!(cached));
+    }
+    if let Some(cache_write) = usage.and_then(|usage| usage.cache_write) {
+        input_details.insert("cache_write_tokens".into(), json!(cache_write));
+    }
+    if !input_details.is_empty() {
+        usage_obj["input_tokens_details"] = Value::Object(input_details);
+    }
+    if let Some(reasoning) = usage.and_then(|usage| usage.thinking) {
+        usage_obj["output_tokens_details"] = json!({ "reasoning_tokens": reasoning });
+    }
+
+    usage_obj
+}
 
 fn responses_incomplete_reason(finish: &FinishReason) -> Option<String> {
     match finish {
@@ -1295,17 +1311,7 @@ pub fn aggregate_responses(
         }));
     }
 
-    let mut usage_obj = json!({
-        "total_tokens": usage.input.unwrap_or(0) + usage.output.unwrap_or(0),
-        "input_tokens": usage.input.unwrap_or(0),
-        "output_tokens": usage.output.unwrap_or(0),
-    });
-    if let Some(cached) = usage.cached {
-        usage_obj["input_token_details"] = json!({ "cached_tokens": cached });
-    }
-    if let Some(t) = usage.thinking {
-        usage_obj["output_token_details"] = json!({ "reasoning_tokens": t });
-    }
+    let usage_obj = responses_usage(Some(usage));
 
     json!({
         "id": format!("resp_{}", request_id.replace(['-', '_'], "")),
@@ -1408,6 +1414,13 @@ mod tests {
             created: 1,
         });
         let mut frames = encoder.encode(StreamEvent::RefusalDelta("not allowed".into()));
+        frames.extend(encoder.encode(StreamEvent::Usage(crate::types::TokenUsage {
+            input: Some(10),
+            output: Some(5),
+            cached: Some(2),
+            cache_write: Some(3),
+            thinking: Some(4),
+        })));
         frames.extend(encoder.encode(StreamEvent::Finish(FinishReason::Length)));
         let wire = frames
             .iter()
@@ -1418,5 +1431,9 @@ mod tests {
         assert!(wire.contains("response.incomplete"));
         assert!(wire.contains("max_output_tokens"));
         assert!(wire.contains("\"status\":\"incomplete\""));
+        assert!(wire.contains("\"input_tokens_details\""));
+        assert!(wire.contains("\"cache_write_tokens\":3"));
+        assert!(wire.contains("\"output_tokens_details\""));
+        assert!(wire.contains("\"reasoning_tokens\":4"));
     }
 }

@@ -1920,7 +1920,7 @@ fn apply_target_overrides(req: &mut InternalRequest, overrides: &Value) -> Resul
             "temperature" => req.params.temperature = value.as_f64(),
             "top_p" => req.params.top_p = value.as_f64(),
             "top_k" => req.params.top_k = value.as_f64(),
-            "max_tokens" | "max_completion_tokens" => {
+            "max_tokens" | "max_completion_tokens" | "max_output_tokens" => {
                 req.params.max_tokens = value.as_u64().and_then(|v| u32::try_from(v).ok())
             }
             "seed" => req.params.seed = value.as_i64(),

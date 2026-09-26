@@ -301,7 +301,11 @@ impl OpenAiResponsesAdapter {
             }
         }
 
+        // The Responses create schema uses max_output_tokens; remove Chat
+        // aliases before rebuilding the target-specific token limit.
+        // https://developers.openai.com/api/reference/cli/resources/responses/methods/create
         body.remove("max_tokens");
+        body.remove("max_completion_tokens");
         body.remove("max_output_tokens");
         if let Some(max_tokens) = req.params.max_tokens {
             let max_tokens = ctx
@@ -347,7 +351,9 @@ impl OpenAiResponsesAdapter {
             cached: usage
                 .pointer("/input_tokens_details/cached_tokens")
                 .and_then(Value::as_u64),
-            cache_write: None,
+            cache_write: usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64),
             thinking: usage
                 .pointer("/output_tokens_details/reasoning_tokens")
                 .and_then(Value::as_u64),
@@ -831,15 +837,43 @@ mod tests {
             matches!(&start[0], StreamEvent::ToolCallStart { index: 2, id: Some(id), name, .. } if id == "call-1" && name == "lookup")
         );
         let done = adapter
-            .parse_stream_chunk(r#"{"type":"response.completed","response":{"output":[{"type":"function_call"}],"usage":{"input_tokens":7,"output_tokens":4,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":1}}}}"#)
+            .parse_stream_chunk(r#"{"type":"response.completed","response":{"output":[{"type":"function_call"}],"usage":{"input_tokens":7,"output_tokens":4,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3},"output_tokens_details":{"reasoning_tokens":1}}}}"#)
             .unwrap();
         assert!(
-            matches!(&done[0], StreamEvent::Usage(usage) if usage.input == Some(7) && usage.cached == Some(2) && usage.thinking == Some(1))
+            matches!(&done[0], StreamEvent::Usage(usage) if usage.input == Some(7) && usage.cached == Some(2) && usage.cache_write == Some(3) && usage.thinking == Some(1))
         );
         assert!(matches!(
             done.last(),
             Some(StreamEvent::Finish(FinishReason::ToolCalls))
         ));
+    }
+
+    #[test]
+    fn passthrough_normalizes_max_completion_tokens_to_responses_token_limit() {
+        let provider = provider();
+        let mut model = model();
+        model.max_output_tokens = Some(64);
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: None,
+            credential: "secret".into(),
+        };
+        let mut req = request();
+        req.params.max_tokens = Some(512);
+        let mut body = json!({
+            "max_tokens": 100,
+            "max_completion_tokens": 200,
+            "max_output_tokens": 300
+        });
+
+        OpenAiResponsesAdapter
+            .normalize_passthrough_body(&ctx, &req, &mut body)
+            .unwrap();
+
+        assert_eq!(body["max_output_tokens"], 64);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]

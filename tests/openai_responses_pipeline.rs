@@ -81,23 +81,48 @@ async fn upstream(
                 "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":11,\"output_tokens\":12}}}\n\n"
             )))
             .unwrap(),
-        "temp_clamp" | "drop_presence_penalty" | "route_override" => Response::builder()
+        "temp_clamp"
+        | "drop_presence_penalty"
+        | "route_override"
+        | "completion_override"
+        | "output_override" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
             .body(Body::from(
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
             ))
             .unwrap(),
-        "full_refusal" => Json(json!({
-            "id": "resp_full_refusal",
-            "status": "completed",
-            "output": [{
-                "type": "message",
-                "content": [{"type": "refusal", "refusal": "I cannot help with that."}]
-            }],
-            "usage": {"input_tokens": 7, "output_tokens": 8}
-        }))
-        .into_response(),
+        "full_refusal" => {
+            let response = json!({
+                "id": "resp_full_refusal",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "I cannot help with that."}]
+                }],
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 8,
+                    "input_tokens_details": {
+                        "cached_tokens": 2,
+                        "cache_write_tokens": 3
+                    },
+                    "output_tokens_details": {"reasoning_tokens": 1}
+                }
+            });
+            let refusal_delta = json!({
+                "type": "response.refusal.delta",
+                "delta": "I cannot help with that."
+            });
+            let completion = json!({ "type": "response.completed", "response": response });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(format!(
+                    "data: {refusal_delta}\n\ndata: {completion}\n\n"
+                )))
+                .unwrap()
+        }
         _ => (StatusCode::BAD_REQUEST, "unexpected test case").into_response(),
     }
 }
@@ -267,33 +292,45 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     db::insert_route_target(&pool, &route_id, None, &model_id, 1, 1, "{}", "{}")
         .await
         .unwrap();
-    let override_route_id = db::insert_route(
-        &pool,
-        &db::NewRoute {
-            name: "responses-override-route",
-            description: "",
-            strategy: "priority",
-            fallback_triggers: json!({}),
-            portability_policy: "reject",
-            sticky_routing: false,
-            cache_affinity: false,
-            max_attempts: Some(1),
-        },
-    )
-    .await
-    .unwrap();
-    db::insert_route_target(
-        &pool,
-        &override_route_id,
-        None,
-        &model_id,
-        1,
-        1,
-        "{}",
-        r#"{"max_tokens":512}"#,
-    )
-    .await
-    .unwrap();
+    for (route_name, param_overrides) in [
+        ("responses-override-route", r#"{"max_tokens":512}"#),
+        (
+            "responses-completion-override-route",
+            r#"{"max_completion_tokens":512}"#,
+        ),
+        (
+            "responses-output-override-route",
+            r#"{"max_output_tokens":512}"#,
+        ),
+    ] {
+        let override_route_id = db::insert_route(
+            &pool,
+            &db::NewRoute {
+                name: route_name,
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "reject",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &pool,
+            &override_route_id,
+            None,
+            &model_id,
+            1,
+            1,
+            "{}",
+            param_overrides,
+        )
+        .await
+        .unwrap();
+    }
     db::insert_virtual_key(
         &pool,
         &db::VirtualKeyRow {
@@ -382,6 +419,22 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         full_refusal.pointer("/output/0/content/0/refusal"),
         Some(&json!("I cannot help with that."))
     );
+    assert_eq!(
+        full_refusal.pointer("/usage/input_tokens_details/cached_tokens"),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        full_refusal.pointer("/usage/input_tokens_details/cache_write_tokens"),
+        Some(&json!(3))
+    );
+    assert_eq!(
+        full_refusal.pointer("/usage/output_tokens_details/reasoning_tokens"),
+        Some(&json!(1))
+    );
+    assert!(full_refusal.pointer("/usage/input_token_details").is_none());
+    assert!(full_refusal
+        .pointer("/usage/output_token_details")
+        .is_none());
 
     let (status, incomplete_responses) = call_responses(
         &state,
@@ -457,6 +510,26 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     .await;
     assert_eq!(status, StatusCode::OK, "{route_override}");
 
+    let (status, completion_override) = call_responses(
+        &state,
+        "responses-completion-override-route",
+        "completion_override",
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{completion_override}");
+
+    let (status, output_override) = call_responses(
+        &state,
+        "responses-output-override-route",
+        "output_override",
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output_override}");
+
     let (status, rejected_parameter) = call_responses(
         &state,
         "responses-route",
@@ -468,7 +541,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected_parameter}");
 
     let requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 7);
+    assert_eq!(requests.len(), 9);
     for (request, test_case) in requests
         .iter()
         .take(2)
@@ -507,8 +580,13 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     );
     assert_eq!(requests[4].body["temperature"], 1.0);
     assert!(requests[5].body.get("presence_penalty").is_none());
-    assert_eq!(requests[6].body["max_output_tokens"], 512);
-    assert!(requests[6].body.get("max_tokens").is_none());
+    for request in &requests[6..9] {
+        assert_eq!(request.body["max_output_tokens"], 512);
+        assert!(request.body.get("max_tokens").is_none());
+        assert!(request.body.get("max_completion_tokens").is_none());
+    }
+    assert_eq!(requests[7].body["input"], "case:completion_override");
+    assert_eq!(requests[8].body["input"], "case:output_override");
 
     server.abort();
     let _ = std::fs::remove_dir_all(&root);

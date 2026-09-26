@@ -342,6 +342,37 @@ impl Adapter for OpenAiAdapter {
         Ok(Value::Object(body))
     }
 
+    fn normalize_passthrough_body(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        req: &InternalRequest,
+        body: &mut Value,
+    ) -> Result<(), UpstreamFailure> {
+        let Some(body) = body.as_object_mut() else {
+            return Err(UpstreamFailure {
+                kind: FailureKind::BadRequest,
+                status: None,
+                retry_after_secs: None,
+                message: "OpenAI passthrough body must be a JSON object".into(),
+                quota_reset_at: None,
+            });
+        };
+
+        if let Some(max_tokens) = req.params.max_tokens {
+            for alias in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                body.remove(alias);
+            }
+            let mut max_tokens = max_tokens as i64;
+            if let Some(max) = ctx.model.max_output_tokens {
+                max_tokens = max_tokens.min(max);
+            }
+            // Keep Chat Completions passthrough aligned with this adapter's
+            // translated body field while preventing Responses aliases from leaking.
+            body.insert("max_tokens".into(), json!(max_tokens));
+        }
+        Ok(())
+    }
+
     fn classify_error(
         &self,
         status: u16,
@@ -648,6 +679,42 @@ mod tests {
             extra: Default::default(),
             raw_body: None,
         }
+    }
+
+    #[test]
+    fn chat_passthrough_normalizes_canonical_token_overrides() {
+        let p = provider();
+        let mut m = model();
+        m.max_output_tokens = Some(300);
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let adapter = OpenAiAdapter;
+        let mut req = base_request();
+        req.params.max_tokens = Some(512);
+        let mut body = serde_json::json!({
+            "max_tokens": 10,
+            "max_completion_tokens": 20,
+            "max_output_tokens": 30
+        });
+
+        adapter
+            .normalize_passthrough_body(&ctx, &req, &mut body)
+            .unwrap();
+
+        assert_eq!(body["max_tokens"], 300);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+
+        req.params.max_tokens = None;
+        let mut untouched = serde_json::json!({"max_output_tokens": "unknown"});
+        adapter
+            .normalize_passthrough_body(&ctx, &req, &mut untouched)
+            .unwrap();
+        assert_eq!(untouched["max_output_tokens"], "unknown");
     }
 
     #[test]

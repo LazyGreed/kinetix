@@ -327,8 +327,8 @@ fn responses_non_streaming_aggregation_is_stable() {
         input: Some(10),
         output: Some(5),
         cached: Some(2),
-        cache_write: None,
-        thinking: None,
+        cache_write: Some(3),
+        thinking: Some(4),
     };
     let agg = frontends::aggregate(
         FrontendFormat::OpenAiResponses,
@@ -349,7 +349,12 @@ fn responses_non_streaming_aggregation_is_stable() {
     assert_eq!(agg["usage"]["total_tokens"], 15);
     assert_eq!(agg["usage"]["input_tokens"], 10);
     assert_eq!(agg["usage"]["output_tokens"], 5);
-    assert_eq!(agg["usage"]["input_token_details"]["cached_tokens"], 2);
+    assert_eq!(agg["usage"]["input_tokens_details"]["cached_tokens"], 2);
+    assert_eq!(
+        agg["usage"]["input_tokens_details"]["cache_write_tokens"],
+        3
+    );
+    assert_eq!(agg["usage"]["output_tokens_details"]["reasoning_tokens"], 4);
 }
 
 #[test]

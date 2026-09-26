@@ -76,12 +76,12 @@
     {
       "id": "responses.native.openai.sync",
       "runner": "cargo",
-      "summary": "Native Responses adapter pairs the Responses body dialect with POST /responses"
+      "summary": "Native Responses adapter pairs the Responses body dialect with POST /responses and preserves Responses usage breakdowns"
     },
     {
       "id": "responses.native.openai.passthrough",
       "runner": "cargo",
-      "summary": "Responses API passthrough normalizes aliases, defaults, clamps, token caps, route overrides and drop/reject policy while rewriting model, store and endpoint"
+      "summary": "Responses API passthrough normalizes all route token aliases to capped max_output_tokens and applies defaults, clamps, reasoning and parameter policy while rewriting model, store and endpoint"
     },
     {
       "id": "responses.native.openai.stream",
@@ -800,7 +800,7 @@
         ],
         [
           "temperature / top_p / max_output_tokens / max_tokens",
-          "target defaults/clamps apply; max_tokens normalizes to capped max_output_tokens",
+          "target defaults/clamps apply; max_tokens and route token aliases normalize to capped max_output_tokens",
           "translated subject to target capability",
           "Same-format passthrough and translated requests both apply resolved model policy, including defaults, bounds and model output-token caps.",
           [
@@ -858,6 +858,16 @@
             "responses.translate.gemini.stream",
             "responses.translate.anthropic.sync",
             "responses.translate.anthropic.stream"
+          ]
+        ],
+        [
+          "usage input_tokens_details / output_tokens_details",
+          "known cached, cache-write and reasoning token breakdowns preserved",
+          "canonical usage",
+          "Responses aggregation emits the documented plural detail fields, includes cache_write_tokens when supplied, and omits unknown breakdown metadata.",
+          [
+            "responses.native.openai.sync",
+            "responses.native.openai.passthrough"
           ]
         ],
         [
