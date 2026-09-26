@@ -70,6 +70,16 @@ pub struct ProviderCircuitTransition {
     pub half_open_probe: bool,
 }
 
+impl ProviderCircuitTransition {
+    pub fn merge(self, later: Self) -> Self {
+        Self {
+            opened: self.opened || later.opened,
+            recovered: self.recovered || later.recovered,
+            half_open_probe: self.half_open_probe || later.half_open_probe,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderCircuitReject {
     pub retry_after_secs: u64,
@@ -273,6 +283,7 @@ impl ProviderCircuits {
             generation,
             correlation_policy,
             half_open_probe,
+            validated_success: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         })
     }
@@ -299,6 +310,7 @@ pub struct ProviderAttempt {
     generation: u64,
     correlation_policy: ProviderCorrelationPolicy,
     half_open_probe: bool,
+    validated_success: AtomicBool,
     finished: AtomicBool,
 }
 
@@ -307,10 +319,47 @@ impl ProviderAttempt {
         self.half_open_probe
     }
 
+    /// Record that a half-open probe produced a validated response without
+    /// consuming its lease; the stream may still fail before termination.
+    pub fn mark_validated_success(&self) -> ProviderCircuitTransition {
+        if !self.half_open_probe
+            || self.finished.load(Ordering::Acquire)
+            || self.validated_success.swap(true, Ordering::AcqRel)
+        {
+            return ProviderCircuitTransition::default();
+        }
+
+        let now = Utc::now();
+        let mut state = self.circuit.lock();
+        let recovered =
+            state.generation == self.generation && state.state == ProviderCircuitState::HalfOpen;
+        if recovered {
+            state.half_open_inflight = 0;
+            state.state = ProviderCircuitState::Closed;
+            state.opened_at = None;
+            state.retry_at = None;
+            state.failures.clear();
+            state.last_successful_probe = Some(now);
+            state.recoveries = state.recoveries.saturating_add(1);
+        }
+        ProviderCircuitTransition {
+            recovered,
+            half_open_probe: true,
+            ..Default::default()
+        }
+    }
+
     pub fn finish_success(&self) -> ProviderCircuitTransition {
         if self.finished.swap(true, Ordering::AcqRel) {
             return ProviderCircuitTransition::default();
         }
+        if self.half_open_probe && self.validated_success.load(Ordering::Acquire) {
+            return ProviderCircuitTransition {
+                half_open_probe: true,
+                ..Default::default()
+            };
+        }
+
         let now = Utc::now();
         let mut state = self.circuit.lock();
         let mut recovered = false;
@@ -325,6 +374,9 @@ impl ProviderAttempt {
                 state.recoveries = state.recoveries.saturating_add(1);
                 recovered = true;
             } else if !self.half_open_probe && state.state == ProviderCircuitState::Closed {
+                // Deliberate conservative policy: a successful closed-state
+                // attempt resets correlation evidence, requiring failures to
+                // accumulate without an intervening success.
                 state.failures.clear();
             }
         }
@@ -348,6 +400,8 @@ impl ProviderAttempt {
         let attempt_owns_state = state.generation == self.generation
             && if self.half_open_probe {
                 state.state == ProviderCircuitState::HalfOpen
+                    || (self.validated_success.load(Ordering::Acquire)
+                        && state.state == ProviderCircuitState::Closed)
             } else {
                 state.state == ProviderCircuitState::Closed
             };
@@ -578,11 +632,68 @@ mod tests {
         assert!(probe.is_half_open_probe());
         assert!(circuits.begin_attempt("p", "b", "route-b").is_err());
 
-        // The probe's first validated success recovers the circuit before the
-        // response stream reaches terminal completion.
-        let transition = probe.finish_success();
+        // The validated response recovers before stream completion without
+        // consuming the attempt's lease.
+        let transition = probe.mark_validated_success();
         assert!(transition.recovered);
         assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);
+        assert!(!probe.finish_success().recovered);
+    }
+
+    #[test]
+    fn validated_probe_stream_failure_reopens_provider_and_records_evidence() {
+        let circuits = ProviderCircuits::default();
+        circuits
+            .begin_attempt("p", "a", "route-a")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        circuits
+            .begin_attempt("p", "b", "route-b")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+
+        {
+            let circuit = circuits.circuit("p");
+            let mut state = circuit.lock();
+            state.retry_at = Some(Utc::now() - ChronoDuration::seconds(1));
+        }
+
+        let probe = circuits.begin_attempt("p", "a", "route-a").unwrap();
+        let validation = probe.mark_validated_success();
+        assert!(validation.recovered);
+        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);
+
+        let terminal = probe.finish_failure(FailureKind::Timeout, None);
+        assert!(terminal.opened);
+        let snapshot = circuits.snapshot("p");
+        assert_eq!(snapshot.state, ProviderCircuitState::Open);
+        assert_eq!(snapshot.recent_qualifying_failures, 1);
+        assert_eq!(snapshot.recent_failures[0].account_id, "a");
+        let combined = validation.merge(terminal);
+        assert!(combined.recovered);
+        assert!(combined.opened);
+    }
+
+    #[test]
+    fn closed_success_clears_correlation_evidence_by_policy() {
+        let circuits = ProviderCircuits::default();
+        circuits
+            .begin_attempt("p", "a", "route-a")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        circuits
+            .begin_attempt("p", "b", "route-b")
+            .unwrap()
+            .finish_success();
+        circuits
+            .begin_attempt("p", "c", "route-c")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+
+        let snapshot = circuits.snapshot("p");
+        assert_eq!(snapshot.state, ProviderCircuitState::Closed);
+        assert_eq!(snapshot.recent_qualifying_failures, 1);
+        assert_eq!(snapshot.distinct_failing_accounts, 1);
     }
 
     #[test]

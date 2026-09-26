@@ -418,12 +418,12 @@ struct Attempt {
     attempt_started: Instant,
 }
 
-fn finish_provider_probe_at_validation(
+fn mark_provider_probe_validated(
     provider_attempt: &crate::provider_circuit::ProviderAttempt,
 ) -> Option<crate::provider_circuit::ProviderCircuitTransition> {
     provider_attempt
         .is_half_open_probe()
-        .then(|| provider_attempt.finish_success())
+        .then(|| provider_attempt.mark_validated_success())
 }
 
 /// Run the full pipeline and produce a client response.
@@ -1478,7 +1478,7 @@ pub async fn run(
                     // Only validated responses clear the circuit-breaker counter.
                     let _ = pool::clear_circuit(&state.pool, &target.account.id).await;
                     let provider_circuit_transition =
-                        finish_provider_probe_at_validation(&provider_attempt);
+                        mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
                         target: target.clone(),
                         upstream_request_id,
@@ -4795,19 +4795,21 @@ async fn finalize_log(
         // terminal target failures but are not provider-outage evidence.
         crate::target_telemetry::TelemetryOutcome::TargetError
     };
-    let circuit_transition = attempt.provider_circuit_transition.unwrap_or_else(|| {
-        if status == "success" {
-            attempt.provider_attempt.finish_success()
-        } else if status == "client_disconnect" {
-            attempt.provider_attempt.finish_neutral()
-        } else if let Some((kind, upstream_status)) = provider_failure {
-            attempt
-                .provider_attempt
-                .finish_failure(kind, upstream_status)
-        } else {
-            attempt.provider_attempt.finish_neutral()
-        }
-    });
+    let terminal_circuit_transition = if status == "success" {
+        attempt.provider_attempt.finish_success()
+    } else if status == "client_disconnect" {
+        attempt.provider_attempt.finish_neutral()
+    } else if let Some((kind, upstream_status)) = provider_failure {
+        attempt
+            .provider_attempt
+            .finish_failure(kind, upstream_status)
+    } else {
+        attempt.provider_attempt.finish_neutral()
+    };
+    let circuit_transition = attempt
+        .provider_circuit_transition
+        .map(|validated| validated.merge(terminal_circuit_transition))
+        .unwrap_or(terminal_circuit_transition);
     let attempt_offset_ms = attempt
         .attempt_started
         .saturating_duration_since(started)
