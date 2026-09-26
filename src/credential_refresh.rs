@@ -336,7 +336,15 @@ fn schedule_from_credential(
     let refresh_after = parse_time(credential.refresh_after.as_deref());
 
     let requested = refresh_after.or_else(|| {
-        expires_at.map(|expires| expires - ChronoDuration::seconds(DEFAULT_REFRESH_LEAD_SECS))
+        expires_at.map(|expires| {
+            // Keep half of a short lease available before refreshing. Applying
+            // the fixed five-minute lead to a lease shorter than five minutes
+            // clamps its deadline to `now`, causing a successful rotation to
+            // be claimed again on every scheduler tick.
+            let remaining_secs = (expires - now).num_seconds().max(0);
+            let lead_secs = (remaining_secs / 2).min(DEFAULT_REFRESH_LEAD_SECS);
+            expires - ChronoDuration::seconds(lead_secs)
+        })
     })?;
     let next_attempt_at = requested.max(now);
 
@@ -387,6 +395,7 @@ mod tests {
     struct RotatingStrategy {
         rotations: AtomicUsize,
         secret: tokio::sync::Mutex<String>,
+        short_lease_after_rotation: bool,
     }
 
     impl RotatingStrategy {
@@ -394,6 +403,15 @@ mod tests {
             Self {
                 rotations: AtomicUsize::new(0),
                 secret: tokio::sync::Mutex::new("stale".into()),
+                short_lease_after_rotation: false,
+            }
+        }
+
+        fn with_short_lease_after_rotation() -> Self {
+            Self {
+                rotations: AtomicUsize::new(0),
+                secret: tokio::sync::Mutex::new("stale".into()),
+                short_lease_after_rotation: true,
             }
         }
     }
@@ -410,17 +428,30 @@ mod tests {
         ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
             let rotations = self.rotations.load(Ordering::Relaxed);
             let now = Utc::now();
+            let has_short_lease = self.short_lease_after_rotation && rotations > 0;
             Ok(ResolvedCredential {
                 secret: self.secret.lock().await.clone(),
-                expires_at: Some((now.to_owned() + ChronoDuration::hours(2)).to_rfc3339()),
-                refresh_after: Some(
-                    if rotations == 0 {
-                        now - ChronoDuration::seconds(1)
-                    } else {
-                        now + ChronoDuration::hours(1)
-                    }
+                expires_at: Some(
+                    (now.to_owned()
+                        + if has_short_lease {
+                            ChronoDuration::minutes(3)
+                        } else {
+                            ChronoDuration::hours(2)
+                        })
                     .to_rfc3339(),
                 ),
+                refresh_after: if has_short_lease {
+                    None
+                } else {
+                    Some(
+                        if rotations == 0 {
+                            now - ChronoDuration::seconds(1)
+                        } else {
+                            now + ChronoDuration::hours(1)
+                        }
+                        .to_rfc3339(),
+                    )
+                },
                 rotated: rotations > 0,
             })
         }
@@ -463,6 +494,26 @@ mod tests {
         assert_eq!(
             schedule.next_attempt_at,
             expiry - ChronoDuration::seconds(DEFAULT_REFRESH_LEAD_SECS)
+        );
+    }
+
+    #[test]
+    fn short_expiry_uses_proportional_refresh_lead() {
+        let now = Utc::now();
+        let expiry = now.to_owned() + ChronoDuration::minutes(4);
+        let credential = ResolvedCredential {
+            secret: "secret".into(),
+            expires_at: Some(expiry.to_rfc3339()),
+            refresh_after: None,
+            rotated: false,
+        };
+
+        let schedule = schedule_from_credential(&credential, now).unwrap();
+
+        assert!(schedule.next_attempt_at > now);
+        assert_eq!(
+            schedule.next_attempt_at,
+            expiry - ChronoDuration::minutes(2)
         );
     }
 
@@ -550,6 +601,29 @@ mod tests {
             coordinator.next_attempt_at("p1", &account.id).unwrap()
                 > Utc::now() + ChronoDuration::minutes(30)
         );
+    }
+
+    #[tokio::test]
+    async fn successful_short_lease_rotation_is_not_immediately_due_again() {
+        let coordinator = RefreshCoordinator::default();
+        let strategy = Arc::new(RotatingStrategy::with_short_lease_after_rotation());
+        let account = account();
+        let initial = strategy.resolve(&account).await.unwrap();
+        coordinator.observe("p1", &account.id, &initial);
+
+        assert_eq!(coordinator.claim_due(Utc::now()).len(), 1);
+        assert!(coordinator
+            .rotate_scheduled("p1", strategy.clone(), &account)
+            .await
+            .unwrap());
+
+        let now = Utc::now();
+        let next_attempt = coordinator.next_attempt_at("p1", &account.id).unwrap();
+        assert!(
+            next_attempt > now + ChronoDuration::minutes(1),
+            "three-minute refreshed lease should retain a proportional lead, not be due now"
+        );
+        assert!(coordinator.claim_due(now).is_empty());
     }
 
     #[test]

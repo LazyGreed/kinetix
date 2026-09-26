@@ -250,22 +250,27 @@ impl AppState {
         &self,
         provider: &crate::db::ProviderRow,
         account: &crate::db::AccountRow,
-    ) -> anyhow::Result<crate::credentials::ResolvedCredential> {
+    ) -> std::result::Result<crate::credentials::ResolvedCredential, CredentialRotationError> {
         if let Some(r) = provider.credential_plugin_ref() {
             let Some(strategy) = self.plugin_credentials.get(&r.plugin_id) else {
-                anyhow::bail!(
-                    "provider '{}' is bound to unavailable plugin credential strategy '{}'",
-                    provider.name,
-                    r.to_string_ref()
-                );
+                return Err(CredentialRotationError::new(
+                    "plugin_internal",
+                    format!(
+                        "provider '{}' is bound to unavailable plugin credential strategy '{}'",
+                        provider.name,
+                        r.to_string_ref()
+                    ),
+                    true,
+                    None,
+                ));
             };
             let strategy = Arc::clone(strategy.value());
-            return Ok(self
+            return self
                 .credential_refresh
                 .resolve(&provider.id, strategy, account)
-                .await?);
+                .await;
         }
-        Ok(self.credentials.resolve(account).await?)
+        self.credentials.resolve(account).await
     }
 
     /// Force renewal for a plugin-backed credential after an upstream auth

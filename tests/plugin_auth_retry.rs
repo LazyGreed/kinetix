@@ -793,6 +793,45 @@ async fn terminal_credential_expired_from_scheduled_resolve_disables_account() {
 }
 
 #[tokio::test]
+async fn terminal_resolve_credential_expired_disables_account_and_uses_fallback() {
+    let strategy = Arc::new(TerminalResolveCredential::new());
+    let harness = setup(strategy.clone(), None, 2).await;
+
+    let response = pipeline::run(
+        &harness.state,
+        FrontendFormat::OpenAi,
+        None,
+        harness.request.clone(),
+        "req_plugin_auth_terminal_resolve_failure".into(),
+        true,
+        None,
+        vec![],
+    )
+    .await
+    .expect("request should fall back after resolve confirms the credential is revoked");
+    consume(response).await;
+
+    let account = db::get_account(&harness.pool, &harness.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.status, "disabled");
+    let fallback = db::get_account(&harness.pool, &harness.fallback_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fallback.status, "healthy");
+    assert_eq!(
+        harness.upstream.attempts.lock().await.as_slice(),
+        ["Bearer fallback-token"],
+        "a revoked credential must be skipped before any upstream request"
+    );
+    assert_eq!(strategy.rotations.load(Ordering::Relaxed), 0);
+
+    cleanup(harness).await;
+}
+
+#[tokio::test]
 async fn confirmed_missing_account_forgets_refresh_schedule() {
     let strategy = Arc::new(TestCredential::new(RotationMode::Success { delay_ms: 0 }));
     let harness = setup(strategy, None, 1).await;

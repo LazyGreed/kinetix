@@ -849,15 +849,37 @@ pub async fn run(
                 crate::alerts::record_credential_success();
                 c.secret
             }
-            Err(e) => {
-                tracing::error!(account = %target.account.id, error = %e, "credential resolution failed");
+            Err(error) => {
+                tracing::error!(
+                    account = %target.account.id,
+                    code = %error.code,
+                    error = %error,
+                    "credential resolution failed"
+                );
                 crate::alerts::record_credential_failure();
                 last_error = Some(ProxyError::internal("credential unavailable"));
-                trace.step(
-                    "skip",
-                    Some(target.account.label.clone()),
-                    "credential unavailable",
-                );
+                if error.invalid_credential() {
+                    let message = format!("credential resolution failed: {}", error.message);
+                    let _ = db::set_account_status(
+                        &state.pool,
+                        &target.account.id,
+                        "disabled",
+                        None,
+                        None,
+                        Some(&message),
+                    )
+                    .await;
+                    let _ = state.registry.reload(&state.pool).await;
+                    let detail = format!("{}:credential_invalid(disabled)", target.account.label);
+                    meta.fallback_path.push(detail.clone());
+                    trace.step("skip", Some(target.account.label.clone()), detail);
+                } else {
+                    trace.step(
+                        "skip",
+                        Some(target.account.label.clone()),
+                        "credential unavailable",
+                    );
+                }
                 continue;
             }
         };
