@@ -483,24 +483,18 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
                     continue;
                 }
             };
-            state.quota.observe_plugin(
+            let quota_observation = state.quota.observe_plugin(
                 &provider.id,
                 &account.id,
                 obs.quota_state.as_deref(),
                 obs.reset_at.as_deref(),
             );
-            let quota_exhausted = obs.quota_state.as_deref().is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "exhausted" | "empty" | "depleted" | "none" | "0" | "0%"
-                )
-            });
-            if quota_exhausted {
-                let reset_at = obs.reset_at.as_deref().and_then(db::parse_dt);
+            if let Some(observation) = quota_observation.filter(|observation| observation.exhausted)
+            {
                 let _ = pool::mark_exhausted(
                     &state.pool,
                     &account.id,
-                    reset_at,
+                    observation.reset_at,
                     3600,
                     "plugin health probe: quota exhausted",
                 )

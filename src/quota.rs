@@ -68,6 +68,13 @@ pub struct QuotaHeaderObservation {
     pub exhausted: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaPluginObservation {
+    pub remaining_fraction: Option<f64>,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub exhausted: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct QuotaRegistry {
     inner: Arc<DashMap<(String, String), QuotaSnapshot>>,
@@ -121,22 +128,33 @@ impl QuotaRegistry {
         account_id: &str,
         quota_state: Option<&str>,
         reset_at: Option<&str>,
-    ) {
+    ) -> Option<QuotaPluginObservation> {
         let reset_at = reset_at.and_then(|value| {
             DateTime::parse_from_rfc3339(value)
                 .ok()
                 .map(|value| value.with_timezone(&Utc))
         });
-        let remaining = quota_state.and_then(parse_quota_state);
+        let remaining_fraction = quota_state
+            .and_then(parse_quota_state)
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 1.0));
+        let exhausted = remaining_fraction.is_some_and(|remaining| remaining <= 0.0);
         if quota_state.is_some() || reset_at.is_some() {
             self.observe(
                 provider_id,
                 account_id,
-                remaining,
+                remaining_fraction,
                 reset_at,
                 "plugin_health_probe",
                 Duration::from_secs(45),
             );
+            Some(QuotaPluginObservation {
+                remaining_fraction,
+                reset_at,
+                exhausted,
+            })
+        } else {
+            None
         }
     }
 
@@ -335,6 +353,35 @@ mod tests {
 
         assert!(!snapshot.is_fresh(now));
         assert_eq!(snapshot.preference(now), 0.0);
+    }
+
+    #[test]
+    fn plugin_numeric_zero_variants_are_reported_as_hard_exhaustion() {
+        for quota_state in ["0", "0%", "0.0", "0.00%", " exhausted "] {
+            let registry = QuotaRegistry::default();
+            let observation = registry
+                .observe_plugin("p", "a", Some(quota_state), None)
+                .unwrap();
+
+            assert!(observation.exhausted, "quota_state={quota_state:?}");
+            assert_eq!(
+                observation.remaining_fraction,
+                Some(0.0),
+                "quota_state={quota_state:?}"
+            );
+            assert_eq!(
+                registry.snapshot("p", "a").unwrap().remaining_fraction,
+                Some(0.0),
+                "quota_state={quota_state:?}"
+            );
+        }
+
+        let registry = QuotaRegistry::default();
+        let observation = registry
+            .observe_plugin("p", "a", Some("0.1"), None)
+            .unwrap();
+        assert!(!observation.exhausted);
+        assert_eq!(observation.remaining_fraction, Some(0.1));
     }
 
     #[test]
