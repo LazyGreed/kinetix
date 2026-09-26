@@ -95,7 +95,7 @@ kinetix account remove <ID>
 ```bash
 kinetix route add --name resilient \
   --target "ProviderA/model-x" --target "ProviderB/model-y" \
-  [--strategy priority|round-robin|weighted|least-used] \
+  [--strategy priority|round-robin|weighted|least-used|adaptive] \
   [--portability-policy reject|strip_with_warning] [--cache-affinity] \
   [--max-attempts 5]
 kinetix route list

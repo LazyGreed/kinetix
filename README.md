@@ -21,7 +21,7 @@ Kinetix puts those concerns behind one endpoint.
 | **Provider portability**      | Gemini, OpenAI-compatible, and Anthropic outbound adapters selected by wire format                   |
 | **Virtual keys**              | Per-client model access, RPM/TPM limits, budgets, expiry, IP restrictions, and optional body logging |
 | **Account pools**             | Multiple credentials per provider with health state, cooldowns, quotas, and automatic failover       |
-| **Executable Routes**         | Priority, round-robin, weighted, and least-used target selection with configurable fallback          |
+| **Executable Routes**         | Priority, round-robin, weighted, least-used, and adaptive target selection with configurable fallback |
 | **Streaming-safe failover**   | Retry another eligible target before response bytes are committed to the client                      |
 | **Extensibility (WASM)**      | Sandboxed WebAssembly (Wasmtime) plugins for custom wire formats, OAuth/credential strategies, routing facts, and probes |
 | **Cost accounting**           | Versioned prices, token usage, cached/thinking-aware accounting, exports, and spend views            |
@@ -193,6 +193,7 @@ Routes can select targets using:
 * round-robin
 * weighted
 * least-used
+* adaptive (target-local concurrency + TTFT/error EWMA)
 
 Kinetix tracks provider-account state and can react to conditions such as rate limits, quota exhaustion, authentication failures, and configured fallback triggers.
 

@@ -3117,7 +3117,7 @@ fn portability_default() -> String {
 fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
     if !matches!(
         body.strategy.as_str(),
-        "priority" | "round-robin" | "weighted" | "least-used"
+        "priority" | "round-robin" | "weighted" | "least-used" | "adaptive"
     ) {
         return Err(ApiError::bad("invalid route strategy"));
     }

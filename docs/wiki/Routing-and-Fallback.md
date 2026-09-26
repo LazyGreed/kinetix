@@ -33,6 +33,37 @@ providers and wire formats (FR-12.2/12.5/12.10).
 | `round-robin` | Rotate the starting target per request. |
 | `weighted` | Choose proportionally to target weight. |
 | `least-used` | Prefer the target with the fewest lifetime requests. |
+| `adaptive` | Prefer available target-local concurrency, then overload/error/TTFT telemetry. Cold TTFT uses the route-wide median observed TTFT as a neutral score. |
+
+For `adaptive` routes, Kinetix holds a target-local concurrency permit for the
+full upstream stream and records dispatch-to-first-semantic-event TTFT immediately.
+First-event health is provisional while the stream is open: it can neutralize
+older/no failure telemetry for routing, but only terminal success commits the
+healthy EWMA sample. Failure signals are timestamped independently, so a newer
+5xx/connection/overload from another request remains visible even while validated
+streams are still open; a later error on the same stream likewise replaces its
+provisional health with a real failure. Limit updates are wall-clock-window gated so request
+density cannot accelerate concurrency growth. Failure/overload penalties decay
+toward neutral with wall-clock time even when a target is idle, so transient
+failures do not permanently sideline recovered targets. TTFT observations also
+become cold after five minutes without a new sample, allowing a previously slow
+target to return to the route's neutral TTFT baseline. Adaptive ordering runs only
+after hard eligibility (predicate, provider restriction, capability, and context
+checks). Within the remaining candidates, only currently dispatchable accounts
+(healthy accounts plus legitimate circuit half-open probes) contribute adaptive
+telemetry or represent a logical route target; unavailable siblings remain in the
+fallback list but cannot shift its ranking. One immutable score is computed per
+dispatchable route candidate for the whole ordering pass; cold TTFT candidates
+receive the median observed TTFT of those eligible candidates. The Gradient2 queue
+allowance scales with the current limit (capped at 4) rather than using a fixed
+allowance equal to the initial limit. A 429 applies immediate loss backoff; a
+timeout backs off only when the target was meaningfully loaded; generic
+5xx/connection failures affect error telemetry without being treated as direct
+congestion.
+
+Cache/sticky affinity is applied after adaptive ordering. An eligible affine
+target therefore stays preferred; if it is only concurrency-saturated Kinetix
+waits briefly (bounded to 300 ms) before spilling to another target.
 
 ## Predicates (FR-12.3/12.4)
 

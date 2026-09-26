@@ -10,6 +10,7 @@ const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], stri
   ['round-robin', 'Round-robin load balancing'],
   ['weighted', 'Weighted distribution'],
   ['least-used', 'Least-used (prefer idle accounts)'],
+  ['adaptive', 'Adaptive (capacity + TTFT EWMA)'],
 ];
 
 

@@ -286,7 +286,7 @@ pub enum RouteAction {
         name: String,
         #[arg(long, default_value = "")]
         description: String,
-        /// priority | round-robin | weighted | least-used
+        /// priority | round-robin | weighted | least-used | adaptive
         #[arg(long, default_value = "priority")]
         strategy: String,
         /// reject | strip_with_warning

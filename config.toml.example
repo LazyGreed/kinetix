@@ -69,7 +69,7 @@ target = "Google Gemini/gemini-3.6-flash"
 # [[routes]]
 # name = "smart"
 # description = "Primary then fallback"
-# strategy = "priority"                # priority | round-robin | weighted | least-used
+# strategy = "priority"                # priority | round-robin | weighted | least-used | adaptive
 # fallback_triggers = { on429 = true, onQuota = true, on5xx = true, onTimeout = true }
 # portability_policy = "strip_with_warning"  # reject | strip_with_warning (FR-2.11)
 # cache_affinity = false               # FR-7.3 prompt-cache-aware sticky routing
