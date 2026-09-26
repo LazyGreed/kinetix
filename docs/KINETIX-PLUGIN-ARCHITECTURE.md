@@ -246,7 +246,15 @@ Security ownership is intentionally split:
 
 The callback may enroll only into a provider whose `credential_plugin` still
 matches the integration's declared credential strategy. State is consumed
-before token exchange, so callback replay fails closed.
+before token exchange, so callback replay fails closed. After inserting the new
+account, Kinetix resolves its credential immediately to seed lease scheduling.
+If that resolve confirms `credential_expired` (or another terminal invalid
+credential error), Kinetix persists the disabled status and reloads the registry
+before returning `reauthorization_required`; if that state transition fails,
+completion returns an error rather than claiming reauthorization is required or
+reporting success. The same terminal-error handling applies to request
+inference, token counting, native model discovery, provider tests, and startup
+schedule seeding.
 
 The browser never receives access or refresh tokens from Kinetix. Provider
 client constraints remain plugin-specific: for example, the bundled
@@ -290,6 +298,35 @@ CredentialLease {
 
 The handle is opaque. When possible, the plugin uses it through the host HTTP capability without
 ever receiving plaintext secret bytes.
+
+Credential lifecycle policy remains host-owned. Kinetix records `refresh_after` when supplied;
+otherwise it derives up to a five-minute lead from `expires_at`, proportionally reducing that lead to
+half the remaining lease for leases shorter than ten minutes. The deadline is anchored to the first
+observation of the same expiry/refresh-hint identity and remains stable across resolves; a scheduler
+claim uses a separate grace marker and does not move the deadline. This lets an unchanged short lease
+reach its refresh deadline without sliding toward expiry, while a different lease returned by a
+concurrent request is rescheduled instead of being rotated as stale work. A host-owned refresh
+coordinator schedules renewal off the request path, applies bounded retry backoff, and shares one
+account-scoped singleflight gate across request-path `resolve`, scheduled refresh, and reactive
+auth-error renewal. This is required because API v1 credential plugins are allowed to refresh inside
+`resolve`. Startup seed and every other credential consumer preserve typed errors: terminal
+`credential_expired` evidence triggers a persisted account disable and registry reload instead of
+being downgraded to a retryable host error. Failure to persist or reload that state propagates to the
+caller; it is never represented as a successful disable. After a successful rotation, Kinetix also
+applies a one-minute anti-spin floor only when the returned refresh deadline is already due or
+stale. The floor is bounded by a future known expiry; once expiry is already past, the next attempt
+is rescheduled after the anti-spin interval rather than repeatedly reusing the expired deadline.
+Future explicit `refresh_after` and expiry-derived deadlines remain authoritative for short valid
+leases. API v1 `credential-lease` has no `rotated` field, so the refresh coordinator uses the resolved
+secret and lease timing hints (`expires_at` and `refresh_after`) as its generation identity. The opaque
+lease handle only locates the encrypted KV entry; it is not part of that identity. This adds no WIT
+field and remains compatible with existing guest SDKs and `.kxp` packages. Only a SHA-256 digest of the
+resolved secret is retained in RAM, never the secret itself, and the digest is neither persisted nor
+logged by the scheduler. Secret or timing changes during resolve apply the safe retry delay, while
+handle-only changes do not suppress an otherwise due rotation. Terminal resolve errors leave the prior
+schedule intact until the account's disabled status is persisted; only then does the host forget the
+schedule. A transient proactive refresh failure does not cool down or
+disable an otherwise still-valid account.
 
 ### 6.2 ModelSource
 

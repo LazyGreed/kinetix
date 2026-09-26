@@ -202,6 +202,8 @@ export const PluginsView: React.FC = () => {
         success: 'Account connected successfully through the plugin authorization flow.',
         cancelled: 'Account authorization was cancelled.',
         error: 'Account authorization failed during the provider exchange.',
+        reauthorization_required:
+          'The provider rejected the newly authorized credential. Reauthorize the account and try again.',
         binding_changed:
           'Account authorization was refused because the provider plugin binding changed during login.',
       };

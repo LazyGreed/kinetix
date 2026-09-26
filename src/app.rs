@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use dashmap::DashMap;
 
 use crate::adapters::AdapterRegistry;
@@ -29,9 +30,9 @@ pub struct AppState {
     /// before falling back to the static strategy.
     pub plugin_credentials:
         Arc<dashmap::DashMap<String, Arc<dyn crate::credentials::CredentialStrategy>>>,
-    /// Account-scoped forced-rotation singleflight gates. The key set is
-    /// bounded by configured plugin-backed accounts.
-    credential_rotation_gates: Arc<DashMap<String, Arc<CredentialRotationGate>>>,
+    /// Host-owned proactive refresh scheduler and account-scoped rotation
+    /// singleflight shared by scheduled refresh and reactive auth recovery.
+    pub credential_refresh: crate::credential_refresh::RefreshCoordinator,
     pub adapters: AdapterRegistry,
     pub http: reqwest::Client,
     /// Pinned provider clients keyed by validated host/address set. This keeps
@@ -81,19 +82,17 @@ pub struct AppState {
     hook_tx: tokio::sync::mpsc::Sender<HookJob>,
 }
 
-struct CredentialRotationGate {
-    lock: tokio::sync::Mutex<()>,
-    generation: AtomicU64,
-    last_result: parking_lot::Mutex<Option<std::result::Result<bool, CredentialRotationError>>>,
+enum RefreshLookup<T, E> {
+    Found(T),
+    Missing,
+    Transient(E),
 }
 
-impl CredentialRotationGate {
-    fn new() -> Self {
-        Self {
-            lock: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
-            last_result: parking_lot::Mutex::new(None),
-        }
+fn classify_refresh_lookup<T, E>(result: Result<Option<T>, E>) -> RefreshLookup<T, E> {
+    match result {
+        Ok(Some(value)) => RefreshLookup::Found(value),
+        Ok(None) => RefreshLookup::Missing,
+        Err(error) => RefreshLookup::Transient(error),
     }
 }
 
@@ -152,7 +151,7 @@ impl AppState {
             crypto,
             credentials,
             plugin_credentials: Arc::new(DashMap::new()),
-            credential_rotation_gates: Arc::new(DashMap::new()),
+            credential_refresh: crate::credential_refresh::RefreshCoordinator::default(),
             adapters: AdapterRegistry::new(),
             http,
             outbound_clients: Arc::new(DashMap::new()),
@@ -252,24 +251,72 @@ impl AppState {
         &self,
         provider: &crate::db::ProviderRow,
         account: &crate::db::AccountRow,
-    ) -> anyhow::Result<crate::credentials::ResolvedCredential> {
+    ) -> std::result::Result<crate::credentials::ResolvedCredential, CredentialRotationError> {
         if let Some(r) = provider.credential_plugin_ref() {
             let Some(strategy) = self.plugin_credentials.get(&r.plugin_id) else {
-                anyhow::bail!(
-                    "provider '{}' is bound to unavailable plugin credential strategy '{}'",
-                    provider.name,
-                    r.to_string_ref()
-                );
+                return Err(CredentialRotationError::new(
+                    "plugin_internal",
+                    format!(
+                        "provider '{}' is bound to unavailable plugin credential strategy '{}'",
+                        provider.name,
+                        r.to_string_ref()
+                    ),
+                    true,
+                    None,
+                ));
             };
-            return strategy.resolve(account).await;
+            let strategy = Arc::clone(strategy.value());
+            return self
+                .credential_refresh
+                .resolve(&provider.id, strategy, account)
+                .await;
         }
         self.credentials.resolve(account).await
     }
 
+    /// Disable an account when credential resolution confirms its credential
+    /// is terminally invalid. Returns whether it was terminal, and propagates
+    /// persistence or registry-reload failures instead of claiming success.
+    pub(crate) async fn disable_invalid_credential(
+        &self,
+        account: &crate::db::AccountRow,
+        error: &CredentialRotationError,
+        context: &'static str,
+    ) -> anyhow::Result<bool> {
+        if !error.invalid_credential() {
+            return Ok(false);
+        }
+
+        crate::db::set_account_status(
+            &self.pool,
+            &account.id,
+            "disabled",
+            None,
+            None,
+            Some(&format!("{context}: {}", error.message)),
+        )
+        .await
+        .with_context(|| format!("failed to persist disabling invalid account {}", account.id))?;
+        self.credential_refresh
+            .forget(&account.provider_id, &account.id);
+        self.registry.reload(&self.pool).await.with_context(|| {
+            format!(
+                "account {} was disabled but registry reload failed",
+                account.id
+            )
+        })?;
+        tracing::warn!(
+            account = %account.id,
+            code = %error.code,
+            context,
+            "credential confirmed invalid; account disabled"
+        );
+        Ok(true)
+    }
+
     /// Force renewal for a plugin-backed credential after an upstream auth
-    /// failure. Calls are serialized per account. A waiter re-resolves under
-    /// the lock and skips a second rotation when another request already
-    /// replaced the credential that failed upstream.
+    /// failure. Proactive and reactive rotation share the coordinator's
+    /// account-scoped singleflight gate so rotating refresh tokens cannot race.
     pub async fn rotate_credential_after_auth_error(
         &self,
         provider: &crate::db::ProviderRow,
@@ -296,32 +343,183 @@ impl AppState {
                 )
             })?;
 
-        let gate_key = format!("{}:{}", provider.id, account.id);
-        let gate = self
-            .credential_rotation_gates
-            .entry(gate_key)
-            .or_insert_with(|| Arc::new(CredentialRotationGate::new()))
-            .clone();
+        self.credential_refresh
+            .rotate_after_auth_error(&provider.id, strategy, account, failed_secret)
+            .await
+    }
 
-        // Capture the generation before waiting. If it changes while this
-        // request is queued, the in-flight caller already completed the
-        // singleflight operation and we reuse that exact result.
-        let observed_generation = gate.generation.load(Ordering::Acquire);
-        let _guard = gate.lock.lock().await;
-        if gate.generation.load(Ordering::Acquire) != observed_generation {
-            if let Some(result) = gate.last_result.lock().clone() {
-                return result;
+    /// Resolve every currently configured plugin-backed account once at
+    /// startup. This rehydrates proactive lease deadlines after a process
+    /// restart without keeping a periodic full-table scanner alive.
+    pub async fn seed_credential_refreshes(&self) {
+        let providers = match crate::db::list_providers(&self.pool).await {
+            Ok(providers) => providers,
+            Err(error) => {
+                tracing::warn!(%error, "could not seed credential refresh schedules");
+                return;
             }
-        }
-
-        let result = match strategy.resolve(account).await {
-            Ok(current) if current.secret != failed_secret => Ok(true),
-            _ => strategy.rotate(account).await.map(|()| true),
         };
 
-        *gate.last_result.lock() = Some(result.clone());
-        gate.generation.fetch_add(1, Ordering::Release);
-        result
+        for provider in providers {
+            if provider.credential_plugin_ref().is_none() || provider.enabled == 0 {
+                continue;
+            }
+            let accounts = match crate::db::accounts_for_provider(&self.pool, &provider.id).await {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    tracing::debug!(provider = %provider.id, %error, "could not enumerate accounts for credential refresh seed");
+                    continue;
+                }
+            };
+            for account in accounts {
+                if account.status == "disabled" {
+                    continue;
+                }
+                if let Err(error) = self.credential_for(&provider, &account).await {
+                    match self
+                        .disable_invalid_credential(&account, &error, "startup credential seed")
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::debug!(
+                            provider = %provider.id,
+                            account = %account.id,
+                            %error,
+                            "credential refresh seed resolve failed"
+                        ),
+                        Err(disable_error) => tracing::error!(
+                            provider = %provider.id,
+                            account = %account.id,
+                            credential_error = %error,
+                            %disable_error,
+                            "failed to disable account after startup credential resolution confirmed invalid"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Refresh all leases claimed due by the coordinator. A bounded JoinSet
+    /// keeps idle credential maintenance off the request path without bursting
+    /// provider token endpoints.
+    pub async fn refresh_due_credentials(&self) {
+        const MAX_CONCURRENT_REFRESHES: usize = 4;
+
+        let due = self.credential_refresh.claim_due(chrono::Utc::now());
+        if due.is_empty() {
+            return;
+        }
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REFRESHES));
+        let mut jobs = tokio::task::JoinSet::new();
+        for key in due {
+            let state = self.clone();
+            let semaphore = semaphore.clone();
+            jobs.spawn(async move {
+                let permit = semaphore.acquire_owned().await;
+                if permit.is_err() {
+                    return;
+                }
+                let _permit = permit.expect("checked above");
+                state.refresh_due_credential(key).await;
+            });
+        }
+        while jobs.join_next().await.is_some() {}
+    }
+
+    async fn refresh_due_credential(&self, key: crate::credential_refresh::CredentialKey) {
+        let account = match classify_refresh_lookup(
+            crate::db::get_account(&self.pool, &key.account_id).await,
+        ) {
+            RefreshLookup::Found(account) => account,
+            RefreshLookup::Missing => {
+                self.credential_refresh
+                    .forget(&key.provider_id, &key.account_id);
+                return;
+            }
+            RefreshLookup::Transient(error) => {
+                tracing::debug!(
+                    provider = %key.provider_id,
+                    account = %key.account_id,
+                    %error,
+                    "credential refresh account lookup failed; keeping schedule"
+                );
+                return;
+            }
+        };
+        if account.status == "disabled" {
+            self.credential_refresh
+                .forget(&key.provider_id, &key.account_id);
+            return;
+        }
+
+        let provider = match classify_refresh_lookup(
+            crate::db::get_provider(&self.pool, &key.provider_id).await,
+        ) {
+            RefreshLookup::Found(provider) => provider,
+            RefreshLookup::Missing => {
+                self.credential_refresh
+                    .forget(&key.provider_id, &key.account_id);
+                return;
+            }
+            RefreshLookup::Transient(error) => {
+                tracing::debug!(
+                    provider = %key.provider_id,
+                    account = %key.account_id,
+                    %error,
+                    "credential refresh provider lookup failed; keeping schedule"
+                );
+                return;
+            }
+        };
+        let Some(reference) = provider.credential_plugin_ref() else {
+            self.credential_refresh
+                .forget(&key.provider_id, &key.account_id);
+            return;
+        };
+        let Some(strategy) = self
+            .plugin_credentials
+            .get(&reference.plugin_id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            // Plugin may be temporarily disabled/reloading. Keep the schedule;
+            // the claimed grace window prevents a hot retry loop.
+            return;
+        };
+
+        match self
+            .credential_refresh
+            .rotate_scheduled(&provider.id, strategy, &account)
+            .await
+        {
+            Ok(true) => tracing::debug!(
+                provider = %provider.id,
+                account = %account.id,
+                "proactively refreshed credential"
+            ),
+            Ok(false) => {}
+            Err(error) => match self
+                .disable_invalid_credential(&account, &error, "proactive credential refresh")
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    provider = %provider.id,
+                    account = %account.id,
+                    code = %error.code,
+                    retryable = error.retryable,
+                    "proactive credential refresh failed; keeping current credential until expiry"
+                ),
+                Err(disable_error) => tracing::error!(
+                    provider = %provider.id,
+                    account = %account.id,
+                    credential_error = %error,
+                    %disable_error,
+                    "failed to disable account after proactive credential refresh confirmed invalid"
+                ),
+            },
+        }
     }
 
     /// Count a route target skipped during eligibility filtering.
@@ -381,6 +579,18 @@ impl AppState {
 #[cfg(test)]
 mod hook_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn refresh_lookup_distinguishes_missing_from_transient_failure() {
+        assert!(matches!(
+            classify_refresh_lookup::<i32, &str>(Ok(None)),
+            RefreshLookup::Missing
+        ));
+        assert!(matches!(
+            classify_refresh_lookup::<i32, &str>(Err("sqlite busy")),
+            RefreshLookup::Transient("sqlite busy")
+        ));
+    }
 
     #[tokio::test]
     async fn blocked_hook_job_does_not_block_next_job() {

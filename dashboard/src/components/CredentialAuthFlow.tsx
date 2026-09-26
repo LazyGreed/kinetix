@@ -80,7 +80,9 @@ export function useAuthEnrollment({ onSuccess, onError }: UseAuthEnrollmentOptio
             ? 'Account authorization was cancelled.'
             : status.result === 'binding_changed'
               ? 'Provider binding changed during authorization.'
-              : 'Account authorization failed during token exchange.',
+              : status.result === 'reauthorization_required'
+                ? 'The provider rejected the new credential. Reauthorize the account and try again.'
+                : 'Account authorization failed during token exchange.',
         );
       } catch {
         // The callback can briefly move between the one-time session and
@@ -107,7 +109,9 @@ export function useAuthEnrollment({ onSuccess, onError }: UseAuthEnrollmentOptio
             ? 'Account authorization was cancelled.'
             : result.result === 'binding_changed'
               ? 'Provider binding changed during authorization.'
-              : 'Account authorization failed during token exchange.',
+              : result.result === 'reauthorization_required'
+                ? 'The provider rejected the new credential. Reauthorize the account and try again.'
+                : 'Account authorization failed during token exchange.',
         );
       }
       const providerId = session.providerId;
