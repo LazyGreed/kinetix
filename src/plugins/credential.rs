@@ -9,6 +9,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 
 use crate::credentials::{
     CredentialHealth, CredentialRotationError, CredentialStrategy, ResolvedCredential,
@@ -36,11 +38,93 @@ fn credential_error(fault: super::runtime::PluginFault) -> CredentialRotationErr
     }
 }
 
+#[derive(Debug)]
+struct PluginCredentialLease {
+    handle: String,
+    expires_at: Option<String>,
+    refresh_after: Option<String>,
+}
+
+struct PluginHealthObservation {
+    state: String,
+    reset_at: Option<String>,
+}
+
+#[async_trait]
+trait CredentialPluginHost: Send + Sync {
+    async fn resolve_lease(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        account_id: &str,
+        account_label: &str,
+    ) -> Result<PluginCredentialLease, super::runtime::PluginFault>;
+
+    async fn rotate_lease(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<(), super::runtime::PluginFault>;
+
+    async fn health_state(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<PluginHealthObservation, super::runtime::PluginFault>;
+}
+
+#[async_trait]
+impl CredentialPluginHost for PluginManager {
+    async fn resolve_lease(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        account_id: &str,
+        account_label: &str,
+    ) -> Result<PluginCredentialLease, super::runtime::PluginFault> {
+        let lease = self
+            .credential_resolve(plugin_id, provider_id, account_id, account_label)
+            .await?;
+        Ok(PluginCredentialLease {
+            handle: lease.handle,
+            expires_at: lease.expires_at,
+            refresh_after: lease.refresh_after,
+        })
+    }
+
+    async fn rotate_lease(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<(), super::runtime::PluginFault> {
+        self.credential_rotate(plugin_id, provider_id, account_id)
+            .await
+    }
+
+    async fn health_state(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<PluginHealthObservation, super::runtime::PluginFault> {
+        self.health_probe(plugin_id, provider_id, account_id)
+            .await
+            .map(|observation| PluginHealthObservation {
+                state: observation.state,
+                reset_at: observation.reset_at,
+            })
+    }
+}
+
 pub struct PluginCredentialStrategy {
-    manager: Arc<PluginManager>,
+    manager: Arc<dyn CredentialPluginHost>,
     pool: Pool,
     crypto: Arc<Crypto>,
     plugin_id: String,
+    resolved_lease_fingerprints: DashMap<String, [u8; 32]>,
 }
 
 impl PluginCredentialStrategy {
@@ -50,11 +134,21 @@ impl PluginCredentialStrategy {
         crypto: Arc<Crypto>,
         plugin_id: impl Into<String>,
     ) -> Self {
+        Self::with_host(manager, pool, crypto, plugin_id)
+    }
+
+    fn with_host(
+        manager: Arc<dyn CredentialPluginHost>,
+        pool: Pool,
+        crypto: Arc<Crypto>,
+        plugin_id: impl Into<String>,
+    ) -> Self {
         PluginCredentialStrategy {
             manager,
             pool,
             crypto,
             plugin_id: plugin_id.into(),
+            resolved_lease_fingerprints: DashMap::new(),
         }
     }
 
@@ -107,7 +201,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
     ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
         let lease = self
             .manager
-            .credential_resolve(
+            .resolve_lease(
                 &self.plugin_id,
                 &account.provider_id,
                 &account.id,
@@ -116,11 +210,20 @@ impl CredentialStrategy for PluginCredentialStrategy {
             .await
             .map_err(credential_error)?;
         let secret = self.lease_secret(&lease.handle).await?;
+        let mut hasher = Sha256::new();
+        hasher.update(lease.handle.as_bytes());
+        hasher.update([0]);
+        hasher.update(secret.as_bytes());
+        let fingerprint: [u8; 32] = hasher.finalize().into();
+        let rotated = self
+            .resolved_lease_fingerprints
+            .insert(account.id.clone(), fingerprint)
+            .is_some_and(|previous| previous != fingerprint);
         Ok(ResolvedCredential {
             secret,
             expires_at: lease.expires_at,
             refresh_after: lease.refresh_after,
-            rotated: false,
+            rotated,
         })
     }
 
@@ -129,7 +232,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
         account: &AccountRow,
     ) -> std::result::Result<(), CredentialRotationError> {
         self.manager
-            .credential_rotate(&self.plugin_id, &account.provider_id, &account.id)
+            .rotate_lease(&self.plugin_id, &account.provider_id, &account.id)
             .await
             .map_err(credential_error)
     }
@@ -137,7 +240,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
     async fn health(&self, account: &AccountRow) -> CredentialHealth {
         match self
             .manager
-            .health_probe(&self.plugin_id, &account.provider_id, &account.id)
+            .health_state(&self.plugin_id, &account.provider_id, &account.id)
             .await
         {
             Ok(obs) => match obs.state.as_str() {
@@ -154,7 +257,10 @@ impl CredentialStrategy for PluginCredentialStrategy {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use crate::db;
     use crate::plugins::runtime::PluginFault;
 
     #[test]
@@ -183,5 +289,162 @@ mod tests {
         });
 
         assert!(error.invalid_credential());
+    }
+
+    struct ChangingLeaseHost {
+        pool: Pool,
+        crypto: Arc<Crypto>,
+        resolutions: AtomicUsize,
+        rotations: AtomicUsize,
+        expires_at: String,
+        refresh_after: String,
+    }
+
+    #[async_trait]
+    impl CredentialPluginHost for ChangingLeaseHost {
+        async fn resolve_lease(
+            &self,
+            plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+            _account_label: &str,
+        ) -> Result<PluginCredentialLease, PluginFault> {
+            let generation = self.resolutions.fetch_add(1, Ordering::Relaxed);
+            let handle = format!("lease-{generation}");
+            let secret = format!("access-token-{generation}");
+            crate::plugins::store::kv_put(
+                &self.pool,
+                &self.crypto,
+                plugin_id,
+                &format!("{LEASE_PREFIX}{handle}"),
+                secret.as_bytes(),
+            )
+            .await
+            .map_err(|error| PluginFault::Internal(error.to_string()))?;
+            Ok(PluginCredentialLease {
+                handle,
+                expires_at: Some(self.expires_at.clone()),
+                refresh_after: Some(self.refresh_after.clone()),
+            })
+        }
+
+        async fn rotate_lease(
+            &self,
+            _plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<(), PluginFault> {
+            self.rotations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn health_state(
+            &self,
+            _plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<PluginHealthObservation, PluginFault> {
+            Ok(PluginHealthObservation {
+                state: "healthy".into(),
+                reset_at: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_lease_changed_during_resolve_is_not_rotated_again() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-plugin-credential-resolve-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("state.db").display());
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let installed_at = db::now_iso();
+        sqlx::query(
+            "INSERT INTO plugins \
+             (id, version, plugin_api_major, package_sha256, enabled, signature, manifest_json, component, installed_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("test.plugin")
+        .bind("0.0.1")
+        .bind(1_i64)
+        .bind("test-package-hash")
+        .bind(1_i64)
+        .bind("unsigned")
+        .bind("{}")
+        .bind(Vec::<u8>::new())
+        .bind(&installed_at)
+        .bind(&installed_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let crypto = Arc::new(Crypto::new(&[31_u8; 32]));
+        let now = chrono::Utc::now();
+        let host = Arc::new(ChangingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+            expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
+        });
+        let strategy = Arc::new(PluginCredentialStrategy::with_host(
+            host.clone(),
+            pool.clone(),
+            crypto,
+            "test.plugin",
+        ));
+        let account = AccountRow {
+            id: "acc_plugin_lease_generation".into(),
+            provider_id: "provider_plugin_lease_generation".into(),
+            label: "plugin-account".into(),
+            secret_enc: String::new(),
+            key_mask: String::new(),
+            status: "healthy".into(),
+            cooldown_until: None,
+            quota_reset_at: None,
+            quota_type: "none".into(),
+            quota_window_s: None,
+            soft_quota_usd: None,
+            priority: 1,
+            weight: 1,
+            last_error: None,
+            last_probe_at: None,
+            circuit_open_until: None,
+            consecutive_failures: 0,
+            created_at: db::now_iso(),
+        };
+        let coordinator = crate::credential_refresh::RefreshCoordinator::default();
+
+        let first = coordinator
+            .resolve(
+                "provider_plugin_lease_generation",
+                strategy.clone(),
+                &account,
+            )
+            .await
+            .unwrap();
+        assert!(!first.rotated);
+        assert_eq!(coordinator.claim_due(chrono::Utc::now()).len(), 1);
+
+        assert!(!coordinator
+            .rotate_scheduled("provider_plugin_lease_generation", strategy, &account,)
+            .await
+            .unwrap());
+        assert_eq!(host.resolutions.load(Ordering::Relaxed), 2);
+        assert_eq!(host.rotations.load(Ordering::Relaxed), 0);
+        let now = chrono::Utc::now();
+        assert!(
+            coordinator
+                .next_attempt_at("provider_plugin_lease_generation", &account.id)
+                .unwrap()
+                >= now + chrono::Duration::seconds(59)
+        );
+        assert!(coordinator.claim_due(now).is_empty());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -297,6 +297,8 @@ impl AppState {
         )
         .await
         .with_context(|| format!("failed to persist disabling invalid account {}", account.id))?;
+        self.credential_refresh
+            .forget(&account.provider_id, &account.id);
         self.registry.reload(&self.pool).await.with_context(|| {
             format!(
                 "account {} was disabled but registry reload failed",

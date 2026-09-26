@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 
 use crate::credentials::{CredentialRotationError, CredentialStrategy, ResolvedCredential};
 use crate::db::AccountRow;
@@ -39,6 +40,7 @@ impl CredentialKey {
 struct LeaseIdentity {
     expires_at: Option<DateTime<Utc>>,
     refresh_after: Option<DateTime<Utc>>,
+    secret_fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -112,12 +114,7 @@ impl RefreshCoordinator {
                 }
                 Ok(current)
             }
-            Err(error) => {
-                if error.invalid_credential() {
-                    self.schedules.remove(&key);
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -181,6 +178,13 @@ impl RefreshCoordinator {
                     // A changed lease identity means another path refreshed
                     // the credential. Invalidate any claim for the old lease.
                     schedule.claim_until = None;
+                    if existing.lease_identity.secret_fingerprint
+                        != schedule.lease_identity.secret_fingerprint
+                    {
+                        schedule.next_attempt_at = schedule.next_attempt_at.max(
+                            now + ChronoDuration::seconds(MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS),
+                        );
+                    }
                     if existing.failures > 0 {
                         schedule.failures = existing.failures;
                         schedule.next_attempt_at =
@@ -276,14 +280,6 @@ impl RefreshCoordinator {
             },
         };
 
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(CredentialRotationError::invalid_credential)
-        {
-            self.schedules.remove(&key);
-        }
-
         *gate.last_auth_result.lock() = Some(result.clone());
         gate.generation.fetch_add(1, Ordering::Release);
         result
@@ -316,9 +312,7 @@ impl RefreshCoordinator {
         let current = match strategy.resolve(account).await {
             Ok(current) => current,
             Err(error) => {
-                if error.invalid_credential() {
-                    self.schedules.remove(&key);
-                } else {
+                if !error.invalid_credential() {
                     self.record_failure(&key, &error);
                 }
                 return Err(error);
@@ -333,10 +327,16 @@ impl RefreshCoordinator {
             self.observe_refreshed(provider_id, &account.id, &current);
             return Ok(false);
         };
-        if stored_schedule.lease_identity != current_schedule.lease_identity {
-            // The credential changed since it was scheduled/claimed. Reschedule
-            // from the new lease and do not rotate it as stale work.
-            self.observe_refreshed(provider_id, &account.id, &current);
+        if current.rotated || stored_schedule.lease_identity != current_schedule.lease_identity {
+            // A resolve-side rotation or changed lease means another path has
+            // already advanced the credential. Reschedule it safely instead of
+            // immediately calling rotate() a second time.
+            self.observe_successful_rotation(
+                provider_id,
+                &account.id,
+                &current,
+                Utc::now().max(now),
+            );
             return Ok(false);
         }
         if stored_schedule.next_attempt_at > now {
@@ -348,9 +348,7 @@ impl RefreshCoordinator {
                 let current = match strategy.resolve(account).await {
                     Ok(current) => current,
                     Err(error) => {
-                        if error.invalid_credential() {
-                            self.schedules.remove(&key);
-                        } else {
+                        if !error.invalid_credential() {
                             self.record_failure(&key, &error);
                         }
                         return Err(error);
@@ -371,9 +369,8 @@ impl RefreshCoordinator {
                 Ok(true)
             }
             Err(error) => {
-                self.record_failure(&key, &error);
-                if error.invalid_credential() {
-                    self.schedules.remove(&key);
+                if !error.invalid_credential() {
+                    self.record_failure(&key, &error);
                 }
                 Err(error)
             }
@@ -402,6 +399,7 @@ impl RefreshCoordinator {
             lease_identity: LeaseIdentity {
                 expires_at: None,
                 refresh_after: None,
+                secret_fingerprint: [0; 32],
             },
             claim_until: None,
         });
@@ -422,9 +420,12 @@ fn schedule_from_credential(
     credential: &ResolvedCredential,
     now: DateTime<Utc>,
 ) -> Option<LeaseSchedule> {
+    // Retain only a one-way in-memory fingerprint as a lease-generation
+    // signal. It is neither logged nor persisted.
     let lease_identity = LeaseIdentity {
         expires_at: parse_time(credential.expires_at.as_deref()),
         refresh_after: parse_time(credential.refresh_after.as_deref()),
+        secret_fingerprint: Sha256::digest(credential.secret.as_bytes()).into(),
     };
 
     let requested = lease_identity.refresh_after.clone().or_else(|| {
@@ -566,6 +567,7 @@ mod tests {
 
     struct FixedShortLeaseStrategy {
         expires_at: String,
+        rotated_on_resolve: bool,
         rotations: AtomicUsize,
     }
 
@@ -583,7 +585,7 @@ mod tests {
                 secret: "fixed-lease-token".into(),
                 expires_at: Some(self.expires_at.clone()),
                 refresh_after: None,
-                rotated: self.rotations.load(Ordering::Relaxed) > 0,
+                rotated: self.rotated_on_resolve,
             })
         }
 
@@ -740,6 +742,7 @@ mod tests {
         let observed_at = Utc::now();
         let strategy = Arc::new(FixedShortLeaseStrategy {
             expires_at: (observed_at.to_owned() + ChronoDuration::minutes(4)).to_rfc3339(),
+            rotated_on_resolve: false,
             rotations: AtomicUsize::new(0),
         });
         let initial = strategy.resolve(&account).await.unwrap();
@@ -764,7 +767,8 @@ mod tests {
         let account = account();
         let strategy = Arc::new(FixedShortLeaseStrategy {
             expires_at: (Utc::now() - ChronoDuration::seconds(1)).to_rfc3339(),
-            rotations: AtomicUsize::new(1),
+            rotated_on_resolve: true,
+            rotations: AtomicUsize::new(0),
         });
 
         let resolved = coordinator.resolve("p1", strategy, &account).await.unwrap();
@@ -784,6 +788,7 @@ mod tests {
         let expires_at = observed_at.to_owned() + ChronoDuration::minutes(4);
         let strategy = Arc::new(FixedShortLeaseStrategy {
             expires_at: expires_at.to_rfc3339(),
+            rotated_on_resolve: false,
             rotations: AtomicUsize::new(0),
         });
         let initial = strategy.resolve(&account).await.unwrap();
