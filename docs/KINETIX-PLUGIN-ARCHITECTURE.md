@@ -315,13 +315,15 @@ being downgraded to a retryable host error. Failure to persist or reload that st
 caller; it is never represented as a successful disable. After a successful rotation, Kinetix also
 requires at least a one-minute delay before another attempt. This bounds retries when a plugin reports
 success without advancing its expiry or refresh hint, including after that unchanged lease reaches
-expiry. API v1 `credential-lease` has no `rotated` field, so the host derives an in-memory lease
-generation fingerprint from the opaque lease handle and resolved secret. This adds no WIT field and
-remains compatible with existing guest SDKs and `.kxp` packages. A changed fingerprint marks a
-plugin-side resolve refresh even when timing hints are unchanged; only the SHA-256 digest is retained
-in RAM, never the handle or secret, and neither value is persisted or logged by the scheduler. Terminal
-resolve errors leave the prior schedule intact until the account's disabled status is persisted; only
-then does the host forget the schedule. A transient proactive refresh failure does not cool down or
+expiry. API v1 `credential-lease` has no `rotated` field, so the refresh coordinator uses the resolved
+secret and lease timing hints (`expires_at` and `refresh_after`) as its generation identity. The opaque
+lease handle only locates the encrypted KV entry; it is not part of that identity. This adds no WIT
+field and remains compatible with existing guest SDKs and `.kxp` packages. Only a SHA-256 digest of the
+resolved secret is retained in RAM, never the secret itself, and the digest is neither persisted nor
+logged by the scheduler. Secret or timing changes during resolve apply the safe retry delay, while
+handle-only changes do not suppress an otherwise due rotation. Terminal resolve errors leave the prior
+schedule intact until the account's disabled status is persisted; only then does the host forget the
+schedule. A transient proactive refresh failure does not cool down or
 disable an otherwise still-valid account.
 
 ### 6.2 ModelSource

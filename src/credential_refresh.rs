@@ -175,16 +175,12 @@ impl RefreshCoordinator {
                     schedule.failures = existing.failures;
                     schedule.claim_until = existing.claim_until;
                 } else {
-                    // A changed lease identity means another path refreshed
-                    // the credential. Invalidate any claim for the old lease.
+                    // A changed secret/timing identity makes this claim stale.
+                    // Invalidate it and impose a short delay before rechecking.
                     schedule.claim_until = None;
-                    if existing.lease_identity.secret_fingerprint
-                        != schedule.lease_identity.secret_fingerprint
-                    {
-                        schedule.next_attempt_at = schedule.next_attempt_at.max(
-                            now + ChronoDuration::seconds(MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS),
-                        );
-                    }
+                    schedule.next_attempt_at = schedule
+                        .next_attempt_at
+                        .max(now + ChronoDuration::seconds(MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS));
                     if existing.failures > 0 {
                         schedule.failures = existing.failures;
                         schedule.next_attempt_at =

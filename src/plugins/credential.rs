@@ -9,8 +9,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
-use sha2::{Digest, Sha256};
 
 use crate::credentials::{
     CredentialHealth, CredentialRotationError, CredentialStrategy, ResolvedCredential,
@@ -124,7 +122,6 @@ pub struct PluginCredentialStrategy {
     pool: Pool,
     crypto: Arc<Crypto>,
     plugin_id: String,
-    resolved_lease_fingerprints: DashMap<String, [u8; 32]>,
 }
 
 impl PluginCredentialStrategy {
@@ -148,7 +145,6 @@ impl PluginCredentialStrategy {
             pool,
             crypto,
             plugin_id: plugin_id.into(),
-            resolved_lease_fingerprints: DashMap::new(),
         }
     }
 
@@ -210,20 +206,14 @@ impl CredentialStrategy for PluginCredentialStrategy {
             .await
             .map_err(credential_error)?;
         let secret = self.lease_secret(&lease.handle).await?;
-        let mut hasher = Sha256::new();
-        hasher.update(lease.handle.as_bytes());
-        hasher.update([0]);
-        hasher.update(secret.as_bytes());
-        let fingerprint: [u8; 32] = hasher.finalize().into();
-        let rotated = self
-            .resolved_lease_fingerprints
-            .insert(account.id.clone(), fingerprint)
-            .is_some_and(|previous| previous != fingerprint);
         Ok(ResolvedCredential {
             secret,
             expires_at: lease.expires_at,
             refresh_after: lease.refresh_after,
-            rotated,
+            // API v1 exposes the handle as opaque lookup data, not as a stable
+            // generation signal. Core compares resolved secret and timing
+            // identity instead of inferring rotation from handle churn.
+            rotated: false,
         })
     }
 
@@ -298,6 +288,8 @@ mod tests {
         rotations: AtomicUsize,
         expires_at: String,
         refresh_after: String,
+        change_secret_on_resolve: bool,
+        advance_expiry_on_resolve: bool,
     }
 
     #[async_trait]
@@ -311,7 +303,11 @@ mod tests {
         ) -> Result<PluginCredentialLease, PluginFault> {
             let generation = self.resolutions.fetch_add(1, Ordering::Relaxed);
             let handle = format!("lease-{generation}");
-            let secret = format!("access-token-{generation}");
+            let secret = if self.change_secret_on_resolve {
+                format!("access-token-{generation}")
+            } else {
+                "stable-access-token".to_owned()
+            };
             crate::plugins::store::kv_put(
                 &self.pool,
                 &self.crypto,
@@ -321,9 +317,14 @@ mod tests {
             )
             .await
             .map_err(|error| PluginFault::Internal(error.to_string()))?;
+            let expires_at = if self.advance_expiry_on_resolve && generation > 0 {
+                (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339()
+            } else {
+                self.expires_at.clone()
+            };
             Ok(PluginCredentialLease {
                 handle,
-                expires_at: Some(self.expires_at.clone()),
+                expires_at: Some(expires_at),
                 refresh_after: Some(self.refresh_after.clone()),
             })
         }
@@ -352,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_lease_changed_during_resolve_is_not_rotated_again() {
+    async fn plugin_strategy_ignores_handle_churn_but_detects_secret_changes() {
         let root = std::env::temp_dir().join(format!(
             "kinetix-plugin-credential-resolve-{}",
             uuid::Uuid::new_v4().simple()
@@ -389,11 +390,13 @@ mod tests {
             rotations: AtomicUsize::new(0),
             expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
             refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
+            change_secret_on_resolve: false,
+            advance_expiry_on_resolve: false,
         });
         let strategy = Arc::new(PluginCredentialStrategy::with_host(
             host.clone(),
             pool.clone(),
-            crypto,
+            crypto.clone(),
             "test.plugin",
         ));
         let account = AccountRow {
@@ -429,16 +432,157 @@ mod tests {
         assert!(!first.rotated);
         assert_eq!(coordinator.claim_due(chrono::Utc::now()).len(), 1);
 
-        assert!(!coordinator
+        assert!(coordinator
             .rotate_scheduled("provider_plugin_lease_generation", strategy, &account,)
             .await
             .unwrap());
-        assert_eq!(host.resolutions.load(Ordering::Relaxed), 2);
-        assert_eq!(host.rotations.load(Ordering::Relaxed), 0);
+        assert_eq!(host.resolutions.load(Ordering::Relaxed), 3);
+        assert_eq!(host.rotations.load(Ordering::Relaxed), 1);
         let now = chrono::Utc::now();
         assert!(
             coordinator
                 .next_attempt_at("provider_plugin_lease_generation", &account.id)
+                .unwrap()
+                >= now + chrono::Duration::seconds(59)
+        );
+        assert!(coordinator.claim_due(now).is_empty());
+
+        let secret_refresh_host = Arc::new(ChangingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+            expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
+            change_secret_on_resolve: true,
+            advance_expiry_on_resolve: false,
+        });
+        let secret_refresh_strategy = Arc::new(PluginCredentialStrategy::with_host(
+            secret_refresh_host.clone(),
+            pool.clone(),
+            crypto.clone(),
+            "test.plugin",
+        ));
+        let secret_refresh_account = AccountRow {
+            id: "acc_plugin_secret_generation".into(),
+            provider_id: "provider_plugin_secret_generation".into(),
+            label: "plugin-account-secret-generation".into(),
+            secret_enc: String::new(),
+            key_mask: String::new(),
+            status: "healthy".into(),
+            cooldown_until: None,
+            quota_reset_at: None,
+            quota_type: "none".into(),
+            quota_window_s: None,
+            soft_quota_usd: None,
+            priority: 1,
+            weight: 1,
+            last_error: None,
+            last_probe_at: None,
+            circuit_open_until: None,
+            consecutive_failures: 0,
+            created_at: db::now_iso(),
+        };
+        let first_secret_lease = coordinator
+            .resolve(
+                &secret_refresh_account.provider_id,
+                secret_refresh_strategy.clone(),
+                &secret_refresh_account,
+            )
+            .await
+            .unwrap();
+        assert!(!first_secret_lease.rotated);
+        assert!(coordinator
+            .claim_due(chrono::Utc::now())
+            .iter()
+            .any(|key| key.account_id == secret_refresh_account.id));
+        assert!(!coordinator
+            .rotate_scheduled(
+                &secret_refresh_account.provider_id,
+                secret_refresh_strategy,
+                &secret_refresh_account,
+            )
+            .await
+            .unwrap());
+        assert_eq!(secret_refresh_host.resolutions.load(Ordering::Relaxed), 2);
+        assert_eq!(secret_refresh_host.rotations.load(Ordering::Relaxed), 0);
+        let now = chrono::Utc::now();
+        assert!(
+            coordinator
+                .next_attempt_at(
+                    &secret_refresh_account.provider_id,
+                    &secret_refresh_account.id
+                )
+                .unwrap()
+                >= now + chrono::Duration::seconds(59)
+        );
+        assert!(coordinator.claim_due(now).is_empty());
+
+        let timing_refresh_host = Arc::new(ChangingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+            expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
+            change_secret_on_resolve: false,
+            advance_expiry_on_resolve: true,
+        });
+        let timing_refresh_strategy = Arc::new(PluginCredentialStrategy::with_host(
+            timing_refresh_host,
+            pool.clone(),
+            crypto,
+            "test.plugin",
+        ));
+        let timing_refresh_account = AccountRow {
+            id: "acc_plugin_timing_generation".into(),
+            provider_id: "provider_plugin_timing_generation".into(),
+            label: "plugin-account-timing-generation".into(),
+            secret_enc: String::new(),
+            key_mask: String::new(),
+            status: "healthy".into(),
+            cooldown_until: None,
+            quota_reset_at: None,
+            quota_type: "none".into(),
+            quota_window_s: None,
+            soft_quota_usd: None,
+            priority: 1,
+            weight: 1,
+            last_error: None,
+            last_probe_at: None,
+            circuit_open_until: None,
+            consecutive_failures: 0,
+            created_at: db::now_iso(),
+        };
+        let first_timing_lease = coordinator
+            .resolve(
+                &timing_refresh_account.provider_id,
+                timing_refresh_strategy.clone(),
+                &timing_refresh_account,
+            )
+            .await
+            .unwrap();
+        assert!(!first_timing_lease.rotated);
+        assert!(coordinator
+            .claim_due(chrono::Utc::now())
+            .iter()
+            .any(|key| key.account_id == timing_refresh_account.id));
+        let second_timing_lease = coordinator
+            .resolve(
+                &timing_refresh_account.provider_id,
+                timing_refresh_strategy,
+                &timing_refresh_account,
+            )
+            .await
+            .unwrap();
+        assert!(!second_timing_lease.rotated);
+        let now = chrono::Utc::now();
+        assert!(
+            coordinator
+                .next_attempt_at(
+                    &timing_refresh_account.provider_id,
+                    &timing_refresh_account.id
+                )
                 .unwrap()
                 >= now + chrono::Duration::seconds(59)
         );
